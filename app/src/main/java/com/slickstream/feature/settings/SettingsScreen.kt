@@ -38,6 +38,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.slickstream.data.settings.CacheSize
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SubtitleLanguage
+import com.slickstream.data.settings.SubtitleSize
+import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.settings.UiDensity
 import com.slickstream.feature.profile.ConfirmDialog
 import com.slickstream.ui.theme.Brand
@@ -129,8 +131,24 @@ fun SettingsScreen(
                 labelOf = { it.label },
                 onSelect = viewModel::setSubtitleLanguage,
             )
+            Spacer(Modifier.height(16.dp))
+            OptionGroup(
+                label = "Text size",
+                options = SubtitleSize.entries,
+                selected = settings.subtitleSize,
+                labelOf = { it.label },
+                onSelect = viewModel::setSubtitleSize,
+            )
+            Spacer(Modifier.height(16.dp))
+            OptionGroup(
+                label = "Style",
+                options = SubtitleStyle.entries,
+                selected = settings.subtitleStyle,
+                labelOf = { it.label },
+                onSelect = viewModel::setSubtitleStyle,
+            )
             Spacer(Modifier.height(6.dp))
-            Hint("When on, the player auto-selects this language if a match is found. You can always change subtitles from the CC button in the player.")
+            Hint("When on, the player auto-selects this language if a match is found. You can always change subtitles, size and style from the CC button or here.")
         }
 
         SettingsSection("Storage") {

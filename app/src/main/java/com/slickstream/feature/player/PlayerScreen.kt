@@ -112,6 +112,7 @@ fun PlayerScreen(
     val title by viewModel.title.collectAsState()
     val subtitles by viewModel.subtitles.collectAsState()
     val currentSubtitle by viewModel.currentSubtitle.collectAsState()
+    val captionPrefs by viewModel.captionPrefs.collectAsState()
     val context = LocalContext.current
 
     var showSources by remember { mutableStateOf(false) }
@@ -165,6 +166,7 @@ fun PlayerScreen(
                     view.player = activePlayer
                     view.useController = !isInPip   // hide all controls inside the PiP window
                     view.setFullscreenButtonState(isFullscreen)
+                    view.subtitleView?.applyAppearance(captionPrefs.size, captionPrefs.style)
                 },
             )
         }

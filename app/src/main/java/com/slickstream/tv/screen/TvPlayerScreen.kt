@@ -71,6 +71,7 @@ import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.feature.player.PlayerUiState
 import com.slickstream.feature.player.PlayerViewModel
+import com.slickstream.feature.player.applyAppearance
 import com.slickstream.ui.components.QualityChip
 import com.slickstream.ui.theme.Brand
 
@@ -95,6 +96,7 @@ fun TvPlayerScreen(
     val title by viewModel.title.collectAsStateWithLifecycle()
     val subtitles by viewModel.subtitles.collectAsStateWithLifecycle()
     val currentSubtitle by viewModel.currentSubtitle.collectAsStateWithLifecycle()
+    val captionPrefs by viewModel.captionPrefs.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -186,7 +188,10 @@ fun TvPlayerScreen(
                         setShutterBackgroundColor(android.graphics.Color.BLACK)
                     }
                 },
-                update = { view -> view.player = player },
+                update = { view ->
+                    view.player = player
+                    view.subtitleView?.applyAppearance(captionPrefs.size, captionPrefs.style)
+                },
                 modifier = Modifier.fillMaxSize(),
             )
         }

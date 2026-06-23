@@ -36,6 +36,8 @@ import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
+import com.slickstream.data.settings.SubtitleSize
+import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.subtitle.SubtitleRepository
 import com.slickstream.navigation.NavArg
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -48,6 +50,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -67,6 +71,9 @@ sealed interface PlayerUiState {
 
     data class Error(val message: String) : PlayerUiState
 }
+
+/** Subtitle appearance the players apply to their Media3 SubtitleView. */
+data class CaptionPrefs(val size: SubtitleSize, val style: SubtitleStyle)
 
 @HiltViewModel
 class PlayerViewModel @Inject constructor(
@@ -142,6 +149,15 @@ class PlayerViewModel @Inject constructor(
     val currentSubtitle: StateFlow<SubtitleTrack?> = _currentSubtitle.asStateFlow()
     private var subtitleConfigs: List<ExoMediaItem.SubtitleConfiguration> = emptyList()
     private var preferredSubCode: String? = null
+
+    /** User's subtitle size + style, live — players apply this to their SubtitleView. */
+    val captionPrefs: StateFlow<CaptionPrefs> = settingsRepository.settings
+        .map { CaptionPrefs(it.subtitleSize, it.subtitleStyle) }
+        .stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000),
+            CaptionPrefs(SubtitleSize.DEFAULT, SubtitleStyle.DEFAULT),
+        )
 
     /** Outlives [viewModelScope] so final progress + torrent-stop survive onCleared(). */
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

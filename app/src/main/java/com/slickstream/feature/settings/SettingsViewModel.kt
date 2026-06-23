@@ -8,6 +8,8 @@ import com.slickstream.data.settings.CacheSize
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.settings.SubtitleLanguage
+import com.slickstream.data.settings.SubtitleSize
+import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.settings.UiDensity
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
@@ -69,4 +71,6 @@ class SettingsViewModel @Inject constructor(
     fun setDensity(d: UiDensity) = viewModelScope.launch { repo.setDensity(d) }
     fun setSubtitlesEnabled(enabled: Boolean) = viewModelScope.launch { repo.setSubtitlesEnabled(enabled) }
     fun setSubtitleLanguage(lang: SubtitleLanguage) = viewModelScope.launch { repo.setSubtitleLanguage(lang) }
+    fun setSubtitleSize(size: SubtitleSize) = viewModelScope.launch { repo.setSubtitleSize(size) }
+    fun setSubtitleStyle(style: SubtitleStyle) = viewModelScope.launch { repo.setSubtitleStyle(style) }
 }

@@ -52,6 +52,32 @@ enum class SubtitleLanguage(val label: String, val code: String) {
     HINDI("Hindi", "hin"),
 }
 
+/** Subtitle text size, as a fraction of the view height (Media3 SubtitleView.setFractionalTextSize). */
+enum class SubtitleSize(val label: String, val fraction: Float) {
+    SMALL("Small", 0.045f),
+    MEDIUM("Medium", 0.0533f), // Media3 default
+    LARGE("Large", 0.072f),
+    XLARGE("Extra large", 0.095f),
+    ;
+
+    companion object {
+        val DEFAULT = MEDIUM
+    }
+}
+
+/** Subtitle appearance preset (mapped to a Media3 CaptionStyleCompat in the player). */
+enum class SubtitleStyle(val label: String) {
+    DROP_SHADOW("White · shadow"),
+    OUTLINE("White · outline"),
+    BLACK_BOX("White on black"),
+    YELLOW("Yellow · shadow"),
+    ;
+
+    companion object {
+        val DEFAULT = DROP_SHADOW
+    }
+}
+
 /** Selectable cap for the on-disk torrent cache (binary GiB to match the engine budget). */
 enum class CacheSize(val label: String, val bytes: Long) {
     GB_1("1 GB", 1L * 1024 * 1024 * 1024),
@@ -71,6 +97,8 @@ data class AppSettings(
     val density: UiDensity = UiDensity.COMFORTABLE,
     val subtitlesEnabled: Boolean = false,
     val subtitleLanguage: SubtitleLanguage = SubtitleLanguage.ENGLISH,
+    val subtitleSize: SubtitleSize = SubtitleSize.DEFAULT,
+    val subtitleStyle: SubtitleStyle = SubtitleStyle.DEFAULT,
     val maxCacheSize: CacheSize = CacheSize.DEFAULT,
 )
 
@@ -91,6 +119,10 @@ class SettingsRepository @Inject constructor(
             subtitlesEnabled = p[KEY_SUBS_ON] ?: false,
             subtitleLanguage = p[KEY_SUB_LANG]?.let { runCatching { SubtitleLanguage.valueOf(it) }.getOrNull() }
                 ?: SubtitleLanguage.ENGLISH,
+            subtitleSize = p[KEY_SUB_SIZE]?.let { runCatching { SubtitleSize.valueOf(it) }.getOrNull() }
+                ?: SubtitleSize.DEFAULT,
+            subtitleStyle = p[KEY_SUB_STYLE]?.let { runCatching { SubtitleStyle.valueOf(it) }.getOrNull() }
+                ?: SubtitleStyle.DEFAULT,
             maxCacheSize = p[KEY_MAX_CACHE]?.let { runCatching { CacheSize.valueOf(it) }.getOrNull() }
                 ?: CacheSize.DEFAULT,
         )
@@ -103,6 +135,8 @@ class SettingsRepository @Inject constructor(
     suspend fun setDensity(d: UiDensity) = dataStore.edit { it[KEY_DENSITY] = d.name }
     suspend fun setSubtitlesEnabled(enabled: Boolean) = dataStore.edit { it[KEY_SUBS_ON] = enabled }
     suspend fun setSubtitleLanguage(lang: SubtitleLanguage) = dataStore.edit { it[KEY_SUB_LANG] = lang.name }
+    suspend fun setSubtitleSize(size: SubtitleSize) = dataStore.edit { it[KEY_SUB_SIZE] = size.name }
+    suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
 
     private fun String?.toQuality(default: QualityPreference): QualityPreference =
@@ -114,6 +148,8 @@ class SettingsRepository @Inject constructor(
         val KEY_DENSITY = stringPreferencesKey("ui_density")
         val KEY_SUBS_ON = booleanPreferencesKey("subs_enabled")
         val KEY_SUB_LANG = stringPreferencesKey("sub_language")
+        val KEY_SUB_SIZE = stringPreferencesKey("sub_size")
+        val KEY_SUB_STYLE = stringPreferencesKey("sub_style")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
     }
 }
