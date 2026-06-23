@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
@@ -129,10 +130,20 @@ fun TvProfileScreen(
                     icon = Icons.Rounded.Login,
                     label = "Sign in with Google",
                     onClick = {
-                        // CredentialManager's Google UI isn't available on TV — use device pairing.
+                        // Credential Manager works on Google TV; if a device lacks it, the user can
+                        // fall back to the pairing-code option below.
+                        val activity = context.findActivity() ?: return@ProfileAction
                         signInError = null
-                        showPairing = true
+                        scope.launch {
+                            val result = authRepository.signIn(activity)
+                            if (result is DataResult.Error) signInError = result.message
+                        }
                     },
+                )
+                ProfileAction(
+                    icon = Icons.Rounded.Devices,
+                    label = "Pair with a code instead",
+                    onClick = { signInError = null; showPairing = true },
                 )
             } else {
                 ProfileAction(

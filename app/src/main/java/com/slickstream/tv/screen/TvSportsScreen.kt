@@ -23,11 +23,20 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -124,6 +133,8 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
                     focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
                 ),
                 scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+                // Tabs auto-load on focus — just move the D-pad onto a sport to switch to it.
+                modifier = Modifier.onFocusChanged { if (it.isFocused) onSelect(c.id) },
             ) {
                 Text(
                     text = c.name,
@@ -140,12 +151,14 @@ private fun TvEventList(events: List<SportEvent>, loading: Boolean, error: Strin
     when {
         loading && events.isEmpty() -> TvLoading(Modifier.fillMaxSize())
         events.isEmpty() -> TvCenteredMessage(error ?: "No events scheduled here right now.")
-        else -> LazyColumn(
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-            contentPadding = PaddingValues(bottom = 48.dp),
+        else -> LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(bottom = 48.dp, end = 24.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
-            items(events, key = { it.id }) { event -> TvEventCard(event, onClick) }
+            gridItems(events, key = { it.id }) { event -> TvEventCard(event, onClick) }
         }
     }
 }
@@ -165,30 +178,46 @@ private fun TvEventCard(event: SportEvent, onClick: (SportEvent) -> Unit) {
         border = ClickableSurfaceDefaults.border(
             focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
         ),
-        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.02f),
-        modifier = Modifier.fillMaxWidth(0.7f),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+        modifier = Modifier.fillMaxWidth(),
     ) {
-        Row(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(
-                modifier = Modifier.size(width = 120.dp, height = 68.dp).background(Brand.SurfaceVariant, RoundedCornerShape(8.dp)),
+                modifier = Modifier.size(width = 96.dp, height = 54.dp).background(Brand.SurfaceVariant, RoundedCornerShape(8.dp)),
                 contentAlignment = Alignment.Center,
             ) {
                 if (event.posterUrl != null) {
                     AsyncImage(model = event.posterUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                 }
             }
-            Spacer(Modifier.width(18.dp))
+            Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text(event.title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = tvStartLabel(event),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (event.isLive) Brand.Error else Brand.OnSurfaceDim,
-                    fontWeight = if (event.isLive) FontWeight.Bold else FontWeight.Normal,
-                )
+                Spacer(Modifier.height(6.dp))
+                if (event.isLive) {
+                    LiveBadge()
+                } else {
+                    Text(
+                        text = tvStartLabel(event),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Brand.OnSurfaceDim,
+                    )
+                }
             }
         }
+    }
+}
+
+/** A small red "● LIVE" pill so live games stand out in any category. */
+@Composable
+private fun LiveBadge() {
+    Row(
+        modifier = Modifier
+            .background(Brand.Error, RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("● LIVE", style = MaterialTheme.typography.labelMedium, color = Color.White, fontWeight = FontWeight.Bold)
     }
 }
 
@@ -199,6 +228,12 @@ private fun TvStreamPanel(
     onClose: () -> Unit,
 ) {
     BackHandler(enabled = true) { onClose() }
+    val firstFocus = remember { FocusRequester() }
+    // Re-focus when the content settles (loading -> list, or -> error button) so the remote always
+    // has a target — fixes "the retry/back buttons don't auto-focus".
+    LaunchedEffect(sheet.loading, sheet.streams.size, sheet.error) {
+        runCatching { firstFocus.requestFocus() }
+    }
     Column(
         modifier = Modifier
             .fillMaxHeight()
@@ -212,10 +247,16 @@ private fun TvStreamPanel(
             sheet.loading -> Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                 androidx.compose.material3.CircularProgressIndicator(color = Brand.Violet, strokeWidth = 3.dp, modifier = Modifier.size(30.dp))
             }
-            sheet.error != null && sheet.streams.isEmpty() ->
+            sheet.error != null && sheet.streams.isEmpty() -> {
                 Text(sheet.error, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
+                Spacer(Modifier.height(8.dp))
+                androidx.tv.material3.Button(
+                    onClick = onClose,
+                    modifier = Modifier.focusRequester(firstFocus),
+                ) { Text("Close") }
+            }
             else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(sheet.streams, key = { it.id }) { stream ->
+                itemsIndexed(sheet.streams, key = { _, s -> s.id }) { index, stream ->
                     val shape = RoundedCornerShape(12.dp)
                     Surface(
                         onClick = { onSelect(stream) },
@@ -230,7 +271,7 @@ private fun TvStreamPanel(
                             focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet), shape = shape),
                         ),
                         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = if (index == 0) Modifier.fillMaxWidth().focusRequester(firstFocus) else Modifier.fillMaxWidth(),
                     ) {
                         Text(stream.label, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(14.dp))
                     }

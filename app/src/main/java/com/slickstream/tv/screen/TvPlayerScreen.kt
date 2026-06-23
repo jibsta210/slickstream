@@ -43,7 +43,9 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
@@ -136,6 +138,8 @@ fun TvPlayerScreen(
         when {
             subsPanelOpen -> subsPanelOpen = false
             panelOpen -> panelOpen = false
+            // While buffering/fetching or errored there's no transport to dismiss — leave at once.
+            uiState !is PlayerUiState.Playing -> onBack()
             controlsVisible -> controlsVisible = false
             else -> onBack()
         }
@@ -148,7 +152,11 @@ fun TvPlayerScreen(
             .focusRequester(rootFocus)
             .focusable()
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown && !controlsVisible && !anyPanelOpen) {
+                // Re-show the transport on a D-pad press — but NEVER swallow Back, or buffering/error
+                // states (which have no transport) would trap the user with no way to exit.
+                if (event.type == KeyEventType.KeyDown && event.key != Key.Back &&
+                    !controlsVisible && !anyPanelOpen && uiState is PlayerUiState.Playing
+                ) {
                     controlsVisible = true   // also restarts the auto-hide LaunchedEffect
                     true
                 } else {
@@ -172,7 +180,7 @@ fun TvPlayerScreen(
 
         // Buffering / error overlay (driven by the VM's PlayerUiState).
         when (val s = uiState) {
-            is PlayerUiState.Buffering -> BufferingOverlay(state = s, title = title)
+            is PlayerUiState.Buffering -> BufferingOverlay(state = s, title = title, onBack = onBack)
             is PlayerUiState.Error -> ErrorOverlay(message = s.message, onRetry = viewModel::retry, onBack = onBack)
             PlayerUiState.Playing -> Unit
         }
@@ -261,7 +269,9 @@ fun TvPlayerScreen(
 }
 
 @Composable
-private fun BufferingOverlay(state: PlayerUiState.Buffering, title: String) {
+private fun BufferingOverlay(state: PlayerUiState.Buffering, title: String, onBack: () -> Unit) {
+    val backFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -294,12 +304,20 @@ private fun BufferingOverlay(state: PlayerUiState.Buffering, title: String) {
             if (detail.isNotBlank()) {
                 Text(detail, style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
             }
+            Spacer(Modifier.height(8.dp))
+            // A focusable, auto-focused Back so the user is never stranded on the fetch/buffer screen.
+            androidx.tv.material3.Button(
+                onClick = onBack,
+                modifier = Modifier.focusRequester(backFocus),
+            ) { Text("Back") }
         }
     }
 }
 
 @Composable
 private fun ErrorOverlay(message: String, onRetry: () -> Unit, onBack: () -> Unit) {
+    val retryFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { retryFocus.requestFocus() } }
     Box(
         modifier = Modifier.fillMaxSize().background(Color(0xE6000000)),
         contentAlignment = Alignment.Center,
@@ -312,7 +330,7 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit, onBack: () -> Uni
             Text("Playback failed", style = MaterialTheme.typography.titleLarge, color = Color.White)
             Text(message, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                androidx.tv.material3.Button(onClick = onRetry) { Text("Try again") }
+                androidx.tv.material3.Button(onClick = onRetry, modifier = Modifier.focusRequester(retryFocus)) { Text("Try again") }
                 androidx.tv.material3.Button(onClick = onBack) { Text("Back") }
             }
         }

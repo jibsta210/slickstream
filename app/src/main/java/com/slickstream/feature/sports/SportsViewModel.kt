@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.slickstream.core.model.DataResult
 import com.slickstream.feature.live.LivePlaybackHolder
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -70,9 +71,15 @@ class SportsViewModel @Inject constructor(
         }
     }
 
+    private var eventsJob: Job? = null
+
     fun select(categoryId: String) {
+        // Select-on-focus drives this from the TV chip rail, so ignore re-selecting the current tab
+        // and cancel any in-flight load when the tab changes (no stale results racing in).
+        if (_state.value.selectedId == categoryId) return
+        eventsJob?.cancel()
         _state.update { it.copy(selectedId = categoryId, loadingEvents = true, events = emptyList(), error = null) }
-        viewModelScope.launch {
+        eventsJob = viewModelScope.launch {
             when (val r = repo.events(categoryId)) {
                 is DataResult.Success -> _state.update { it.copy(events = r.data, loadingEvents = false) }
                 is DataResult.Error -> _state.update { it.copy(loadingEvents = false, error = r.message) }
