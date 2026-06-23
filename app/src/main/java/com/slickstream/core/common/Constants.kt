@@ -34,4 +34,8 @@ object Subtitles {
 
 object Auth {
     val GOOGLE_WEB_CLIENT_ID: String = BuildConfig.GOOGLE_WEB_CLIENT_ID
+    /** "TVs and Limited Input devices" OAuth client — used by the Android TV device-pairing flow. */
+    val GOOGLE_TV_CLIENT_ID: String = BuildConfig.GOOGLE_TV_CLIENT_ID
+    /** Public client secret for the TV client (Google embeds this in app source; not truly secret). */
+    val GOOGLE_TV_CLIENT_SECRET: String = BuildConfig.GOOGLE_TV_CLIENT_SECRET
 }

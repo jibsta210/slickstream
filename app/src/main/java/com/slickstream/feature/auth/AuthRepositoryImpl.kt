@@ -100,6 +100,47 @@ class AuthRepositoryImpl @Inject constructor(
         }
     }
 
+    /**
+     * Sign in from a Google ID token acquired via the TV device-authorization flow. Mirrors the
+     * success branch of [signIn]: exchange for a Firebase session, persist, emit, start sync.
+     */
+    override suspend fun signInWithIdToken(idToken: String): DataResult<UserProfile> {
+        val profile = profileFromIdToken(idToken)
+            ?: return DataResult.Error("Couldn't verify your Google account. Please try again.")
+        return try {
+            runCatching { firebaseSync.signInWithGoogle(idToken) }
+            persist(profile)
+            _currentUser.value = profile
+            syncCoordinator.onSignedIn()
+            DataResult.Success(profile)
+        } catch (e: Exception) {
+            DataResult.Error(e.message ?: "Google sign-in failed. Please try again.", e)
+        }
+    }
+
+    /** Build a [UserProfile] from the standard OIDC claims in a Google ID token (no verification). */
+    private fun profileFromIdToken(idToken: String): UserProfile? {
+        val claims = decodeJwtClaims(idToken) ?: return null
+        val sub = claims.optString("sub").takeIf { it.isNotBlank() } ?: return null
+        val email = claims.optString("email").takeIf { it.isNotBlank() }
+        val name = claims.optString("name").takeIf { it.isNotBlank() }
+            ?: claims.optString("given_name").takeIf { it.isNotBlank() }
+        val picture = claims.optString("picture").takeIf { it.isNotBlank() }
+        return UserProfile(id = sub, displayName = name, email = email, photoUrl = picture)
+    }
+
+    /** Decode (without verifying) the payload of a JWT into a JSONObject. */
+    private fun decodeJwtClaims(idToken: String): JSONObject? = try {
+        val parts = idToken.split(".")
+        if (parts.size < 2) null
+        else {
+            val bytes = Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+            JSONObject(String(bytes, Charsets.UTF_8))
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     /** Clear the Credential Manager state and wipe the persisted session. */
     override suspend fun signOut() {
         runCatching {

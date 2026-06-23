@@ -49,6 +49,9 @@ android {
         // In-app updater: version manifest hosted on GitHub Releases (override in local.properties).
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${secret("UPDATE_MANIFEST_URL", "https://github.com/jibsta210/slickstream/releases/latest/download/update.json")}\"")
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"${secret("GOOGLE_WEB_CLIENT_ID")}\"")
+        // "TVs and Limited Input devices" OAuth client for the Android TV device-pairing flow.
+        buildConfigField("String", "GOOGLE_TV_CLIENT_ID", "\"${secret("GOOGLE_TV_CLIENT_ID")}\"")
+        buildConfigField("String", "GOOGLE_TV_CLIENT_SECRET", "\"${secret("GOOGLE_TV_CLIENT_SECRET")}\"")
     }
 
     buildTypes {

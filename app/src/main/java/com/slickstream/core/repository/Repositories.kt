@@ -95,6 +95,8 @@ interface AuthRepository {
     val currentUser: StateFlow<UserProfile?>
     /** Launches the Google credential flow; requires an Activity context. */
     suspend fun signIn(activity: Activity): DataResult<UserProfile>
+    /** Complete sign-in from a Google ID token obtained out-of-band (the TV device-pairing flow). */
+    suspend fun signInWithIdToken(idToken: String): DataResult<UserProfile>
     suspend fun signOut()
     /** Restore a previously authorized session silently (no UI). */
     suspend fun restoreSession()

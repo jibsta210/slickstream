@@ -106,6 +106,7 @@ fun TvProfileScreen(
 
     var dialog by remember { mutableStateOf<ProfileDialog?>(null) }
     var signInError by remember { mutableStateOf<String?>(null) }
+    var showPairing by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -128,12 +129,9 @@ fun TvProfileScreen(
                     icon = Icons.Rounded.Login,
                     label = "Sign in with Google",
                     onClick = {
-                        val activity = context.findActivity() ?: return@ProfileAction
+                        // CredentialManager's Google UI isn't available on TV — use device pairing.
                         signInError = null
-                        scope.launch {
-                            val result = authRepository.signIn(activity)
-                            if (result is DataResult.Error) signInError = result.message
-                        }
+                        showPairing = true
                     },
                 )
             } else {
@@ -196,6 +194,13 @@ fun TvProfileScreen(
         )
 
         null -> Unit
+    }
+
+    if (showPairing) {
+        TvPairingDialog(
+            onDismiss = { showPairing = false },
+            onSignedIn = { showPairing = false },
+        )
     }
 }
 
