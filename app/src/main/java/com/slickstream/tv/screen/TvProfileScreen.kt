@@ -131,26 +131,8 @@ fun TvProfileScreen(
                 ProfileAction(
                     icon = Icons.Rounded.Login,
                     label = "Sign in with Google",
-                    onClick = {
-                        // Credential Manager works on Google TV; if a device lacks it, the user can
-                        // fall back to the pairing-code option below.
-                        val activity = context.findActivity() ?: return@ProfileAction
-                        signInError = null
-                        scope.launch {
-                            val result = authRepository.signIn(activity)
-                            if (result is DataResult.Error) signInError = result.message
-                        }
-                    },
+                    onClick = { signInError = null; showPairing = true },
                 )
-                // Only offer code-pairing when the TV OAuth client is actually configured — an
-                // unconfigured button just dead-ends in "TV sign-in isn't configured yet".
-                if (com.slickstream.core.common.Auth.GOOGLE_TV_CLIENT_ID.isNotBlank()) {
-                    ProfileAction(
-                        icon = Icons.Rounded.Devices,
-                        label = "Pair with a code instead",
-                        onClick = { signInError = null; showPairing = true },
-                    )
-                }
             } else {
                 ProfileAction(
                     icon = Icons.Rounded.Logout,
@@ -220,7 +202,7 @@ fun TvProfileScreen(
     }
 
     if (showPairing) {
-        TvPairingDialog(
+        TvCodePairDialog(
             onDismiss = { showPairing = false },
             onSignedIn = { showPairing = false },
         )

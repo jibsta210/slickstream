@@ -55,6 +55,58 @@ class FirebaseSync @Inject constructor(
         runCatching { auth?.signOut() }
     }
 
+    // --- TV pairing mailbox -------------------------------------------------
+    // A short-lived Firestore doc keyed by a code the TV shows. The signed-in phone writes its
+    // Google id-token + profile into it; the TV polls, signs in, and deletes it. Works without a
+    // Firebase Auth session (rules allow the /pairing collection for the brief window).
+
+    /** TV: create the pending pairing doc for [code]. Returns false if Firestore is unavailable. */
+    suspend fun createPairing(code: String): Boolean {
+        val d = db ?: return false
+        return try {
+            d.collection(PAIRING).document(code).set(
+                mapOf("createdAt" to com.google.firebase.firestore.FieldValue.serverTimestamp(), "status" to "waiting"),
+            ).await()
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "createPairing failed", t); false
+        }
+    }
+
+    /** Phone: write the account's id-token + profile into the TV's [code]. */
+    suspend fun claimPairing(code: String, idToken: String, name: String?, email: String?, photoUrl: String?): Boolean {
+        val d = db ?: return false
+        return try {
+            d.collection(PAIRING).document(code).set(
+                mapOf(
+                    "idToken" to idToken,
+                    "name" to name, "email" to email, "photoUrl" to photoUrl,
+                    "claimedAt" to com.google.firebase.firestore.FieldValue.serverTimestamp(),
+                ),
+                com.google.firebase.firestore.SetOptions.merge(),
+            ).await()
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "claimPairing failed", t); false
+        }
+    }
+
+    /** TV: returns the claimed id-token once the phone has filled it in (null while still waiting). */
+    suspend fun readPairingToken(code: String): String? {
+        val d = db ?: return null
+        return try {
+            val snap = d.collection(PAIRING).document(code).get().await()
+            if (!snap.exists()) return null
+            snap.getString("idToken")
+        } catch (t: Throwable) {
+            Log.w(TAG, "readPairingToken failed", t); null
+        }
+    }
+
+    suspend fun deletePairing(code: String) {
+        runCatching { db?.collection(PAIRING)?.document(code)?.delete()?.await() }
+    }
+
     // --- Favourites ---------------------------------------------------------
 
     suspend fun pushFavorite(item: MediaItem) {
@@ -170,5 +222,6 @@ class FirebaseSync @Inject constructor(
 
     private companion object {
         const val TAG = "FirebaseSync"
+        const val PAIRING = "pairing"
     }
 }

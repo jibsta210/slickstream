@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
@@ -70,6 +71,7 @@ fun ProfileScreen(
 
     var showSignOutDialog by remember { mutableStateOf(false) }
     var showClearHistoryDialog by remember { mutableStateOf(false) }
+    var showLinkTvDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -112,6 +114,17 @@ fun ProfileScreen(
             subtitle = "Streaming quality per network and display density.",
             onClick = onOpenSettings,
         )
+
+        if (user != null) {
+            Spacer(Modifier.height(24.dp))
+            SectionHeader(title = "Devices")
+            SettingRow(
+                icon = { Icon(Icons.Rounded.Cast, contentDescription = null, tint = Brand.Violet) },
+                title = "Link a TV",
+                subtitle = "Sign a TV into this account with the code it shows.",
+                onClick = { showLinkTvDialog = true },
+            )
+        }
 
         Spacer(Modifier.height(24.dp))
 
@@ -178,6 +191,10 @@ fun ProfileScreen(
             },
             onDismiss = { showClearHistoryDialog = false },
         )
+    }
+
+    if (showLinkTvDialog) {
+        com.slickstream.feature.auth.LinkTvDialog(onDismiss = { showLinkTvDialog = false })
     }
 }
 

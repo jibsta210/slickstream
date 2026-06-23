@@ -118,6 +118,31 @@ class AuthRepositoryImpl @Inject constructor(
         }
     }
 
+    /** Fetch a fresh Google ID token for the current account (to hand over to a TV being linked). */
+    override suspend fun acquireIdToken(activity: Activity): DataResult<String> {
+        val serverClientId = Auth.GOOGLE_WEB_CLIENT_ID
+        if (serverClientId.isBlank()) {
+            return DataResult.Error("Google sign-in isn't configured yet.")
+        }
+        return try {
+            val response = credentialManager.getCredential(
+                context = activity,
+                request = buildSignInRequest(serverClientId),
+            )
+            val cred = response.asGoogleIdCredential()
+                ?: return DataResult.Error("Couldn't read your Google account. Please try again.")
+            DataResult.Success(cred.idToken)
+        } catch (e: GetCredentialCancellationException) {
+            DataResult.Error("Sign-in was cancelled.", e)
+        } catch (e: NoCredentialException) {
+            DataResult.Error("No Google account on this phone. Sign in first, then link the TV.", e)
+        } catch (e: GetCredentialException) {
+            DataResult.Error("Couldn't get a fresh sign-in. Please try again.", e)
+        } catch (e: Exception) {
+            DataResult.Error(e.message ?: "Couldn't get a fresh sign-in.", e)
+        }
+    }
+
     /** Build a [UserProfile] from the standard OIDC claims in a Google ID token (no verification). */
     private fun profileFromIdToken(idToken: String): UserProfile? {
         val claims = decodeJwtClaims(idToken) ?: return null
