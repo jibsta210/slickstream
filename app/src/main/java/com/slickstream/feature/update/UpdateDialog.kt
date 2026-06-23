@@ -1,6 +1,13 @@
 package com.slickstream.feature.update
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -145,7 +152,15 @@ private fun UpdateDialog(
                     // (a mandatory update with no focusable button would otherwise soft-lock a TV).
                     val primaryFocus = remember { FocusRequester() }
                     LaunchedEffect(primaryLabel) {
-                        if (primaryLabel != null) runCatching { primaryFocus.requestFocus() }
+                        // Retry past the dialog window's layout so focus actually lands in the dialog
+                        // on TV — a single request fires too early and leaves the remote driving the
+                        // rail behind the dialog (verified in the TV emulator).
+                        if (primaryLabel != null) {
+                            repeat(15) {
+                                kotlinx.coroutines.delay(50)
+                                if (runCatching { primaryFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                            }
+                        }
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -177,27 +192,35 @@ private fun PillButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Material3 buttons are focusable + DPAD_CENTER-operable, so the dialog works on a TV remote
-    // (the old clickable Text was not focusable). Still a styled Compose dialog — never native.
-    if (ghost) {
-        TextButton(
-            onClick = onClick,
-            modifier = modifier,
-            colors = ButtonDefaults.textButtonColors(contentColor = Brand.OnSurfaceDim),
-        ) {
-            Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Normal)
-        }
-    } else {
-        Button(
-            onClick = onClick,
-            modifier = modifier,
-            shape = RoundedCornerShape(50),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Brand.Violet,
-                contentColor = Brand.Background,
-            ),
-        ) {
-            Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
-        }
+    // Focusable + clickable with an EXPLICIT focus ring — Material3's default focus highlight is too
+    // subtle to see at 10 ft, so a TV user couldn't tell which dialog button was selected.
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(50)
+    val white = androidx.compose.ui.graphics.Color.White
+    val transparent = androidx.compose.ui.graphics.Color.Transparent
+    val container = when {
+        focused && ghost -> Brand.SurfaceVariant
+        ghost -> transparent
+        else -> Brand.Violet
+    }
+    Box(
+        modifier = modifier
+            .clip(shape)
+            .background(container, shape)
+            .border(BorderStroke(if (focused) 3.dp else 0.dp, if (focused) white else transparent), shape)
+            .clickable(interactionSource = interaction, indication = null) { onClick() }
+            .padding(horizontal = 22.dp, vertical = 12.dp),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (ghost) FontWeight.Normal else FontWeight.SemiBold,
+            color = when {
+                ghost && focused -> Brand.OnSurface
+                ghost -> Brand.OnSurfaceDim
+                else -> Brand.Background
+            },
+        )
     }
 }
