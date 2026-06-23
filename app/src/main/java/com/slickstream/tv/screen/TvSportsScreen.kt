@@ -31,7 +31,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -116,6 +118,15 @@ fun TvSportsScreen(
 
 @Composable
 private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, onSelect: (String) -> Unit) {
+    // Auto-load the focused tab, but DEBOUNCED: settle on a chip for 250ms before switching, so
+    // scrubbing the D-pad across the row doesn't fire a cancelling network load + grid wipe per
+    // chip (the #1 cause of the choppiness). A click still switches instantly.
+    var focusedId by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    LaunchedEffect(focusedId) {
+        val id = focusedId ?: return@LaunchedEffect
+        kotlinx.coroutines.delay(250)
+        if (id == focusedId && id != selectedId) onSelect(id)
+    }
     LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
         items(categories, key = { it.id }) { c ->
             val shape = RoundedCornerShape(50)
@@ -124,21 +135,23 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
                 onClick = { onSelect(c.id) },
                 shape = ClickableSurfaceDefaults.shape(shape = shape),
                 colors = ClickableSurfaceDefaults.colors(
-                    containerColor = if (selected) Brand.Violet else Brand.SurfaceVariant,
+                    // selected != focused: active tab = subtle fill + violet text; FOCUSED tab = solid
+                    // violet pill + white ring, so you can always tell what you're on vs what's active.
+                    containerColor = if (selected) Brand.SurfaceVariant else Brand.Surface,
                     focusedContainerColor = Brand.Violet,
-                    contentColor = if (selected) Color.White else Brand.OnSurface,
+                    contentColor = if (selected) Brand.Violet else Brand.OnSurface,
                     focusedContentColor = Color.White,
                 ),
                 border = ClickableSurfaceDefaults.border(
                     focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
                 ),
                 scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
-                // Tabs auto-load on focus — just move the D-pad onto a sport to switch to it.
-                modifier = Modifier.onFocusChanged { if (it.isFocused) onSelect(c.id) },
+                modifier = Modifier.onFocusChanged { if (it.isFocused) focusedId = c.id },
             ) {
                 Text(
                     text = c.name,
                     style = MaterialTheme.typography.titleSmall,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
                     modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
                 )
             }

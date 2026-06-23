@@ -1,6 +1,7 @@
 package com.slickstream.tv.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -77,7 +78,7 @@ fun TvPosterCard(
             shape = ClickableSurfaceDefaults.shape(shape = shape),
             scale = ClickableSurfaceDefaults.scale(
                 scale = 1f,
-                focusedScale = 1.1f,
+                focusedScale = 1.06f,
             ),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = Brand.Surface,
@@ -101,7 +102,14 @@ fun TvPosterCard(
                 if (image != null) {
                     var loaded by remember(image) { mutableStateOf(false) }
                     AsyncImage(
-                        model = image,
+                        // Hard decode ceiling — a ~360px poster is plenty for this tile, so Coil
+                        // doesn't decode full-res TMDB bitmaps during D-pad scroll (frame drops + GC
+                        // on a weak TV SoC).
+                        model = coil.request.ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
+                            .data(image)
+                            .size(if (wide) 480 else 360, if (wide) 270 else 540)
+                            .crossfade(true)
+                            .build(),
                         contentDescription = item.title,
                         contentScale = ContentScale.Crop,
                         onState = { st -> loaded = st is coil.compose.AsyncImagePainter.State.Success },
@@ -159,6 +167,16 @@ fun TvPosterCard(
                                 .background(Brand.Violet),
                         )
                     }
+                }
+
+                // Focus ring drawn ON TOP of the (edge-to-edge cropped) art so it's always visible,
+                // not occluded behind a bright poster.
+                if (focused) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape),
+                    )
                 }
             }
         }

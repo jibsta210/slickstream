@@ -138,9 +138,11 @@ private fun <T> TvOptionRow(
                     onClick = { onSelect(option) },
                     shape = ClickableSurfaceDefaults.shape(shape = shape),
                     colors = ClickableSurfaceDefaults.colors(
-                        containerColor = if (isSel) Brand.Violet else Brand.SurfaceVariant,
+                        // selected != focused: the active value is a subtle fill + violet text + a dot;
+                        // the FOCUSED chip is a solid violet pill + white ring.
+                        containerColor = if (isSel) Brand.SurfaceVariant else Brand.Surface,
                         focusedContainerColor = Brand.Violet,
-                        contentColor = if (isSel) Color.White else Brand.OnSurface,
+                        contentColor = if (isSel) Brand.Violet else Brand.OnSurface,
                         focusedContentColor = Color.White,
                     ),
                     border = ClickableSurfaceDefaults.border(
@@ -148,7 +150,12 @@ private fun <T> TvOptionRow(
                     ),
                     scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
                 ) {
-                    Text(labelOf(option), style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp))
+                    Text(
+                        text = if (isSel) "● ${labelOf(option)}" else labelOf(option),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                    )
                 }
             }
         }

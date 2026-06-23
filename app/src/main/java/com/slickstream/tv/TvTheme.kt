@@ -1,12 +1,12 @@
 package com.slickstream.tv
 
-import androidx.compose.material3.Typography
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.MaterialTheme
+import androidx.tv.material3.Typography
 import androidx.tv.material3.darkColorScheme
 import com.slickstream.ui.theme.Brand
 
@@ -31,13 +31,15 @@ private val TvColors = darkColorScheme(
     error = Brand.Error,
 )
 
-/** Slightly larger type scale tuned for 10-foot legibility. */
+/** Slightly larger type scale tuned for 10-foot legibility (tv-material3 Typography). */
 private val TvTypography = Typography(
     displayLarge = TextStyle(fontWeight = FontWeight.Bold, fontSize = 44.sp, lineHeight = 50.sp),
     displaySmall = TextStyle(fontWeight = FontWeight.Bold, fontSize = 34.sp, lineHeight = 40.sp),
     headlineMedium = TextStyle(fontWeight = FontWeight.Bold, fontSize = 28.sp, lineHeight = 34.sp),
+    headlineSmall = TextStyle(fontWeight = FontWeight.Bold, fontSize = 24.sp, lineHeight = 30.sp),
     titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 28.sp),
     titleMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 18.sp, lineHeight = 24.sp),
+    titleSmall = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 22.sp),
     bodyLarge = TextStyle(fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 24.sp),
     bodyMedium = TextStyle(fontWeight = FontWeight.Normal, fontSize = 14.sp, lineHeight = 20.sp),
     bodySmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 13.sp, lineHeight = 18.sp),
@@ -48,10 +50,9 @@ private val TvTypography = Typography(
 /** Wrap TV content in the brand-themed `androidx.tv.material3.MaterialTheme`. */
 @Composable
 fun SlickStreamTvTheme(content: @Composable () -> Unit) {
-    // tv-material3 MaterialTheme expects an androidx.tv.material3.Typography; we keep the brand
-    // colors and use the default TV type scale to avoid a cross-artifact Typography mismatch.
     MaterialTheme(
         colorScheme = TvColors,
+        typography = TvTypography,
         content = content,
     )
 }

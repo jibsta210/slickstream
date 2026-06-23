@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.tv.material3.Border
 import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
@@ -54,9 +55,10 @@ enum class TvDestination(val route: String, val label: String, val icon: ImageVe
 }
 
 /**
- * Left navigation rail for the TV shell. Collapsed to icons by default; expands to show labels
- * while any rail item holds focus (a common 10-foot pattern). Selecting an item invokes
- * [onSelect] with the destination's route.
+ * Left navigation rail for the TV shell. FIXED width with labels always visible — it deliberately
+ * does NOT expand on focus, because animating the rail width slid the entire content area sideways
+ * on every D-pad move into/out of the rail (a pervasive source of the "choppy" feel). Selecting an
+ * item invokes [onSelect] with the destination's route.
  */
 @Composable
 fun TvNavRail(
@@ -64,11 +66,6 @@ fun TvNavRail(
     onSelect: (TvDestination) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // A focus COUNTER (not a flag) so moving focus between rail items keeps it expanded without a
-    // collapse/expand relayout cycle on every D-pad move.
-    var focusedCount by remember { mutableStateOf(0) }
-    val expanded = focusedCount > 0
-
     Column(
         modifier = modifier
             .fillMaxHeight()
@@ -78,16 +75,14 @@ fun TvNavRail(
                     1f to Brand.Background,
                 ),
             )
-            .width(if (expanded) 220.dp else 88.dp)
-            .animateContentSize()
+            .width(212.dp)
             .selectableGroup()
             .padding(vertical = 28.dp, horizontal = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
         horizontalAlignment = Alignment.Start,
     ) {
-        // Brand mark.
         Text(
-            text = if (expanded) "SlickStream" else "S",
+            text = "SlickStream",
             style = MaterialTheme.typography.titleLarge,
             color = Brand.Violet,
             maxLines = 1,
@@ -99,11 +94,7 @@ fun TvNavRail(
             TvNavItem(
                 destination = dest,
                 selected = dest.route == selectedRoute,
-                expanded = expanded,
                 onSelect = { onSelect(dest) },
-                onFocusChanged = { focused ->
-                    focusedCount = (focusedCount + if (focused) 1 else -1).coerceAtLeast(0)
-                },
             )
         }
 
@@ -115,14 +106,10 @@ fun TvNavRail(
 private fun TvNavItem(
     destination: TvDestination,
     selected: Boolean,
-    expanded: Boolean,
     onSelect: () -> Unit,
-    onFocusChanged: (Boolean) -> Unit,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
-    // Bubble focus up so the rail can expand.
-    androidx.compose.runtime.LaunchedEffect(focused) { onFocusChanged(focused) }
 
     val shape = RoundedCornerShape(14.dp)
     val activeTint = when {
@@ -136,13 +123,17 @@ private fun TvNavItem(
         interactionSource = interaction,
         shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
+            // selected = subtle fill + violet tint; focused = solid violet pill + white ring.
             containerColor = if (selected) Brand.SurfaceVariant else Color.Transparent,
             focusedContainerColor = Brand.Violet,
             pressedContainerColor = Brand.VioletDim,
             focusedContentColor = Color.White,
             contentColor = activeTint,
         ),
-        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Box(
@@ -160,16 +151,14 @@ private fun TvNavItem(
                     tint = if (focused) Color.White else activeTint,
                     modifier = Modifier.size(26.dp),
                 )
-                if (expanded) {
-                    Spacer(Modifier.width(16.dp))
-                    Text(
-                        text = destination.label,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = if (focused) Color.White else activeTint,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+                Spacer(Modifier.width(16.dp))
+                Text(
+                    text = destination.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (focused) Color.White else activeTint,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }

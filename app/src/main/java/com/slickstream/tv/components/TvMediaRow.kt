@@ -42,7 +42,9 @@ fun TvMediaRow(
         )
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(18.dp),
-            contentPadding = PaddingValues(horizontal = 48.dp, vertical = 8.dp),
+            // Generous vertical padding so the focused card's scale + 3dp ring + glow aren't clipped
+            // by the LazyRow bounds (a cut-off focus ring reads as "unclear what you're on").
+            contentPadding = PaddingValues(horizontal = 48.dp, vertical = 22.dp),
         ) {
             items(
                 items,

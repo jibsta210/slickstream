@@ -15,7 +15,12 @@ enum class MediaType {
 /**
  * A single browsable catalog item (card). All image paths are already resolved to
  * full URLs by the data layer — UI never has to build TMDB image URLs itself.
+ *
+ * @Immutable: the `genreIds: List<Int>` field would otherwise mark this class unstable to the
+ * Compose compiler, forcing every visible poster card to recompose on any parent state change
+ * (e.g. focus). The contents are effectively immutable, so this lets the poster rows skip.
  */
+@androidx.compose.runtime.Immutable
 data class MediaItem(
     val id: Int,                 // TMDB id
     val mediaType: MediaType,
