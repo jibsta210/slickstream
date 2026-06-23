@@ -8,8 +8,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -230,7 +233,14 @@ private fun StreamsPanel(
 ) {
     BackHandler(enabled = true) { onClose() }
     val firstFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
+    // Retry past the slide-in animation so the D-pad actually lands IN the panel — the focus request
+    // was firing before the first row was laid out, leaving the panel visible but unreachable.
+    LaunchedEffect(Unit) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxHeight()
@@ -243,24 +253,54 @@ private fun StreamsPanel(
         Text("Pick another feed for this event.", style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp)) {
             itemsIndexed(feeds) { i, feed ->
-                val selected = i == currentIndex
-                Surface(
+                StreamRow(
+                    label = feed.label.ifBlank { "Stream ${i + 1}" },
+                    selected = i == currentIndex,
+                    focusRequester = if (i == 0) firstFocus else null,
                     onClick = { onSelect(i) },
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (selected) Brand.Violet else Brand.Surface,
-                    contentColor = if (selected) Color.White else Brand.OnSurface,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .then(if (i == currentIndex.coerceIn(0, (feeds.size - 1).coerceAtLeast(0))) Modifier.focusRequester(firstFocus) else Modifier),
-                ) {
-                    Text(
-                        feed.label.ifBlank { "Stream ${i + 1}" },
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(14.dp),
-                    )
-                }
+                )
             }
         }
+    }
+}
+
+/** A D-pad-focusable feed row (focusable + clickable so Center/Enter selects it; explicit focus highlight). */
+@Composable
+private fun StreamRow(
+    label: String,
+    selected: Boolean,
+    focusRequester: FocusRequester?,
+    onClick: () -> Unit,
+) {
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(12.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .clip(shape)
+            .background(
+                when {
+                    focused -> Brand.Violet
+                    selected -> Brand.SurfaceVariant
+                    else -> Brand.Surface
+                },
+            )
+            .border(
+                androidx.compose.foundation.BorderStroke(if (focused) 3.dp else 0.dp, if (focused) Color.White else Color.Transparent),
+                shape,
+            )
+            .clickable(interactionSource = interaction, indication = null) { onClick() }
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (selected) Text("●  ", color = Brand.Cyan, style = MaterialTheme.typography.titleMedium)
+        Text(
+            label,
+            style = MaterialTheme.typography.titleMedium,
+            color = if (focused) Color.White else Brand.OnSurface,
+        )
     }
 }
 
