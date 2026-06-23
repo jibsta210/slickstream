@@ -24,6 +24,12 @@ val localProps = Properties().apply {
 fun secret(key: String, default: String = ""): String =
     localProps.getProperty(key) ?: System.getenv(key) ?: default
 
+// Monotonic version so the in-app updater can recognise a newer build. Precedence:
+// gradle -PversionCode=N  >  local.properties/env VERSION_CODE  >  baseline. CI passes the run
+// number; bump the baseline whenever you cut a manual release.
+val appVersionCode: Int = ((findProperty("versionCode") as String?) ?: secret("VERSION_CODE", "2")).toInt()
+val appVersionName: String = (findProperty("versionName") as String?) ?: secret("VERSION_NAME", "1.1.0")
+
 android {
     namespace = "com.slickstream"
     compileSdk = 35
@@ -32,8 +38,8 @@ android {
         applicationId = "com.slickstream"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
 
@@ -48,18 +54,36 @@ android {
         buildConfigField("String", "SUBTITLE_BASE_URL", "\"${secret("SUBTITLE_BASE_URL", "https://opensubtitles-v3.strem.io/")}\"")
         // Live-sports schedule/stream source (streamed.pk-compatible REST). Keyless, user-overridable.
         buildConfigField("String", "SPORTS_BASE_URL", "\"${secret("SPORTS_BASE_URL", "https://streamed.pk/")}\"")
-        // In-app updater: version manifest hosted on GitHub Releases (override in local.properties).
-        buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${secret("UPDATE_MANIFEST_URL", "https://github.com/jibsta210/slickstream/releases/latest/download/update.json")}\"")
+        // In-app updater: version manifest on a PUBLIC releases repo (a private repo's release
+        // assets aren't anonymously downloadable). Override in local.properties.
+        buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${secret("UPDATE_MANIFEST_URL", "https://github.com/jibsta210/slickstream-releases/releases/latest/download/update.json")}\"")
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"${secret("GOOGLE_WEB_CLIENT_ID")}\"")
         // "TVs and Limited Input devices" OAuth client for the Android TV device-pairing flow.
         buildConfigField("String", "GOOGLE_TV_CLIENT_ID", "\"${secret("GOOGLE_TV_CLIENT_ID")}\"")
         buildConfigField("String", "GOOGLE_TV_CLIENT_SECRET", "\"${secret("GOOGLE_TV_CLIENT_SECRET")}\"")
     }
 
+    // Stable release signing — REQUIRED for the in-app updater: an update only installs over the
+    // existing app when both APKs share one certificate. Configure a keystore in local.properties
+    // (RELEASE_STORE_FILE / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD); if
+    // absent, release falls back to debug signing so the project still builds.
+    signingConfigs {
+        val storePath = secret("RELEASE_STORE_FILE")
+        if (storePath.isNotBlank() && rootProject.file(storePath).exists()) {
+            create("release") {
+                storeFile = rootProject.file(storePath)
+                storePassword = secret("RELEASE_STORE_PASSWORD")
+                keyAlias = secret("RELEASE_KEY_ALIAS")
+                keyPassword = secret("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
         debug {
             isMinifyEnabled = false

@@ -20,6 +20,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.mediarouter.media.MediaRouteSelector
 import com.slickstream.cast.CastManager
+import com.slickstream.core.common.DeviceProfile
 import com.slickstream.core.model.DataResult
 import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
@@ -77,6 +78,7 @@ class PlayerViewModel @Inject constructor(
     private val castManager: CastManager,
     private val settingsRepository: SettingsRepository,
     private val subtitleRepository: SubtitleRepository,
+    private val deviceProfile: DeviceProfile,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
@@ -298,13 +300,24 @@ class PlayerViewModel @Inject constructor(
         }
 
         // Start playing with a small buffer so we don't sit idle while the torrent fills ahead.
+        // On low-power TV, hard-cap the buffer to ~8 MB: the default 50s duration buffer can hold
+        // 60-95 MB of a high-bitrate stream — identical on a phone and a 1.5 GB TV — which drives the
+        // OOM/page-eviction pressure that freezes the whole device. bufferForPlaybackMs stays 1_500 so
+        // first-frame latency is unchanged.
+        val lowPower = deviceProfile.isLowPower
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                15_000, // minBufferMs
-                50_000, // maxBufferMs
-                1_500,  // bufferForPlaybackMs — begin playback this fast
-                3_000,  // bufferForPlaybackAfterRebufferMs
+                if (lowPower) 8_000 else 15_000,  // minBufferMs
+                if (lowPower) 20_000 else 50_000, // maxBufferMs
+                1_500,                            // bufferForPlaybackMs — begin playback this fast
+                3_000,                            // bufferForPlaybackAfterRebufferMs
             )
+            .apply {
+                if (lowPower) {
+                    setTargetBufferBytes(8 * 1024 * 1024)
+                    setPrioritizeTimeOverSizeThresholds(false)
+                }
+            }
             .build()
         val exo = ExoPlayer.Builder(appContext).setLoadControl(loadControl).build().apply {
             setMediaItem(buildMediaItem(url))
@@ -571,6 +584,9 @@ class PlayerViewModel @Inject constructor(
     /** Warm the next episode when within [PREFETCH_LEAD_MS] / [PREFETCH_PCT] of the end. */
     private fun maybeWarmNextEpisode() {
         if (mediaType != MediaType.TV) return
+        // No concurrent second-torrent download on a weak TV SoC — a full hash+disk+peer load during
+        // playback is a direct freeze trigger. Cost is only a buffering spinner between episodes.
+        if (deviceProfile.isLowPower) return
         if (prefetchTriggeredForEpisode) return
         if (_isCasting.value) return                 // remote playback: a phone-side head buffer is useless
         if (!isOnUnmeteredNetwork()) return

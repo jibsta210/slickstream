@@ -20,6 +20,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
+import com.slickstream.core.common.DeviceProfile
 import com.slickstream.feature.update.UpdateGate
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
@@ -46,7 +47,11 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var settingsRepository: SettingsRepository
 
-    private val onTv: Boolean by lazy { isRunningOnTv(this) }
+    @Inject
+    lateinit var deviceProfile: DeviceProfile
+
+    // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
+    private val onTv: Boolean get() = deviceProfile.isTv
 
     // PiP state, driven by the player screen through [pipController].
     private var pipEnabled = false
@@ -129,9 +134,4 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-}
-
-fun isRunningOnTv(context: Context): Boolean {
-    val uiModeManager = context.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
-    return uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
 }

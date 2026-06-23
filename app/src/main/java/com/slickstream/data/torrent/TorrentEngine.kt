@@ -1,10 +1,8 @@
 package com.slickstream.data.torrent
 
-import android.app.ActivityManager
-import android.app.UiModeManager
 import android.content.Context
-import android.content.res.Configuration
 import android.util.Log
+import com.slickstream.core.common.DeviceProfile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
 import org.libtorrent4j.AddTorrentParams
@@ -41,6 +39,7 @@ import javax.inject.Singleton
 @Singleton
 class TorrentEngine @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val deviceProfile: DeviceProfile,
 ) {
 
     private val session = SessionManager()
@@ -92,25 +91,56 @@ class TorrentEngine @Inject constructor(
         if (started.get()) return
         // Android TV boxes / low-RAM devices choke on aggressive torrenting (hundreds of peer
         // connections + piece hashing + decode saturate a weak SoC and freeze the UI). Throttle.
-        val lowPower = isLowPowerDevice()
+        val lowPower = deviceProfile.isLowPower
         readaheadBytes = if (lowPower) LOW_POWER_READAHEAD_BYTES else READAHEAD_BYTES
         val sp = SettingsPack().apply {
-            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 80 else 400)
+            // --- Peer load (the freeze comes from too many sockets + per-peer crypto on a weak SoC) ---
+            // 20 peers still saturates any single video bitrate; 400 stays for capable devices.
+            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 20 else 400)
             setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 4 else 8)
             setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 4 else 8)
             setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 8 else 16)
-            // Fast start on capable devices; gentle peer ramp on low-power ones.
-            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 30 else 200)
-            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 60 else 500)
-            setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), true)
-            setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), true)
+            // Flatten the connection burst/ramp on TV — the 30-conn boost spike landed right at the
+            // buffering moment the device froze. 8/12 still gives the sequential head ample peers.
+            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 8 else 200)
+            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 12 else 500)
+            // Announce to only the first working tier on low-power (less inbound peer flood to crypt).
+            setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), !lowPower)
+            setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), !lowPower)
+            // Keep DHT (needed for poorly-seeded discovery), but drop LSD/UPnP/NAT-PMP background
+            // network+CPU work a pure leech/stream TV client never needs.
             setBoolean(settings_pack.bool_types.enable_dht.swigValue(), true)
-            setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), true)
-            setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), true)
-            setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), true)
-            // No rate caps — let the pipe fill.
+            setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), !lowPower)
+            setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), !lowPower)
+            setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), !lowPower)
             setInteger(settings_pack.int_types.upload_rate_limit.swigValue(), 0)
-            setInteger(settings_pack.int_types.download_rate_limit.swigValue(), 0)
+            // THE biggest freeze lever: an 8 MB/s download cap on low-power bounds SHA-1 hashing
+            // throughput + eMMC write pressure + ExoPlayer buffer-fill rate all at once. 8 (not 4)
+            // MB/s keeps the 6 MB head + 1 MB moov startup fuel arriving in <1s (preserves the
+            // sequential-download latency fix). Capable devices stay uncapped.
+            setInteger(
+                settings_pack.int_types.download_rate_limit.swigValue(),
+                if (lowPower) 8 * 1024 * 1024 else 0,
+            )
+
+            // Pin the disk/hash worker pools to 1 on low-power — libtorrent otherwise scales them to
+            // hardware_concurrency and saturates every weak core + contends for slow eMMC. Throughput
+            // is already bounded by the rate cap above, not by parallel hashing. Guarded in case a
+            // key enum is absent in this libtorrent4j build.
+            runCatching {
+                setInteger(settings_pack.int_types.aio_threads.swigValue(), if (lowPower) 1 else 4)
+                setInteger(settings_pack.int_types.hashing_threads.swigValue(), if (lowPower) 1 else 2)
+            }
+            // Bound dirty writeback + open handles + unchoke slots on low-power so libtorrent flushes
+            // small steady batches instead of bursting the slow eMMC.
+            if (lowPower) {
+                runCatching {
+                    setInteger(settings_pack.int_types.max_queued_disk_bytes.swigValue(), 1 * 1024 * 1024)
+                    setInteger(settings_pack.int_types.file_pool_size.swigValue(), 4)
+                    setBoolean(settings_pack.bool_types.no_atime_storage.swigValue(), true)
+                    setInteger(settings_pack.int_types.unchoke_slots_limit.swigValue(), 4)
+                }
+            }
 
             // Streaming-oriented tuning (libtorrent 2.0-correct; NO cache_size — removed in 2.0).
             setInteger(
@@ -140,14 +170,8 @@ class TorrentEngine @Inject constructor(
         return
     }
 
-    /** Android TV or a system-flagged low-RAM device — both warrant gentle torrent settings. */
-    private fun isLowPowerDevice(): Boolean {
-        val isTv = (context.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager)
-            ?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
-        val lowRam = (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
-            ?.isLowRamDevice == true
-        return isTv || lowRam
-    }
+    /** Android TV or a system-flagged low-RAM device — both warrant gentle torrent + read settings. */
+    val isLowPower: Boolean get() = deviceProfile.isLowPower
 
     private val sessionListener = object : AlertListener {
         override fun types(): IntArray = intArrayOf(

@@ -180,9 +180,17 @@ class StreamHttpServer(
         private var position = start
         private var raf: RandomAccessFile? = null
 
-        private fun raf(): RandomAccessFile {
-            return raf ?: RandomAccessFile(file, "r").also { raf = it }
-        }
+        // One eMMC read of [chunkSize] services many of NanoHTTPD's small read() calls, so the
+        // ensureRange()/advanceReadHead() native round-trips fire ~16-64x less often. On a no-NCQ
+        // TV eMMC, a few large sequential reads beat thousands of tiny random-ish ones — this is a
+        // big part of stopping the disk-contention freeze. 256 KB on low-power is heap-safe.
+        private val chunkSize = if (engine.isLowPower) 256 * 1024 else 1024 * 1024
+        private val chunk = ByteArray(chunkSize)
+        private var chunkStart = -1L
+        private var chunkLen = 0
+
+        private fun raf(): RandomAccessFile =
+            raf ?: RandomAccessFile(file, "r").also { raf = it }
 
         override fun read(): Int {
             val single = ByteArray(1)
@@ -192,50 +200,61 @@ class StreamHttpServer(
 
         override fun read(b: ByteArray, off: Int, len: Int): Int {
             if (position > end) return -1
-            val remaining = end - position + 1
-            val toRead = minOf(len.toLong(), remaining).toInt()
-            if (toRead <= 0) return -1
+            // Refill the look-ahead chunk when the read position leaves the current window.
+            if (position < chunkStart || position >= chunkStart + chunkLen) {
+                fillChunk()
+                if (chunkLen <= 0) return -1
+            }
+            val inChunk = (position - chunkStart).toInt()
+            val toCopy = minOf(len, chunkLen - inChunk)
+            System.arraycopy(chunk, inChunk, b, off, toCopy)
+            position += toCopy
+            return toCopy
+        }
 
-            // Ensure the bytes we're about to read are downloaded.
-            val rangeEnd = position + toRead - 1
-            // Tell the engine where the player (or Chromecast) is reading so it keeps the
-            // sliding look-ahead band hot ahead of this position.
-            engine.advanceReadHead(infoHash, position)
+        /** Ensure + flush-retry one [chunkSize] window starting at the current read position. */
+        private fun fillChunk() {
+            val fillStart = position
+            val fillEnd = minOf(fillStart + chunkSize - 1, end)
+            val want = (fillEnd - fillStart + 1).toInt()
+
+            // Keep the engine's look-ahead band hot at the ACTUAL read position (not a buffer-fill
+            // position) so head prioritisation tracks where the player really is.
+            engine.advanceReadHead(infoHash, fillStart)
             val ready = runBlocking {
-                engine.ensureRange(infoHash, position, rangeEnd, READ_WAIT_TIMEOUT_MS)
+                engine.ensureRange(infoHash, fillStart, fillEnd, READ_WAIT_TIMEOUT_MS)
             }
-            if (!ready) {
-                // Couldn't get the data in time — surface as a transient I/O error so the
-                // player retries rather than treating it as EOF.
-                throw IOException("range $position-$rangeEnd not available")
-            }
+            if (!ready) throw IOException("range $fillStart-$fillEnd not available")
 
             // Pieces report present, but libtorrent flips the bitfield on hash-pass *before* its
-            // write cache is flushed to disk, so the RAF can briefly read 0 bytes. Retry against a
-            // hard wall-clock deadline — NO recursion (constant stack, can't StackOverflow) so the
-            // NanoHTTPD worker thread can never hang indefinitely.
+            // write cache is flushed to disk, so the RAF can briefly read short. Retry against a hard
+            // wall-clock deadline, re-seeking the SAME handle (reopening does NOT surface unflushed
+            // data — that just storms open()/close()/seek() syscalls at flash blocks libtorrent is
+            // mid-write on). Only reopen on a real IOException.
             val deadlineNanos = System.nanoTime() + FLUSH_WAIT_BUDGET_MS * 1_000_000L
             var backoff = 10L
-            while (true) {
+            var filled = 0
+            while (filled < want) {
                 val n = try {
-                    raf().apply { seek(position) }.read(b, off, toRead)
+                    raf().apply { seek(fillStart + filled) }.read(chunk, filled, want - filled)
                 } catch (e: IOException) {
                     Log.w(TAG, "read error, reopening", e)
                     raf?.close(); raf = null
                     -1
                 }
                 if (n > 0) {
-                    position += n
-                    return n
+                    filled += n
+                    continue
                 }
                 if (System.nanoTime() >= deadlineNanos) {
-                    throw IOException("backing file not flushed for $position-$rangeEnd")
+                    if (filled > 0) break // serve what flushed; the next read refills the remainder
+                    throw IOException("backing file not flushed for $fillStart")
                 }
-                // Drop the stale handle, back off, and re-seek so we observe freshly flushed data.
-                raf?.close(); raf = null
                 Thread.sleep(backoff)
                 backoff = (backoff * 2).coerceAtMost(200L)
             }
+            chunkStart = fillStart
+            chunkLen = filled
         }
 
         override fun available(): Int {

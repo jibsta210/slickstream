@@ -15,3 +15,7 @@ local.properties
 
 # Firebase config (machine-specific secret)
 **/google-services.json
+
+# Release signing keystores (never commit)
+*.jks
+*.keystore

@@ -1,7 +1,5 @@
 package com.slickstream.feature.update
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,14 +9,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -120,6 +125,12 @@ private fun UpdateDialog(
                 }
                 if (primaryLabel != null || secondaryLabel != null) {
                     Spacer(Modifier.height(24.dp))
+                    // Land the D-pad on the primary action so a TV remote can drive the dialog
+                    // (a mandatory update with no focusable button would otherwise soft-lock a TV).
+                    val primaryFocus = remember { FocusRequester() }
+                    LaunchedEffect(primaryLabel) {
+                        if (primaryLabel != null) runCatching { primaryFocus.requestFocus() }
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.End,
@@ -128,7 +139,14 @@ private fun UpdateDialog(
                             PillButton(secondaryLabel, ghost = true, onClick = onSecondary)
                             Spacer(Modifier.width(8.dp))
                         }
-                        if (primaryLabel != null) PillButton(primaryLabel, ghost = false, onClick = onPrimary)
+                        if (primaryLabel != null) {
+                            PillButton(
+                                primaryLabel,
+                                ghost = false,
+                                onClick = onPrimary,
+                                modifier = Modifier.focusRequester(primaryFocus),
+                            )
+                        }
                     }
                 }
             }
@@ -137,16 +155,33 @@ private fun UpdateDialog(
 }
 
 @Composable
-private fun PillButton(label: String, ghost: Boolean, onClick: () -> Unit) {
-    Text(
-        text = label,
-        style = MaterialTheme.typography.labelLarge,
-        fontWeight = if (ghost) FontWeight.Normal else FontWeight.SemiBold,
-        color = if (ghost) Brand.OnSurfaceDim else Brand.Background,
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .then(if (ghost) Modifier else Modifier.background(Brand.Violet))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 10.dp),
-    )
+private fun PillButton(
+    label: String,
+    ghost: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Material3 buttons are focusable + DPAD_CENTER-operable, so the dialog works on a TV remote
+    // (the old clickable Text was not focusable). Still a styled Compose dialog — never native.
+    if (ghost) {
+        TextButton(
+            onClick = onClick,
+            modifier = modifier,
+            colors = ButtonDefaults.textButtonColors(contentColor = Brand.OnSurfaceDim),
+        ) {
+            Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Normal)
+        }
+    } else {
+        Button(
+            onClick = onClick,
+            modifier = modifier,
+            shape = RoundedCornerShape(50),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Brand.Violet,
+                contentColor = Brand.Background,
+            ),
+        ) {
+            Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        }
+    }
 }
