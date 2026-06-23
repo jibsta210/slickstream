@@ -2,33 +2,57 @@ package com.slickstream.feature.live
 
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -39,8 +63,9 @@ import androidx.media3.ui.PlayerView
 import com.slickstream.ui.theme.Brand
 
 /**
- * Full-screen HLS player for a live-sports feed. Uses Media3's built-in transport controls (which
- * work with both touch and the TV D-pad), with a brand back button + buffering / error overlays.
+ * Full-screen HLS player for live sports. Chrome (back + "Switch stream") auto-hides after a few
+ * seconds while playing and reappears on any D-pad press (TV) or tap (phone). The Switch-stream
+ * panel lets the user change to another of the event's feeds WITHOUT leaving the player.
  */
 @OptIn(UnstableApi::class)
 @Composable
@@ -50,23 +75,63 @@ fun LivePlayerScreen(
     viewModel: LivePlayerViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
-    BackHandler { onBack() }
-
-    // Land the D-pad on the back button and keep it there, so TV always has a visible exit.
-    val backFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
-
     val player by viewModel.player.collectAsStateWithLifecycle()
+    val currentIndex by viewModel.currentIndex.collectAsStateWithLifecycle()
+    val feeds = viewModel.feeds
 
-    Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
+    var controlsVisible by remember { mutableStateOf(true) }
+    var panelOpen by remember { mutableStateOf(false) }
+    val playing = state is LivePlayerViewModel.UiState.Playing
+
+    val rootFocus = remember { FocusRequester() }
+    val backFocus = remember { FocusRequester() }
+
+    BackHandler {
+        when {
+            panelOpen -> panelOpen = false
+            playing && controlsVisible -> controlsVisible = false
+            else -> onBack()
+        }
+    }
+
+    // Auto-hide the chrome while actively playing.
+    LaunchedEffect(controlsVisible, panelOpen, playing) {
+        if (controlsVisible && !panelOpen && playing) {
+            kotlinx.coroutines.delay(4_000)
+            controlsVisible = false
+        }
+    }
+    // Keep a focus target: the back button when chrome is up, else the root (so any key re-shows it).
+    LaunchedEffect(controlsVisible, panelOpen, playing) {
+        runCatching {
+            when {
+                panelOpen -> Unit
+                controlsVisible || !playing -> backFocus.requestFocus()
+                else -> rootFocus.requestFocus()
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .focusRequester(rootFocus)
+            .focusable()
+            .onPreviewKeyEvent { e ->
+                if (e.type == KeyEventType.KeyDown && e.key != Key.Back && !controlsVisible && !panelOpen) {
+                    controlsVisible = true
+                    true
+                } else {
+                    false
+                }
+            }
+            .pointerInput(Unit) { detectTapGestures { controlsVisible = !controlsVisible } },
+    ) {
         if (player != null) {
             AndroidView(
                 factory = { ctx ->
                     PlayerView(ctx).apply {
-                        this.player = player
-                        // No Media3 controller: on Android TV it swallows the BACK key (to hide its
-                        // own controls) so BACK never reaches the Compose BackHandler — that's why
-                        // the user got stuck. It also traps D-pad focus. We draw our own back button.
                         useController = false
                         isFocusable = false
                         isFocusableInTouchMode = false
@@ -74,6 +139,7 @@ fun LivePlayerScreen(
                         setShutterBackgroundColor(android.graphics.Color.BLACK)
                     }
                 },
+                update = { it.player = player },
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -84,34 +150,116 @@ fun LivePlayerScreen(
                 Text(viewModel.title, style = MaterialTheme.typography.titleLarge, color = Color.White)
                 Text("Connecting to live feed…", style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
             }
-
             is LivePlayerViewModel.UiState.Error -> CenterOverlay {
                 Text("Couldn't play this feed", style = MaterialTheme.typography.titleLarge, color = Color.White)
                 Text(s.message, style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim, textAlign = TextAlign.Center)
-                androidx.compose.foundation.layout.Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(onClick = viewModel::retry) { Text("Retry") }
+                    if (feeds.size > 1) Button(onClick = { panelOpen = true }) { Text("Other streams") }
                     Button(onClick = onBack) { Text("Back") }
                 }
             }
-
             LivePlayerViewModel.UiState.NoStream -> CenterOverlay {
                 Text("No stream selected", style = MaterialTheme.typography.titleLarge, color = Color.White)
                 Button(onClick = onBack) { Text("Back") }
             }
-
             LivePlayerViewModel.UiState.Playing -> Unit
         }
 
-        // Brand back button, top-left — focusable + auto-focused so a TV remote can always exit.
-        IconButton(
-            onClick = onBack,
-            modifier = Modifier
-                .padding(16.dp)
-                .focusRequester(backFocus)
-                .clip(CircleShape)
-                .background(Color(0x66000000)),
+        // Chrome: back (always while not playing; auto-hides while playing) + switch-stream.
+        AnimatedVisibility(
+            visible = controlsVisible || !playing,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.TopStart),
         ) {
-            Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White)
+            IconButton(
+                onClick = onBack,
+                modifier = Modifier.padding(16.dp).focusRequester(backFocus).clip(CircleShape).background(Color(0x66000000)),
+            ) {
+                Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = Color.White)
+            }
+        }
+
+        AnimatedVisibility(
+            visible = controlsVisible && playing && feeds.size > 1,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier.align(Alignment.TopEnd),
+        ) {
+            Surface(
+                onClick = { panelOpen = true },
+                shape = RoundedCornerShape(50),
+                color = Color(0x66000000),
+                contentColor = Color.White,
+                modifier = Modifier.padding(16.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Rounded.SwapHoriz, contentDescription = null, modifier = Modifier.size(20.dp))
+                    Text("  Switch stream", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+
+        // Switch-stream side panel.
+        AnimatedVisibility(
+            visible = panelOpen,
+            enter = slideInHorizontally { it } + fadeIn(),
+            exit = slideOutHorizontally { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.CenterEnd),
+        ) {
+            StreamsPanel(
+                feeds = feeds,
+                currentIndex = currentIndex,
+                onSelect = { viewModel.switchTo(it); panelOpen = false; controlsVisible = true },
+                onClose = { panelOpen = false },
+            )
+        }
+    }
+}
+
+@Composable
+private fun StreamsPanel(
+    feeds: List<LivePlaybackHolder.Feed>,
+    currentIndex: Int,
+    onSelect: (Int) -> Unit,
+    onClose: () -> Unit,
+) {
+    BackHandler(enabled = true) { onClose() }
+    val firstFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
+    Column(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(440.dp)
+            .background(Color(0xF2101019))
+            .padding(28.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Streams", style = MaterialTheme.typography.titleLarge, color = Brand.OnSurface)
+        Text("Pick another feed for this event.", style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp)) {
+            itemsIndexed(feeds) { i, feed ->
+                val selected = i == currentIndex
+                Surface(
+                    onClick = { onSelect(i) },
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (selected) Brand.Violet else Brand.Surface,
+                    contentColor = if (selected) Color.White else Brand.OnSurface,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(if (i == currentIndex.coerceIn(0, (feeds.size - 1).coerceAtLeast(0))) Modifier.focusRequester(firstFocus) else Modifier),
+                ) {
+                    Text(
+                        feed.label.ifBlank { "Stream ${i + 1}" },
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(14.dp),
+                    )
+                }
+            }
         }
     }
 }
@@ -125,7 +273,7 @@ private fun androidx.compose.foundation.layout.BoxScope.CenterOverlay(content: @
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
-            modifier = Modifier.width(520.dp),
+            modifier = Modifier.width(560.dp),
         ) { content() }
     }
 }

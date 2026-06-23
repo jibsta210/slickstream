@@ -93,7 +93,7 @@ fun SportsScreen(
     sheet?.let { s ->
         StreamPicker(
             sheet = s,
-            onSelect = { stream -> viewModel.prepareToPlay(s.event, stream); onOpenPlayer() },
+            onSelect = { stream -> viewModel.prepareToPlay(s, stream); onOpenPlayer() },
             onDismiss = viewModel::dismissStreams,
         )
     }

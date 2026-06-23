@@ -106,7 +106,7 @@ fun TvSportsScreen(
             sheet?.let { s ->
                 TvStreamPanel(
                     sheet = s,
-                    onSelect = { stream -> viewModel.prepareToPlay(s.event, stream); onOpenPlayer() },
+                    onSelect = { stream -> viewModel.prepareToPlay(s, stream); onOpenPlayer() },
                     onClose = viewModel::dismissStreams,
                 )
             }

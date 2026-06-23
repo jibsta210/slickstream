@@ -50,29 +50,48 @@ class LivePlayerViewModel @Inject constructor(
 
     val title: String = holder.current?.title ?: "Live"
 
+    /** All feeds for the event — labels for the in-player stream switcher. */
+    val feeds: List<LivePlaybackHolder.Feed> = holder.current?.feeds ?: emptyList()
+
+    private val _currentIndex = MutableStateFlow(holder.current?.index ?: 0)
+    val currentIndex: StateFlow<Int> = _currentIndex.asStateFlow()
+
+    private var playJob: kotlinx.coroutines.Job? = null
+
     init {
-        val sel = holder.current
-        if (sel == null) {
-            _uiState.value = UiState.NoStream
-        } else {
-            viewModelScope.launch {
-                val playUrl = if (sel.needsResolution) {
-                    // Resolve the embed -> m3u8 invisibly (shows the buffering overlay meanwhile).
-                    // The embed page's referrer check wants its PARENT site (streamed.pk); the
-                    // resulting m3u8 is then played with the embed.st headers in sel.headers.
-                    resolver.resolve(
-                        embedUrl = sel.url,
-                        pageReferer = "https://streamed.pk/",
-                        userAgent = sel.headers["User-Agent"] ?: DEFAULT_UA,
-                    )
-                } else {
-                    sel.url
-                }
-                if (playUrl.isNullOrBlank()) {
-                    _uiState.value = UiState.Error("Couldn't find a playable stream for this feed. Try another source.")
-                } else {
-                    buildPlayer(playUrl, sel.headers)
-                }
+        if (holder.current == null) _uiState.value = UiState.NoStream
+        else play(_currentIndex.value)
+    }
+
+    /** Switch to another feed for the same event without leaving the player. */
+    fun switchTo(index: Int) {
+        if (index == _currentIndex.value || index !in feeds.indices) return
+        _currentIndex.value = index
+        play(index)
+    }
+
+    private fun play(index: Int) {
+        val feed = feeds.getOrNull(index) ?: return
+        playJob?.cancel()
+        _player.value?.release()
+        _player.value = null
+        _uiState.value = UiState.Buffering
+        playJob = viewModelScope.launch {
+            val playUrl = if (feed.needsResolution) {
+                // Resolve the embed -> m3u8 invisibly. The embed's referrer check wants its PARENT
+                // site (streamed.pk); the resulting m3u8 plays with the embed.st headers.
+                resolver.resolve(
+                    embedUrl = feed.url,
+                    pageReferer = "https://streamed.pk/",
+                    userAgent = feed.headers["User-Agent"] ?: DEFAULT_UA,
+                )
+            } else {
+                feed.url
+            }
+            if (playUrl.isNullOrBlank()) {
+                _uiState.value = UiState.Error("Couldn't find a playable stream for this feed. Try another source.")
+            } else {
+                buildPlayer(playUrl, feed.headers)
             }
         }
     }
@@ -108,10 +127,7 @@ class LivePlayerViewModel @Inject constructor(
     }
 
     fun retry() {
-        val p = _player.value ?: return
-        _uiState.value = UiState.Buffering
-        p.prepare()
-        p.playWhenReady = true
+        play(_currentIndex.value)
     }
 
     override fun onCleared() {

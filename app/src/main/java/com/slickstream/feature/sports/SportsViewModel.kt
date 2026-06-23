@@ -104,12 +104,14 @@ class SportsViewModel @Inject constructor(
     fun dismissStreams() { _sheet.value = null }
 
     /** Stash the chosen feed for [com.slickstream.feature.live.LivePlayerViewModel] and clear the sheet. */
-    fun prepareToPlay(event: SportEvent, stream: SportStream) {
+    fun prepareToPlay(sheet: StreamSheet, stream: SportStream) {
+        val feeds = sheet.streams.map {
+            com.slickstream.feature.live.LivePlaybackHolder.Feed(it.label, it.url, it.headers, it.needsResolution)
+        }
         playbackHolder.set(
-            title = event.title,
-            url = stream.url,
-            headers = stream.headers,
-            needsResolution = stream.needsResolution,
+            title = sheet.event.title,
+            feeds = feeds,
+            index = sheet.streams.indexOf(stream).coerceAtLeast(0),
         )
         _sheet.value = null
     }
