@@ -1,0 +1,91 @@
+name: Release
+
+# Push a tag like v1.1.2 (or run manually) -> builds a signed, minified release APK,
+# auto-increments versionCode, and publishes the APK + update.json so the in-app updater
+# picks it up. Requires repo secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS,
+# TMDB_API_KEY, TMDB_BEARER, GOOGLE_WEB_CLIENT_ID.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      versionName:
+        description: 'Version name, e.g. 1.1.2'
+        required: true
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/slickstream-release.jks"
+
+      - name: Compute version
+        id: ver
+        run: |
+          VC=$((1000 + GITHUB_RUN_NUMBER))
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VN="${GITHUB_REF_NAME#v}"
+          else
+            VN="${{ github.event.inputs.versionName }}"
+          fi
+          echo "vc=$VC" >> "$GITHUB_OUTPUT"
+          echo "vn=$VN" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VN}" >> "$GITHUB_OUTPUT"
+          echo "Building versionCode=$VC versionName=$VN"
+
+      - name: Build signed release
+        env:
+          RELEASE_STORE_FILE: slickstream-release.jks
+          RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          TMDB_BEARER: ${{ secrets.TMDB_BEARER }}
+          GOOGLE_WEB_CLIENT_ID: ${{ secrets.GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease \
+            -PversionCode=${{ steps.ver.outputs.vc }} \
+            -PversionName=${{ steps.ver.outputs.vn }} \
+            --no-daemon --stacktrace
+
+      - name: Stage assets + manifest
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk slickstream.apk
+          SHA=$(sha256sum slickstream.apk | awk '{print $1}')
+          cat > update.json <<EOF
+          {
+            "versionCode": ${{ steps.ver.outputs.vc }},
+            "versionName": "${{ steps.ver.outputs.vn }}",
+            "apkUrl": "https://github.com/${{ github.repository }}/releases/latest/download/slickstream.apk",
+            "notes": "SlickStream ${{ steps.ver.outputs.vn }}",
+            "mandatory": false,
+            "sha256": "$SHA"
+          }
+          EOF
+          echo "sha256=$SHA"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          gh release create "$TAG" slickstream.apk update.json \
+            --repo "${{ github.repository }}" \
+            --title "SlickStream ${{ steps.ver.outputs.vn }}" \
+            --notes "Automated signed release (versionCode ${{ steps.ver.outputs.vc }})." \
+          || gh release upload "$TAG" slickstream.apk update.json --clobber --repo "${{ github.repository }}"
