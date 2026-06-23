@@ -1,5 +1,6 @@
 package com.slickstream.navigation
 
+import android.net.Uri
 import com.slickstream.core.model.MediaType
 
 /**
@@ -24,6 +25,17 @@ object Routes {
     const val PLAYER = "player/{mediaType}/{mediaId}?season={season}&episode={episode}"
     fun player(type: MediaType, id: Int, season: Int? = null, episode: Int? = null) =
         "player/${type.name}/$id?season=${season ?: -1}&episode=${episode ?: -1}"
+
+    // category/{mediaType}/{genreId}/{genreName} — full grid for one genre ("Kids", "Action", …)
+    const val CATEGORY = "category/{mediaType}/{genreId}/{genreName}"
+    fun category(type: MediaType, genreId: Int, name: String) =
+        "category/${type.name}/$genreId/${Uri.encode(name)}"
+
+    // Live sports — top-level tab + a per-category grid (sport/league).
+    const val SPORTS = "sports"
+    const val SPORTS_CATEGORY = "sports/{sportId}/{sportName}"
+    fun sportsCategory(sportId: String, name: String) =
+        "sports/${Uri.encode(sportId)}/${Uri.encode(name)}"
 }
 
 /** Nav argument keys (kept in one place so screens + host agree). */
@@ -33,6 +45,10 @@ object NavArg {
     const val SEASON = "season"
     const val EPISODE = "episode"
     const val QUERY = "query"
+    const val GENRE_ID = "genreId"
+    const val GENRE_NAME = "genreName"
+    const val SPORT_ID = "sportId"
+    const val SPORT_NAME = "sportName"
 }
 
 /** Bottom-nav destinations for phone: Home, Movies, TV, Favourites. (Search + Profile are

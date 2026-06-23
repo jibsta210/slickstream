@@ -3,6 +3,7 @@ package com.slickstream.feature.catalog
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.slickstream.core.model.DataResult
+import com.slickstream.core.model.Genre
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.repository.CatalogRepository
@@ -28,6 +29,10 @@ class CatalogViewModel @Inject constructor(
 
     private val _state = MutableStateFlow(HomeUiState())
     val state: StateFlow<HomeUiState> = _state.asStateFlow()
+
+    /** The full genre list for the current tab, surfaced as browseable category chips. */
+    private val _genres = MutableStateFlow<List<Genre>>(emptyList())
+    val genres: StateFlow<List<Genre>> = _genres.asStateFlow()
 
     private var loadedType: MediaType? = null
 
@@ -56,7 +61,9 @@ class CatalogViewModel @Inject constructor(
             val popular = popularDef.await()
             val topRated = topRatedDef.await()
             val newest = newDef.await()
-            val genres = (genresDef.await() as? DataResult.Success)?.data.orEmpty().take(4)
+            val allGenres = (genresDef.await() as? DataResult.Success)?.data.orEmpty()
+            _genres.value = allGenres
+            val genres = allGenres.take(4)
 
             val genreRows = genres
                 .map { g -> g.name to async { catalog.getByGenre(mediaType, g.id) } }

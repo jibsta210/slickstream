@@ -95,6 +95,7 @@ import com.slickstream.feature.details.DetailsScreen
 import com.slickstream.feature.favorites.FavoritesScreen
 import com.slickstream.feature.home.HomeScreen
 import com.slickstream.feature.player.PlayerScreen
+import com.slickstream.feature.catalog.CategoryScreen
 import com.slickstream.feature.profile.ProfileScreen
 import com.slickstream.feature.settings.SettingsScreen
 import com.slickstream.feature.search.SearchUiState
@@ -204,6 +205,9 @@ fun PhoneApp() {
                     mediaType = MediaType.MOVIE,
                     onMediaClick = { item -> navController.navigateToDetails(item) },
                     onPlayClick = { item -> navController.navigateToPlayer(item) },
+                    onCategoryClick = { genreId, name ->
+                        navController.navigate(Routes.category(MediaType.MOVIE, genreId, name))
+                    },
                 )
             }
 
@@ -212,6 +216,9 @@ fun PhoneApp() {
                     mediaType = MediaType.TV,
                     onMediaClick = { item -> navController.navigateToDetails(item) },
                     onPlayClick = { item -> navController.navigateToPlayer(item) },
+                    onCategoryClick = { genreId, name ->
+                        navController.navigate(Routes.category(MediaType.TV, genreId, name))
+                    },
                 )
             }
 
@@ -243,6 +250,27 @@ fun PhoneApp() {
 
             composable(Routes.SETTINGS) {
                 SettingsScreen(onBack = { navController.popBackStack() })
+            }
+
+            composable(
+                route = Routes.CATEGORY,
+                arguments = listOf(
+                    navArgument(NavArg.MEDIA_TYPE) { type = NavType.StringType },
+                    navArgument(NavArg.GENRE_ID) { type = NavType.IntType },
+                    navArgument(NavArg.GENRE_NAME) { type = NavType.StringType },
+                ),
+            ) { entry ->
+                val args = entry.arguments
+                val type = runCatching {
+                    MediaType.valueOf(args?.getString(NavArg.MEDIA_TYPE) ?: MediaType.MOVIE.name)
+                }.getOrDefault(MediaType.MOVIE)
+                CategoryScreen(
+                    mediaType = type,
+                    genreId = args?.getInt(NavArg.GENRE_ID) ?: -1,
+                    genreName = args?.getString(NavArg.GENRE_NAME).orEmpty(),
+                    onMediaClick = { item -> navController.navigateToDetails(item) },
+                    onBack = { navController.popBackStack() },
+                )
             }
 
             composable(

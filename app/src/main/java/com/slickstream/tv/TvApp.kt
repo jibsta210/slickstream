@@ -20,6 +20,7 @@ import com.slickstream.navigation.Routes
 import com.slickstream.tv.components.TvDestination
 import com.slickstream.tv.components.TvNavRail
 import com.slickstream.tv.screen.TvCatalogScreen
+import com.slickstream.tv.screen.TvCategoryScreen
 import com.slickstream.tv.screen.TvDetailsScreen
 import com.slickstream.tv.screen.TvFavoritesScreen
 import com.slickstream.tv.screen.TvHomeScreen
@@ -70,6 +71,10 @@ fun TvApp() {
             navController.navigate(Routes.player(type, id, season, episode))
         }
 
+        fun openCategory(type: MediaType, genreId: Int, name: String) {
+            navController.navigate(Routes.category(type, genreId, name))
+        }
+
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -101,6 +106,7 @@ fun TvApp() {
                                 mediaType = MediaType.MOVIE,
                                 onMediaClick = ::openDetails,
                                 onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
+                                onCategoryClick = { gid, name -> openCategory(MediaType.MOVIE, gid, name) },
                             )
                         }
 
@@ -109,6 +115,28 @@ fun TvApp() {
                                 mediaType = MediaType.TV,
                                 onMediaClick = ::openDetails,
                                 onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
+                                onCategoryClick = { gid, name -> openCategory(MediaType.TV, gid, name) },
+                            )
+                        }
+
+                        composable(
+                            route = Routes.CATEGORY,
+                            arguments = listOf(
+                                navArgument(NavArg.MEDIA_TYPE) { type = NavType.StringType },
+                                navArgument(NavArg.GENRE_ID) { type = NavType.IntType },
+                                navArgument(NavArg.GENRE_NAME) { type = NavType.StringType },
+                            ),
+                        ) { entry ->
+                            val a = entry.arguments
+                            val type = runCatching {
+                                MediaType.valueOf(a?.getString(NavArg.MEDIA_TYPE) ?: MediaType.MOVIE.name)
+                            }.getOrDefault(MediaType.MOVIE)
+                            TvCategoryScreen(
+                                mediaType = type,
+                                genreId = a?.getInt(NavArg.GENRE_ID) ?: -1,
+                                genreName = a?.getString(NavArg.GENRE_NAME).orEmpty(),
+                                onMediaClick = ::openDetails,
+                                onBack = { navController.popBackStack() },
                             )
                         }
 
