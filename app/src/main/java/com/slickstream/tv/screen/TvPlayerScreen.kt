@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ClosedCaption
 import androidx.compose.material.icons.rounded.Forward10
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -64,6 +65,7 @@ import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.slickstream.core.model.StreamSource
+import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.feature.player.PlayerUiState
 import com.slickstream.feature.player.PlayerViewModel
 import com.slickstream.ui.components.QualityChip
@@ -88,9 +90,12 @@ fun TvPlayerScreen(
     val sources by viewModel.sources.collectAsStateWithLifecycle()
     val currentSource by viewModel.currentSource.collectAsStateWithLifecycle()
     val title by viewModel.title.collectAsStateWithLifecycle()
+    val subtitles by viewModel.subtitles.collectAsStateWithLifecycle()
+    val currentSubtitle by viewModel.currentSubtitle.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
+    var subsPanelOpen by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
 
     val rootFocus = remember { FocusRequester() }
@@ -107,25 +112,28 @@ fun TvPlayerScreen(
         onDispose { p?.removeListener(listener) }
     }
 
+    val anyPanelOpen = panelOpen || subsPanelOpen
+
     // Auto-hide the transport overlay after a few seconds of no interaction.
-    LaunchedEffect(controlsVisible, panelOpen) {
-        if (controlsVisible && !panelOpen) {
+    LaunchedEffect(controlsVisible, anyPanelOpen) {
+        if (controlsVisible && !anyPanelOpen) {
             kotlinx.coroutines.delay(5_000)
             controlsVisible = false
         }
     }
 
-    // When the controls are hidden (and the panel is closed) there is no focusable
+    // When the controls are hidden (and no panel is open) there is no focusable
     // overlay target, so pull focus back to the root Box. Its onPreviewKeyEvent then
     // receives any D-pad press and re-shows the transport.
-    LaunchedEffect(controlsVisible, panelOpen) {
-        if (!controlsVisible && !panelOpen) {
+    LaunchedEffect(controlsVisible, anyPanelOpen) {
+        if (!controlsVisible && !anyPanelOpen) {
             rootFocus.requestFocus()
         }
     }
 
     BackHandler {
         when {
+            subsPanelOpen -> subsPanelOpen = false
             panelOpen -> panelOpen = false
             controlsVisible -> controlsVisible = false
             else -> onBack()
@@ -139,7 +147,7 @@ fun TvPlayerScreen(
             .focusRequester(rootFocus)
             .focusable()
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown && !controlsVisible && !panelOpen) {
+                if (event.type == KeyEventType.KeyDown && !controlsVisible && !anyPanelOpen) {
                     controlsVisible = true   // also restarts the auto-hide LaunchedEffect
                     true
                 } else {
@@ -200,6 +208,12 @@ fun TvPlayerScreen(
                         controlsVisible = true
                     },
                     onOpenSources = { panelOpen = true; controlsVisible = true },
+                    subtitlesActive = currentSubtitle != null,
+                    onOpenSubtitles = {
+                        subsPanelOpen = true
+                        controlsVisible = true
+                        if (subtitles.isEmpty()) viewModel.refreshSubtitles()
+                    },
                 )
             }
         }
@@ -219,6 +233,25 @@ fun TvPlayerScreen(
                     panelOpen = false
                 },
                 onClose = { panelOpen = false },
+            )
+        }
+
+        // Focusable subtitles side-panel (search + pick a track, or turn off).
+        AnimatedVisibility(
+            visible = subsPanelOpen,
+            enter = slideInHorizontally { it } + fadeIn(),
+            exit = slideOutHorizontally { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.CenterEnd),
+        ) {
+            SubtitlesPanel(
+                subtitles = subtitles,
+                current = currentSubtitle,
+                onSelect = { track ->
+                    viewModel.selectSubtitle(track)
+                    subsPanelOpen = false
+                },
+                onSearch = { viewModel.refreshSubtitles() },
+                onClose = { subsPanelOpen = false },
             )
         }
     }
@@ -293,6 +326,8 @@ private fun TransportOverlay(
     onSeekBack: () -> Unit,
     onSeekForward: () -> Unit,
     onOpenSources: () -> Unit,
+    subtitlesActive: Boolean,
+    onOpenSubtitles: () -> Unit,
 ) {
     Box(
         modifier = Modifier
@@ -349,6 +384,12 @@ private fun TransportOverlay(
             )
             TransportButton(Icons.Rounded.Forward10, "Forward 10 seconds", onSeekForward)
             Spacer(Modifier.width(24.dp))
+            TransportButton(
+                Icons.Rounded.ClosedCaption,
+                "Subtitles",
+                onOpenSubtitles,
+                tint = if (subtitlesActive) Brand.Cyan else Color.White,
+            )
             TransportButton(Icons.Rounded.Tune, "Sources & quality", onOpenSources)
         }
     }
@@ -360,6 +401,7 @@ private fun TransportButton(
     contentDescription: String,
     onClick: () -> Unit,
     large: Boolean = false,
+    tint: Color = Color.White,
     modifier: Modifier = Modifier,
 ) {
     val dim = if (large) 84.dp else 64.dp
@@ -385,7 +427,7 @@ private fun TransportButton(
             Icon(
                 imageVector = icon,
                 contentDescription = contentDescription,
-                tint = Color.White,
+                tint = tint,
                 modifier = Modifier.size(if (large) 44.dp else 32.dp),
             )
         }
@@ -488,6 +530,104 @@ private fun SourceRow(
             }
             if (meta.isNotBlank()) {
                 Text(meta, style = MaterialTheme.typography.labelMedium, color = Brand.Cyan)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SubtitlesPanel(
+    subtitles: List<SubtitleTrack>,
+    current: SubtitleTrack?,
+    onSelect: (SubtitleTrack?) -> Unit,
+    onSearch: () -> Unit,
+    onClose: () -> Unit,
+) {
+    BackHandler(enabled = true) { onClose() }
+    Column(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(420.dp)
+            .background(Color(0xF2101019))
+            .padding(28.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text(
+            text = "Subtitles",
+            style = MaterialTheme.typography.titleLarge,
+            color = Brand.OnSurface,
+        )
+        Text(
+            text = "Pick a language, or turn subtitles off.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Brand.OnSurfaceDim,
+        )
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
+        ) {
+            item { TvSubtitleRow(label = "Off", selected = current == null) { onSelect(null) } }
+            item { TvSubtitleRow(label = "Search again", selected = false, accent = true) { onSearch() } }
+            if (subtitles.isEmpty()) {
+                item {
+                    Text(
+                        text = "No subtitles found yet. Tap \"Search again\" to look.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Brand.OnSurfaceDim,
+                        modifier = Modifier.padding(vertical = 8.dp),
+                    )
+                }
+            } else {
+                items(subtitles, key = { it.id }) { track ->
+                    TvSubtitleRow(
+                        label = track.label,
+                        selected = track.id == current?.id,
+                    ) { onSelect(track) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TvSubtitleRow(
+    label: String,
+    selected: Boolean,
+    accent: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (selected) Brand.SurfaceVariant else Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = if (accent) Brand.Cyan else Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(
+                border = androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet),
+                shape = shape,
+            ),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (selected) {
+                Spacer(Modifier.width(10.dp))
+                Text("●", color = Brand.Cyan, style = MaterialTheme.typography.labelLarge)
             }
         }
     }

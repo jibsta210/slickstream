@@ -213,6 +213,15 @@ fun PlayerScreen(
             )
         }
 
+        // Auto-PiP must only arm while the player is on screen. When we leave the player (back to
+        // the main UI), disarm it — otherwise a later Home/Back press from a browsing screen would
+        // wrongly pop the floating window.
+        DisposableEffect(pipController) {
+            onDispose {
+                pipController?.update(enabled = false, aspect = videoAspect, sourceHint = null)
+            }
+        }
+
         // --- Top bar overlay (title + back + sources) -----------------------
         AnimatedVisibility(
             visible = (overlayVisible || uiState !is PlayerUiState.Playing) && !isInPip,

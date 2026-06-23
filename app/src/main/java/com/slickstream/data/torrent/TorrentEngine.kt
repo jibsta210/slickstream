@@ -225,9 +225,9 @@ class TorrentEngine @Inject constructor(
         // 6-arg form: (info, saveDir, resumeFile, filePriorities, peers, flags).
         // NB: flags must be non-null — libtorrent4j does params.flags().or_(flags) with no null
         // guard, so passing null dereferences a null torrent_flags_t in native code. AUTO_MANAGED
-        // is already part of the default flags, so this is a behaviourally-neutral non-null value;
-        // applyStreamingState() then forces the torrent active. We deliberately do NOT pass
-        // SEQUENTIAL_DOWNLOAD here (it forces the tail to download last and stalls the moov gate).
+        // is already part of the default flags, so this is a behaviourally-neutral non-null value.
+        // applySequentialAndPriority() (below, once the handle exists) flips on SEQUENTIAL_DOWNLOAD
+        // and the head/tail deadlines that actually drive streaming order.
         session.download(info, savePath, resumeFile, null, null, TorrentFlags.AUTO_MANAGED)
 
         val handle = awaitHandle(infoHash)
@@ -320,17 +320,22 @@ class TorrentEngine @Inject constructor(
     private fun applySequentialAndPriority(handle: TorrentHandle, active: ActiveTorrent) {
         // Force an actively-downloading state. The metadata-fetch phase can leave the torrent
         // upload-only / paused / auto-managed (which downloads nothing); clear those and take
-        // manual control. We intentionally do NOT use the strict SEQUENTIAL_DOWNLOAD flag: it
-        // ignores piece priorities/deadlines and downloads the tail last, which deadlocks the
-        // moov/tail readiness gate. Streaming order comes from head+tail priority here plus the
-        // per-read deadlines set in ensureRange() as the player advances.
+        // manual control.
         runCatching {
             handle.unsetFlags(
                 TorrentFlags.UPLOAD_MODE
                     .or_(TorrentFlags.PAUSED)
                     .or_(TorrentFlags.AUTO_MANAGED),
             )
-        }.onFailure { Log.w(TAG, "clear streaming flags failed", it) }
+            // Strict in-order download. Without this, a fast swarm fills pieces out of order:
+            // you get 9 MB/s of *body* the player can't use yet while the contiguous head — the
+            // only thing the readiness gate counts — dribbles in (the "9 MB/s but still buffering
+            // for 45 s" bug). Sequential makes the head fill at the FULL swarm rate. The tail/moov
+            // pieces carry explicit deadlines in prioritizeHeadAndTail(); set_piece_deadline marks
+            // them "time critical" and libtorrent fetches those AHEAD of the sequential cursor, so
+            // the moov still arrives early and the moov gate never deadlocks.
+            handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+        }.onFailure { Log.w(TAG, "set streaming flags failed", it) }
         prioritizeHeadAndTail(active)
         runCatching { handle.resume() }
     }

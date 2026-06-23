@@ -233,6 +233,11 @@ fun PhoneApp() {
                 ProfileScreen(
                     onSignIn = onSignIn,
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
+                    onBack = {
+                        if (!navController.popBackStack()) {
+                            navController.navigateToTopLevel(TopLevelDestination.entries.first())
+                        }
+                    },
                 )
             }
 
