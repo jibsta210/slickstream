@@ -31,6 +31,13 @@
 # NanoHTTPD
 -keep class fi.iki.elonen.** { *; }
 
+# Google Sign-In via Credential Manager (defensive — keeps the request/response classes our code
+# references so a future obfuscation pass can't break sign-in; the actual provider is in Play Services)
+-keep class androidx.credentials.** { *; }
+-keep class com.google.android.libraries.identity.googleid.** { *; }
+-keep class com.google.android.gms.auth.** { *; }
+-dontwarn com.google.android.libraries.identity.googleid.**
+
 # App @Serializable models / DTOs (defensive — keep names so generated serializers resolve)
 -keep @kotlinx.serialization.Serializable class com.slickstream.** { *; }
 -keepclassmembers enum com.slickstream.** { *; }
