@@ -127,8 +127,21 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
         kotlinx.coroutines.delay(250)
         if (id == focusedId && id != selectedId) onSelect(id)
     }
+    // Land the cursor on the FILTER (this chip row) when you enter Sports — not on a mid-column
+    // event. Fires once, retried past layout so the request lands.
+    val firstFocus = remember { FocusRequester() }
+    var didFocus by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    LaunchedEffect(categories.isNotEmpty()) {
+        if (categories.isNotEmpty() && !didFocus) {
+            didFocus = true
+            repeat(12) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
     LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-        items(categories, key = { it.id }) { c ->
+        itemsIndexed(categories, key = { _, c -> c.id }) { index, c ->
             val shape = RoundedCornerShape(50)
             val selected = c.id == selectedId
             Surface(
@@ -146,7 +159,9 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
                     focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
                 ),
                 scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
-                modifier = Modifier.onFocusChanged { if (it.isFocused) focusedId = c.id },
+                modifier = Modifier
+                    .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier)
+                    .onFocusChanged { if (it.isFocused) focusedId = c.id },
             ) {
                 Text(
                     text = c.name,

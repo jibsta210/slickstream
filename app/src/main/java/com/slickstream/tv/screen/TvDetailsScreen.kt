@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -196,6 +197,16 @@ private fun HeroBlock(
     val details = state.details ?: return
     val item = details.item
 
+    // Details hides the rail — land focus on Play the moment it resolves (and on details->details
+    // navigation) so the first D-pad press isn't swallowed.
+    val playFocus = androidx.compose.runtime.remember { androidx.compose.ui.focus.FocusRequester() }
+    androidx.compose.runtime.LaunchedEffect(item.id) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { playFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth(0.62f)
@@ -267,6 +278,7 @@ private fun HeroBlock(
                         onPlay(MediaType.MOVIE, item.id, null, null)
                     }
                 },
+                modifier = Modifier.focusRequester(playFocus),
             ) {
                 Icon(
                     imageVector = Icons.Rounded.PlayArrow,

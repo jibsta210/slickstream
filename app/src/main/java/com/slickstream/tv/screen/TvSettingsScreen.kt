@@ -10,10 +10,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -46,6 +48,15 @@ fun TvSettingsScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val cache by viewModel.cacheStats.collectAsStateWithLifecycle()
 
+    // Rail is hidden here — land focus on the first setting so the first D-pad press isn't swallowed.
+    val firstFocus = androidx.compose.runtime.remember { androidx.compose.ui.focus.FocusRequester() }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -60,7 +71,7 @@ fun TvSettingsScreen(
 
         item {
             TvSettingSection("Streaming quality") {
-                TvOptionRow("On Wi-Fi / Ethernet", QualityPreference.entries, settings.wifiQuality, { it.label }, viewModel::setWifiQuality)
+                TvOptionRow("On Wi-Fi / Ethernet", QualityPreference.entries, settings.wifiQuality, { it.label }, viewModel::setWifiQuality, firstChipFocus = firstFocus)
                 TvOptionRow("On mobile data", QualityPreference.entries, settings.cellularQuality, { it.label }, viewModel::setCellularQuality)
             }
         }
@@ -127,11 +138,12 @@ private fun <T> TvOptionRow(
     selected: T,
     labelOf: (T) -> String,
     onSelect: (T) -> Unit,
+    firstChipFocus: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(label, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(options) { option ->
+            itemsIndexed(options) { index, option ->
                 val isSel = option == selected
                 val shape = RoundedCornerShape(50)
                 Surface(
@@ -149,6 +161,11 @@ private fun <T> TvOptionRow(
                         focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
                     ),
                     scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+                    modifier = if (index == 0 && firstChipFocus != null) {
+                        Modifier.focusRequester(firstChipFocus)
+                    } else {
+                        Modifier
+                    },
                 ) {
                     Text(
                         text = if (isSel) "● ${labelOf(option)}" else labelOf(option),

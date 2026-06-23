@@ -275,27 +275,35 @@ private fun StreamRow(
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     val shape = RoundedCornerShape(12.dp)
+    // High-contrast: focused = bright violet fill + white ring; selected(not focused) = lighter
+    // surface + cyan ring + dot; idle = a clearly-lighter-than-panel surface so every row is legible.
+    val bg = when {
+        focused -> Brand.Violet
+        selected -> Color(0xFF2A2A38)
+        else -> Brand.SurfaceVariant
+    }
+    val ringColor = when {
+        focused -> Color.White
+        selected -> Brand.Cyan
+        else -> Color.Transparent
+    }
+    val ringWidth = when {
+        focused -> 3.dp
+        selected -> 2.dp
+        else -> 0.dp
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .clip(shape)
-            .background(
-                when {
-                    focused -> Brand.Violet
-                    selected -> Brand.SurfaceVariant
-                    else -> Brand.Surface
-                },
-            )
-            .border(
-                androidx.compose.foundation.BorderStroke(if (focused) 3.dp else 0.dp, if (focused) Color.White else Color.Transparent),
-                shape,
-            )
+            .background(bg)
+            .border(androidx.compose.foundation.BorderStroke(ringWidth, ringColor), shape)
             .clickable(interactionSource = interaction, indication = null) { onClick() }
             .padding(16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (selected) Text("●  ", color = Brand.Cyan, style = MaterialTheme.typography.titleMedium)
+        if (selected) Text("●  ", color = if (focused) Color.White else Brand.Cyan, style = MaterialTheme.typography.titleMedium)
         Text(
             label,
             style = MaterialTheme.typography.titleMedium,

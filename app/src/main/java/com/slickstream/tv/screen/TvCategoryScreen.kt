@@ -10,14 +10,18 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -49,6 +53,20 @@ fun TvCategoryScreen(
     val gridState = rememberLazyGridState()
 
     BackHandler { onBack() }
+
+    // This screen hides the nav rail, so without an explicit target the first D-pad press is
+    // swallowed. Land focus on the first poster as soon as the grid has items.
+    val firstFocus = remember { FocusRequester() }
+    var didFocus by remember { mutableStateOf(false) }
+    LaunchedEffect(state.isEmpty) {
+        if (!state.isEmpty && !didFocus) {
+            didFocus = true
+            repeat(12) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
 
     val shouldPage by remember {
         derivedStateOf {
@@ -92,8 +110,14 @@ fun TvCategoryScreen(
                 verticalArrangement = Arrangement.spacedBy(24.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                items(state.items, key = { "${it.mediaType.name}-${it.id}" }) { item ->
-                    TvPosterCard(item = item, onClick = onMediaClick, modifier = Modifier.fillMaxWidth())
+                itemsIndexed(state.items, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
+                    TvPosterCard(
+                        item = item,
+                        onClick = onMediaClick,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
+                    )
                 }
             }
         }
