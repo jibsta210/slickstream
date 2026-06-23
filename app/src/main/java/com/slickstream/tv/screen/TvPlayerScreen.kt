@@ -58,6 +58,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Icon
@@ -187,8 +188,10 @@ fun TvPlayerScreen(
             ) {
                 // Whenever the overlay (re)appears, move focus onto the play/pause button so
                 // it is immediately D-pad controllable.
-                LaunchedEffect(controlsVisible) {
-                    if (controlsVisible) playPauseFocus.requestFocus()
+                // Don't yank focus back to play/pause while a side-panel (sources/subtitles) is
+                // open — that's what kept the CC menu un-navigable.
+                LaunchedEffect(controlsVisible, anyPanelOpen) {
+                    if (controlsVisible && !anyPanelOpen) playPauseFocus.requestFocus()
                 }
                 TransportOverlay(
                     title = title,
@@ -442,6 +445,8 @@ private fun SourcesPanel(
     onClose: () -> Unit,
 ) {
     BackHandler(enabled = true) { onClose() }
+    val firstFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
     Column(
         modifier = Modifier
             .fillMaxHeight()
@@ -464,11 +469,12 @@ private fun SourcesPanel(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
         ) {
-            items(sources, key = { it.infoHash + (it.fileIndex ?: 0) }) { source ->
+            itemsIndexed(sources, key = { _, s -> s.infoHash + (s.fileIndex ?: 0) }) { index, source ->
                 SourceRow(
                     source = source,
                     selected = source.infoHash == current?.infoHash,
                     onClick = { onSelect(source) },
+                    modifier = if (index == 0) Modifier.focusRequester(firstFocus) else Modifier,
                 )
             }
         }
@@ -480,6 +486,7 @@ private fun SourceRow(
     source: StreamSource,
     selected: Boolean,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val shape = RoundedCornerShape(12.dp)
     Surface(
@@ -498,7 +505,7 @@ private fun SourceRow(
             ),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -544,6 +551,8 @@ private fun SubtitlesPanel(
     onClose: () -> Unit,
 ) {
     BackHandler(enabled = true) { onClose() }
+    val firstFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
     Column(
         modifier = Modifier
             .fillMaxHeight()
@@ -566,7 +575,13 @@ private fun SubtitlesPanel(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
         ) {
-            item { TvSubtitleRow(label = "Off", selected = current == null) { onSelect(null) } }
+            item {
+                TvSubtitleRow(
+                    label = "Off",
+                    selected = current == null,
+                    modifier = Modifier.focusRequester(firstFocus),
+                ) { onSelect(null) }
+            }
             item { TvSubtitleRow(label = "Search again", selected = false, accent = true) { onSearch() } }
             if (subtitles.isEmpty()) {
                 item {
@@ -594,6 +609,7 @@ private fun TvSubtitleRow(
     label: String,
     selected: Boolean,
     accent: Boolean = false,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     val shape = RoundedCornerShape(12.dp)
@@ -613,7 +629,7 @@ private fun TvSubtitleRow(
             ),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
