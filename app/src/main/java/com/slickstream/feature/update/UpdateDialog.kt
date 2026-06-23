@@ -39,6 +39,22 @@ import com.slickstream.ui.theme.Brand
 @Composable
 fun UpdateGate(viewModel: UpdateViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+
+    // Re-check for updates every time the app comes to the foreground (not just cold start), and
+    // resume a pending install once the user grants unknown-sources permission and returns.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_START -> viewModel.checkNow()
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> viewModel.onResume()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     when (val s = state) {
         is UpdateUiState.Available -> UpdateDialog(
             title = "Update available",

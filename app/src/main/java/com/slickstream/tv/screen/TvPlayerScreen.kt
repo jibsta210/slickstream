@@ -152,15 +152,28 @@ fun TvPlayerScreen(
             .focusRequester(rootFocus)
             .focusable()
             .onPreviewKeyEvent { event ->
-                // Re-show the transport on a D-pad press — but NEVER swallow Back, or buffering/error
-                // states (which have no transport) would trap the user with no way to exit.
-                if (event.type == KeyEventType.KeyDown && event.key != Key.Back &&
-                    !controlsVisible && !anyPanelOpen && uiState is PlayerUiState.Playing
-                ) {
-                    controlsVisible = true   // also restarts the auto-hide LaunchedEffect
-                    true
-                } else {
-                    false
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                val p = player
+                // Honour the remote's dedicated media keys (play/pause, FF, RW, stop) — with our
+                // custom transport + useController=false, nothing mapped them before, so only
+                // D-pad/Enter worked.
+                when (event.key) {
+                    Key.MediaPlay -> { p?.let { it.playWhenReady = true }; controlsVisible = true; true }
+                    Key.MediaPause -> { p?.let { it.playWhenReady = false }; controlsVisible = true; true }
+                    Key.MediaPlayPause -> { p?.let { it.playWhenReady = !it.isPlaying }; controlsVisible = true; true }
+                    Key.MediaFastForward -> { p?.let { it.seekTo(it.currentPosition + 10_000) }; controlsVisible = true; true }
+                    Key.MediaRewind -> { p?.let { it.seekTo((it.currentPosition - 10_000).coerceAtLeast(0)) }; controlsVisible = true; true }
+                    Key.MediaStop -> { onBack(); true }
+                    Key.Back -> false   // never swallow Back, or buffering/error states would trap the user
+                    else -> {
+                        // Any other D-pad press just re-shows the transport (while playing).
+                        if (!controlsVisible && !anyPanelOpen && uiState is PlayerUiState.Playing) {
+                            controlsVisible = true
+                            true
+                        } else {
+                            false
+                        }
+                    }
                 }
             },
     ) {
@@ -180,7 +193,13 @@ fun TvPlayerScreen(
 
         // Buffering / error overlay (driven by the VM's PlayerUiState).
         when (val s = uiState) {
-            is PlayerUiState.Buffering -> BufferingOverlay(state = s, title = title, onBack = onBack)
+            is PlayerUiState.Buffering -> BufferingOverlay(
+                state = s,
+                title = title,
+                onBack = onBack,
+                canSwitchSource = sources.size > 1,
+                onSwitchSource = { panelOpen = true },
+            )
             is PlayerUiState.Error -> ErrorOverlay(message = s.message, onRetry = viewModel::retry, onBack = onBack)
             PlayerUiState.Playing -> Unit
         }
@@ -269,7 +288,13 @@ fun TvPlayerScreen(
 }
 
 @Composable
-private fun BufferingOverlay(state: PlayerUiState.Buffering, title: String, onBack: () -> Unit) {
+private fun BufferingOverlay(
+    state: PlayerUiState.Buffering,
+    title: String,
+    onBack: () -> Unit,
+    canSwitchSource: Boolean = false,
+    onSwitchSource: () -> Unit = {},
+) {
     val backFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
     Box(
@@ -305,11 +330,17 @@ private fun BufferingOverlay(state: PlayerUiState.Buffering, title: String, onBa
                 Text(detail, style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
             }
             Spacer(Modifier.height(8.dp))
-            // A focusable, auto-focused Back so the user is never stranded on the fetch/buffer screen.
-            androidx.tv.material3.Button(
-                onClick = onBack,
-                modifier = Modifier.focusRequester(backFocus),
-            ) { Text("Back") }
+            // Focusable actions so the user is never stranded on the fetch/buffer screen — and can
+            // switch to a healthier torrent without waiting for playback to start (parity with phone).
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                androidx.tv.material3.Button(
+                    onClick = onBack,
+                    modifier = Modifier.focusRequester(backFocus),
+                ) { Text("Back") }
+                if (canSwitchSource) {
+                    androidx.tv.material3.Button(onClick = onSwitchSource) { Text("Switch source") }
+                }
+            }
         }
     }
 }

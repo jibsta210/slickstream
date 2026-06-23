@@ -29,6 +29,25 @@ class UpdateViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Re-check on every foreground (ON_START), not just fresh start. Skips if a check/download/
+     * prompt is already in flight so it never interrupts the user; the checker's dismissed-version
+     * gate keeps a previously-dismissed update from popping again.
+     */
+    fun checkNow() {
+        when (_state.value) {
+            is UpdateUiState.Checking,
+            is UpdateUiState.Downloading,
+            is UpdateUiState.Available,
+            is UpdateUiState.ReadyToInstall -> return
+            else -> Unit
+        }
+        viewModelScope.launch {
+            val manifest = checker.check()
+            if (manifest != null) _state.value = UpdateUiState.Available(manifest)
+        }
+    }
+
     fun startDownload(manifest: UpdateManifest) {
         viewModelScope.launch {
             _state.value = UpdateUiState.Downloading(0)
