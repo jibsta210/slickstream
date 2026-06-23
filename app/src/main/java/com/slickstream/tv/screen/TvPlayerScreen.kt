@@ -43,9 +43,13 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
@@ -102,9 +106,11 @@ fun TvPlayerScreen(
     var panelOpen by remember { mutableStateOf(false) }
     var subsPanelOpen by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
+    var scrubbing by remember { mutableStateOf(false) }
 
     val rootFocus = remember { FocusRequester() }
     val playPauseFocus = remember { FocusRequester() }
+    val scrubFocus = remember { FocusRequester() }
 
     // Track play state for the toggle icon.
     DisposableEffect(player) {
@@ -119,9 +125,10 @@ fun TvPlayerScreen(
 
     val anyPanelOpen = panelOpen || subsPanelOpen
 
-    // Auto-hide the transport overlay after a few seconds of no interaction.
-    LaunchedEffect(controlsVisible, anyPanelOpen) {
-        if (controlsVisible && !anyPanelOpen) {
+    // Auto-hide the transport overlay after a few seconds of no interaction (never while a panel is
+    // open or a scrub is in progress).
+    LaunchedEffect(controlsVisible, anyPanelOpen, scrubbing) {
+        if (controlsVisible && !anyPanelOpen && !scrubbing) {
             kotlinx.coroutines.delay(5_000)
             controlsVisible = false
         }
@@ -223,12 +230,15 @@ fun TvPlayerScreen(
                 // Don't yank focus back to play/pause while a side-panel (sources/subtitles) is
                 // open — that's what kept the CC menu un-navigable.
                 LaunchedEffect(controlsVisible, anyPanelOpen) {
-                    if (controlsVisible && !anyPanelOpen) playPauseFocus.requestFocus()
+                    if (controlsVisible && !anyPanelOpen) runCatching { scrubFocus.requestFocus() }
                 }
                 TransportOverlay(
                     title = title,
                     isPlaying = isPlaying,
                     currentSource = currentSource,
+                    player = player,
+                    scrubFocus = scrubFocus,
+                    onScrubbingChange = { scrubbing = it },
                     playPauseFocus = playPauseFocus,
                     onPlayPause = {
                         player?.let { it.playWhenReady = !it.isPlaying }
@@ -378,6 +388,9 @@ private fun TransportOverlay(
     title: String,
     isPlaying: Boolean,
     currentSource: StreamSource?,
+    player: androidx.media3.common.Player?,
+    scrubFocus: FocusRequester,
+    onScrubbingChange: (Boolean) -> Unit,
     playPauseFocus: FocusRequester,
     onPlayPause: () -> Unit,
     onSeekBack: () -> Unit,
@@ -423,15 +436,26 @@ private fun TransportOverlay(
             }
         }
 
-        // Transport row, bottom-centre.
-        Row(
+        // Scrub bar + transport row, bottom-centre.
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 56.dp),
-            horizontalArrangement = Arrangement.spacedBy(20.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .fillMaxWidth()
+                .padding(start = 48.dp, end = 48.dp, bottom = 48.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            TransportButton(Icons.Rounded.Replay10, "Rewind 10 seconds", onSeekBack)
+            ScrubBar(
+                player = player,
+                focusRequester = scrubFocus,
+                onScrubbingChange = onScrubbingChange,
+                onTogglePlayPause = onPlayPause,
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TransportButton(Icons.Rounded.Replay10, "Rewind 10 seconds", onSeekBack)
             TransportButton(
                 if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                 if (isPlaying) "Pause" else "Play",
@@ -448,8 +472,118 @@ private fun TransportOverlay(
                 tint = if (subtitlesActive) Brand.Cyan else Color.White,
             )
             TransportButton(Icons.Rounded.Tune, "Sources & quality", onOpenSources)
+            }
         }
     }
+}
+
+/**
+ * Focusable D-pad scrub bar: progress + buffered band + current/total time. LEFT/RIGHT seek with a
+ * RAMPING step (longer hold = bigger jump), committing on release (or Center). DOWN moves focus to
+ * the transport buttons. No thumbnail strip — frames over a partially-downloaded torrent aren't
+ * feasible; the live frame updates after the seek commits.
+ */
+@Composable
+private fun ScrubBar(
+    player: androidx.media3.common.Player?,
+    focusRequester: FocusRequester,
+    onScrubbingChange: (Boolean) -> Unit,
+    onTogglePlayPause: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var scrubbing by remember { mutableStateOf(false) }
+    var scrubTargetMs by remember { mutableStateOf(0L) }
+    var rampPresses by remember { mutableStateOf(0) }   // consecutive held presses -> ramp the step
+    var positionMs by remember { mutableStateOf(0L) }
+    var bufferedMs by remember { mutableStateOf(0L) }
+    var durationMs by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(player) {
+        while (true) {
+            val p = player
+            if (p != null && !scrubbing) {
+                positionMs = p.currentPosition.coerceAtLeast(0L)
+                bufferedMs = p.bufferedPosition.coerceAtLeast(0L)
+                durationMs = p.duration.takeIf { it > 0 } ?: 0L
+            }
+            kotlinx.coroutines.delay(500)
+        }
+    }
+
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+
+    Column(modifier = modifier.fillMaxWidth(0.72f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (scrubbing) {
+            Text(
+                text = fmtTime(scrubTargetMs),
+                style = MaterialTheme.typography.headlineSmall,
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(if (focused || scrubbing) 12.dp else 6.dp)
+                .clip(RoundedCornerShape(50))
+                .background(Brand.SurfaceVariant)
+                .focusRequester(focusRequester)
+                .focusable(interactionSource = interaction)
+                .onKeyEvent { event ->
+                    val p = player ?: return@onKeyEvent false
+                    val dur = durationMs.takeIf { it > 0 } ?: Long.MAX_VALUE
+                    when {
+                        event.type == KeyEventType.KeyUp && scrubbing &&
+                            (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) -> {
+                            p.seekTo(scrubTargetMs); scrubbing = false; rampPresses = 0; onScrubbingChange(false); true
+                        }
+                        event.type == KeyEventType.KeyDown &&
+                            (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) -> {
+                            if (!scrubbing) { scrubbing = true; onScrubbingChange(true); scrubTargetMs = positionMs; rampPresses = 0 }
+                            rampPresses++
+                            val step = when {
+                                rampPresses <= 3 -> 10_000L
+                                rampPresses <= 7 -> 30_000L
+                                rampPresses <= 13 -> 60_000L
+                                else -> 120_000L
+                            }
+                            val delta = if (event.key == Key.DirectionRight) step else -step
+                            scrubTargetMs = (scrubTargetMs + delta).coerceIn(0L, dur)
+                            true
+                        }
+                        event.type == KeyEventType.KeyDown &&
+                            (event.key == Key.DirectionCenter || event.key == Key.Enter) -> {
+                            if (scrubbing) { p.seekTo(scrubTargetMs); scrubbing = false; rampPresses = 0; onScrubbingChange(false) }
+                            else onTogglePlayPause()
+                            true
+                        }
+                        else -> false
+                    }
+                },
+        ) {
+            val dur = durationMs.takeIf { it > 0 } ?: 1L
+            val bufFrac = (bufferedMs.toFloat() / dur).coerceIn(0f, 1f)
+            val progFrac = ((if (scrubbing) scrubTargetMs else positionMs).toFloat() / dur).coerceIn(0f, 1f)
+            Box(Modifier.fillMaxWidth(bufFrac).fillMaxHeight().background(Color.White.copy(alpha = 0.28f)))
+            Box(Modifier.fillMaxWidth(progFrac).fillMaxHeight().clip(RoundedCornerShape(50)).background(Brand.Violet))
+        }
+        Row(Modifier.fillMaxWidth()) {
+            Text(fmtTime(if (scrubbing) scrubTargetMs else positionMs), style = MaterialTheme.typography.labelMedium, color = Color.White)
+            Spacer(Modifier.weight(1f))
+            Text(fmtTime(durationMs), style = MaterialTheme.typography.labelMedium, color = Brand.OnSurfaceDim)
+        }
+    }
+}
+
+private fun fmtTime(ms: Long): String {
+    if (ms <= 0) return "0:00"
+    val s = ms / 1000
+    val h = s / 3600
+    val m = (s % 3600) / 60
+    val sec = s % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }
 
 @Composable
