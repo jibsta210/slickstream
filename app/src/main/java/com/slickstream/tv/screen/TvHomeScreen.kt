@@ -141,7 +141,7 @@ private fun HomeContent(
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun FeaturedCarousel(
+internal fun FeaturedCarousel(
     items: List<MediaItem>,
     onPlay: (MediaItem) -> Unit,
     onDetails: (MediaItem) -> Unit,

@@ -41,7 +41,10 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Scale
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
@@ -105,7 +108,11 @@ private fun DetailsContent(
     Box(modifier = modifier.fillMaxSize().background(Brand.Background)) {
         // Backdrop fills the top of the screen, fading into the background.
         AsyncImage(
-            model = item.backdropUrl ?: item.posterUrl,
+            model = ImageRequest.Builder(LocalContext.current)
+                .data(item.backdropUrl ?: item.posterUrl)
+                .size(1280, 720) // hard decode ceiling so a 4K panel doesn't decode at 2x
+                .scale(Scale.FILL)
+                .build(),
             contentDescription = item.title,
             contentScale = ContentScale.Crop,
             modifier = Modifier
@@ -361,7 +368,11 @@ private fun EpisodeList(
             horizontalArrangement = Arrangement.spacedBy(16.dp),
             contentPadding = PaddingValues(horizontal = 48.dp, vertical = 6.dp),
         ) {
-            items(state.episodes, key = { "${it.seasonNumber}-${it.episodeNumber}" }) { ep ->
+            items(
+                state.episodes,
+                key = { "${it.seasonNumber}-${it.episodeNumber}" },
+                contentType = { "episode" },
+            ) { ep ->
                 EpisodeCard(episode = ep, onClick = { onPlayEpisode(ep) })
             }
         }

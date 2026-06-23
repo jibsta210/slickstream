@@ -19,6 +19,7 @@ import com.slickstream.navigation.NavArg
 import com.slickstream.navigation.Routes
 import com.slickstream.tv.components.TvDestination
 import com.slickstream.tv.components.TvNavRail
+import com.slickstream.tv.screen.TvCatalogScreen
 import com.slickstream.tv.screen.TvDetailsScreen
 import com.slickstream.tv.screen.TvFavoritesScreen
 import com.slickstream.tv.screen.TvHomeScreen
@@ -45,12 +46,16 @@ fun TvApp() {
         // The rail is shown for the four top-level sections; details + player are immersive.
         val showRail = currentRoute == null ||
             currentRoute == Routes.HOME ||
+            currentRoute == Routes.MOVIES ||
+            currentRoute == Routes.TV ||
             currentRoute == Routes.SEARCH ||
             currentRoute == Routes.FAVORITES ||
             currentRoute == Routes.PROFILE
 
         // Resolve which rail item is highlighted from the current route.
         val selectedRoute = when (currentRoute) {
+            Routes.MOVIES -> Routes.MOVIES
+            Routes.TV -> Routes.TV
             Routes.SEARCH -> Routes.SEARCH
             Routes.FAVORITES -> Routes.FAVORITES
             Routes.PROFILE -> Routes.PROFILE
@@ -86,6 +91,22 @@ fun TvApp() {
                     ) {
                         composable(Routes.HOME) {
                             TvHomeScreen(
+                                onMediaClick = ::openDetails,
+                                onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
+                            )
+                        }
+
+                        composable(Routes.MOVIES) {
+                            TvCatalogScreen(
+                                mediaType = MediaType.MOVIE,
+                                onMediaClick = ::openDetails,
+                                onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
+                            )
+                        }
+
+                        composable(Routes.TV) {
+                            TvCatalogScreen(
+                                mediaType = MediaType.TV,
                                 onMediaClick = ::openDetails,
                                 onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
                             )

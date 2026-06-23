@@ -18,8 +18,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -41,9 +43,11 @@ import com.slickstream.ui.theme.Brand
 
 /** A single destination shown in the left navigation rail. */
 enum class TvDestination(val route: String, val label: String, val icon: ImageVector) {
-    BROWSE(com.slickstream.navigation.Routes.HOME, "Browse", Icons.Rounded.Home),
+    HOME(com.slickstream.navigation.Routes.HOME, "Home", Icons.Rounded.Home),
+    MOVIES(com.slickstream.navigation.Routes.MOVIES, "Movies", Icons.Rounded.Movie),
+    TV(com.slickstream.navigation.Routes.TV, "TV", Icons.Rounded.Tv),
+    FAVORITES(com.slickstream.navigation.Routes.FAVORITES, "Favourites", Icons.Rounded.Favorite),
     SEARCH(com.slickstream.navigation.Routes.SEARCH, "Search", Icons.Rounded.Search),
-    FAVORITES(com.slickstream.navigation.Routes.FAVORITES, "Favorites", Icons.Rounded.Favorite),
     PROFILE(com.slickstream.navigation.Routes.PROFILE, "Profile", Icons.Rounded.Person),
 }
 
@@ -58,8 +62,10 @@ fun TvNavRail(
     onSelect: (TvDestination) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var anyFocused by remember { mutableStateOf(false) }
-    val expanded = anyFocused
+    // A focus COUNTER (not a flag) so moving focus between rail items keeps it expanded without a
+    // collapse/expand relayout cycle on every D-pad move.
+    var focusedCount by remember { mutableStateOf(0) }
+    val expanded = focusedCount > 0
 
     Column(
         modifier = modifier
@@ -93,7 +99,9 @@ fun TvNavRail(
                 selected = dest.route == selectedRoute,
                 expanded = expanded,
                 onSelect = { onSelect(dest) },
-                onFocusChanged = { focused -> if (focused) anyFocused = true },
+                onFocusChanged = { focused ->
+                    focusedCount = (focusedCount + if (focused) 1 else -1).coerceAtLeast(0)
+                },
             )
         }
 
