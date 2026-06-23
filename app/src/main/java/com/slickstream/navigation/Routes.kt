@@ -31,11 +31,9 @@ object Routes {
     fun category(type: MediaType, genreId: Int, name: String) =
         "category/${type.name}/$genreId/${Uri.encode(name)}"
 
-    // Live sports — top-level tab + a per-category grid (sport/league).
+    // Live sports — top-level tab + the HLS live player.
     const val SPORTS = "sports"
-    const val SPORTS_CATEGORY = "sports/{sportId}/{sportName}"
-    fun sportsCategory(sportId: String, name: String) =
-        "sports/${Uri.encode(sportId)}/${Uri.encode(name)}"
+    const val LIVE = "live"
 }
 
 /** Nav argument keys (kept in one place so screens + host agree). */
@@ -47,8 +45,6 @@ object NavArg {
     const val QUERY = "query"
     const val GENRE_ID = "genreId"
     const val GENRE_NAME = "genreName"
-    const val SPORT_ID = "sportId"
-    const val SPORT_NAME = "sportName"
 }
 
 /** Bottom-nav destinations for phone: Home, Movies, TV, Favourites. (Search + Profile are
@@ -57,5 +53,6 @@ enum class TopLevelDestination(val route: String, val label: String) {
     HOME(Routes.HOME, "Home"),
     MOVIES(Routes.MOVIES, "Movies"),
     TV(Routes.TV, "TV"),
+    SPORTS(Routes.SPORTS, "Sports"),
     FAVORITES(Routes.FAVORITES, "Favourites"),
 }

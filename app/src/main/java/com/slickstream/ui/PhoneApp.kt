@@ -36,6 +36,7 @@ import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SportsBasketball
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -96,7 +97,9 @@ import com.slickstream.feature.favorites.FavoritesScreen
 import com.slickstream.feature.home.HomeScreen
 import com.slickstream.feature.player.PlayerScreen
 import com.slickstream.feature.catalog.CategoryScreen
+import com.slickstream.feature.live.LivePlayerScreen
 import com.slickstream.feature.profile.ProfileScreen
+import com.slickstream.feature.sports.SportsScreen
 import com.slickstream.feature.settings.SettingsScreen
 import com.slickstream.feature.search.SearchUiState
 import com.slickstream.feature.search.SearchViewModel
@@ -226,6 +229,16 @@ fun PhoneApp() {
                 SearchScreen(
                     onMediaClick = { item -> navController.navigateToDetails(item) },
                 )
+            }
+
+            composable(Routes.SPORTS) {
+                SportsScreen(
+                    onOpenPlayer = { navController.navigate(Routes.LIVE) },
+                )
+            }
+
+            composable(Routes.LIVE) {
+                LivePlayerScreen(onBack = { navController.popBackStack() })
             }
 
             composable(Routes.FAVORITES) {
@@ -410,6 +423,7 @@ private fun iconFor(destination: TopLevelDestination): ImageVector = when (desti
     TopLevelDestination.HOME -> Icons.Rounded.Home
     TopLevelDestination.MOVIES -> Icons.Rounded.Movie
     TopLevelDestination.TV -> Icons.Rounded.Tv
+    TopLevelDestination.SPORTS -> Icons.Rounded.SportsBasketball
     TopLevelDestination.FAVORITES -> Icons.Rounded.Favorite
 }
 

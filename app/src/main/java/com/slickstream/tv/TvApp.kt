@@ -19,8 +19,10 @@ import com.slickstream.navigation.NavArg
 import com.slickstream.navigation.Routes
 import com.slickstream.tv.components.TvDestination
 import com.slickstream.tv.components.TvNavRail
+import com.slickstream.feature.live.LivePlayerScreen
 import com.slickstream.tv.screen.TvCatalogScreen
 import com.slickstream.tv.screen.TvCategoryScreen
+import com.slickstream.tv.screen.TvSportsScreen
 import com.slickstream.tv.screen.TvDetailsScreen
 import com.slickstream.tv.screen.TvFavoritesScreen
 import com.slickstream.tv.screen.TvHomeScreen
@@ -49,6 +51,7 @@ fun TvApp() {
             currentRoute == Routes.HOME ||
             currentRoute == Routes.MOVIES ||
             currentRoute == Routes.TV ||
+            currentRoute == Routes.SPORTS ||
             currentRoute == Routes.SEARCH ||
             currentRoute == Routes.FAVORITES ||
             currentRoute == Routes.PROFILE
@@ -57,6 +60,7 @@ fun TvApp() {
         val selectedRoute = when (currentRoute) {
             Routes.MOVIES -> Routes.MOVIES
             Routes.TV -> Routes.TV
+            Routes.SPORTS -> Routes.SPORTS
             Routes.SEARCH -> Routes.SEARCH
             Routes.FAVORITES -> Routes.FAVORITES
             Routes.PROFILE -> Routes.PROFILE
@@ -142,6 +146,14 @@ fun TvApp() {
 
                         composable(Routes.SEARCH) {
                             TvSearchScreen(onMediaClick = ::openDetails)
+                        }
+
+                        composable(Routes.SPORTS) {
+                            TvSportsScreen(onOpenPlayer = { navController.navigate(Routes.LIVE) })
+                        }
+
+                        composable(Routes.LIVE) {
+                            LivePlayerScreen(onBack = { navController.popBackStack() })
                         }
 
                         composable(Routes.FAVORITES) {

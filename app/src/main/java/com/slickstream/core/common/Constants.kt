@@ -32,6 +32,11 @@ object Subtitles {
     val BASE_URL: String = BuildConfig.SUBTITLE_BASE_URL
 }
 
+object Sports {
+    /** streamed.pk-compatible REST base. Blank disables the Live tab entirely. */
+    val BASE_URL: String = BuildConfig.SPORTS_BASE_URL
+}
+
 object Auth {
     val GOOGLE_WEB_CLIENT_ID: String = BuildConfig.GOOGLE_WEB_CLIENT_ID
     /** "TVs and Limited Input devices" OAuth client — used by the Android TV device-pairing flow. */

@@ -21,6 +21,7 @@ import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SportsBasketball
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -46,6 +47,7 @@ enum class TvDestination(val route: String, val label: String, val icon: ImageVe
     HOME(com.slickstream.navigation.Routes.HOME, "Home", Icons.Rounded.Home),
     MOVIES(com.slickstream.navigation.Routes.MOVIES, "Movies", Icons.Rounded.Movie),
     TV(com.slickstream.navigation.Routes.TV, "TV", Icons.Rounded.Tv),
+    SPORTS(com.slickstream.navigation.Routes.SPORTS, "Sports", Icons.Rounded.SportsBasketball),
     FAVORITES(com.slickstream.navigation.Routes.FAVORITES, "Favourites", Icons.Rounded.Favorite),
     SEARCH(com.slickstream.navigation.Routes.SEARCH, "Search", Icons.Rounded.Search),
     PROFILE(com.slickstream.navigation.Routes.PROFILE, "Profile", Icons.Rounded.Person),
