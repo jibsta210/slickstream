@@ -1,0 +1,14 @@
+# Copy to local.properties (gitignored) and fill in. Android Studio sets sdk.dir automatically.
+sdk.dir=/path/to/Android/Sdk
+
+# --- TMDB (https://www.themoviedb.org/settings/api) ---
+# Either a v3 API key OR a v4 bearer token. Bearer is preferred if set.
+TMDB_API_KEY=
+TMDB_BEARER=
+
+# --- Torrent indexer (Stremio/Torrentio-compatible) ---
+# Resolves IMDB ids -> torrent streams. Point this at any source you are authorized to use.
+INDEXER_BASE_URL=https://torrentio.strem.fun/
+
+# --- Google Sign-In (OAuth Web client ID from Google Cloud console) ---
+GOOGLE_WEB_CLIENT_ID=

@@ -1,0 +1,668 @@
+package com.slickstream.feature.player
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
+import androidx.annotation.OptIn
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem as ExoMediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.cast.CastPlayer
+import androidx.media3.cast.SessionAvailabilityListener
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.mediarouter.media.MediaRouteSelector
+import com.slickstream.cast.CastManager
+import com.slickstream.core.model.DataResult
+import com.slickstream.core.model.MediaDetails
+import com.slickstream.core.model.MediaItem
+import com.slickstream.core.model.MediaType
+import com.slickstream.core.model.PlaybackProgress
+import com.slickstream.core.model.StreamSource
+import com.slickstream.core.model.StreamState
+import com.slickstream.core.model.StreamStatus
+import com.slickstream.core.repository.CatalogRepository
+import com.slickstream.core.repository.LibraryRepository
+import com.slickstream.core.repository.SourceRepository
+import com.slickstream.core.repository.TorrentStreamer
+import com.slickstream.core.model.SubtitleTrack
+import com.slickstream.data.settings.QualityPreference
+import com.slickstream.data.settings.SettingsRepository
+import com.slickstream.data.subtitle.SubtitleRepository
+import com.slickstream.navigation.NavArg
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/** What the player overlay renders. The ExoPlayer instance is exposed separately. */
+sealed interface PlayerUiState {
+    /** Resolving sources / fetching torrent metadata / pre-buffering. */
+    data class Buffering(
+        val percent: Int,
+        val seeders: Int,
+        val downloadRateBytes: Int,
+        val label: String,
+    ) : PlayerUiState
+
+    /** Player has a stream URL and is (or will shortly be) playing. */
+    data object Playing : PlayerUiState
+
+    data class Error(val message: String) : PlayerUiState
+}
+
+@HiltViewModel
+class PlayerViewModel @Inject constructor(
+    @ApplicationContext private val appContext: Context,
+    private val catalogRepository: CatalogRepository,
+    private val sourceRepository: SourceRepository,
+    private val torrentStreamer: TorrentStreamer,
+    private val libraryRepository: LibraryRepository,
+    private val castManager: CastManager,
+    private val settingsRepository: SettingsRepository,
+    private val subtitleRepository: SubtitleRepository,
+    savedStateHandle: SavedStateHandle,
+) : ViewModel() {
+
+    // --- Nav args -----------------------------------------------------------
+    private val mediaType: MediaType =
+        MediaType.fromName(savedStateHandle.get<String>(NavArg.MEDIA_TYPE))
+    private val mediaId: Int = savedStateHandle.get<Int>(NavArg.MEDIA_ID) ?: -1
+    private val season: Int? =
+        savedStateHandle.get<Int>(NavArg.SEASON)?.takeIf { it >= 0 }
+    private val episode: Int? =
+        savedStateHandle.get<Int>(NavArg.EPISODE)?.takeIf { it >= 0 }
+
+    // --- UI state -----------------------------------------------------------
+    private val _uiState = MutableStateFlow<PlayerUiState>(
+        PlayerUiState.Buffering(0, 0, 0, "Loading…")
+    )
+    val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
+
+    private val _sources = MutableStateFlow<List<StreamSource>>(emptyList())
+    val sources: StateFlow<List<StreamSource>> = _sources.asStateFlow()
+
+    private val _currentSource = MutableStateFlow<StreamSource?>(null)
+    val currentSource: StateFlow<StreamSource?> = _currentSource.asStateFlow()
+
+    private val _player = MutableStateFlow<ExoPlayer?>(null)
+    val player: StateFlow<ExoPlayer?> = _player.asStateFlow()
+
+    /** The active player surface the UI binds to — local ExoPlayer or the remote CastPlayer. */
+    private val _currentPlayer = MutableStateFlow<androidx.media3.common.Player?>(null)
+    val currentPlayer: StateFlow<androidx.media3.common.Player?> = _currentPlayer.asStateFlow()
+
+    private val _isCasting = MutableStateFlow(false)
+    val isCasting: StateFlow<Boolean> = _isCasting.asStateFlow()
+
+    private val _title = MutableStateFlow("Now Playing")
+    val title: StateFlow<String> = _title.asStateFlow()
+
+    // --- Internal -----------------------------------------------------------
+    private var details: MediaDetails? = null
+    private var streamJob: Job? = null
+    private var progressTickJob: Job? = null
+    private var activeInfoHash: String? = null
+    private var hasSeekedToResume = false
+    private var playerListener: Player.Listener? = null
+    private var currentMediaUrl: String? = null
+    private var castPlayer: CastPlayer? = null
+
+    // --- Next-episode prefetch ---
+    private var prefetchJob: Job? = null
+    private var prefetchTriggeredForEpisode = false
+    @Volatile private var prefetchedInfoHash: String? = null
+
+    // --- PiP: current video aspect ratio for PictureInPictureParams (clamped at use site) ---
+    private val _videoAspect = MutableStateFlow(16f / 9f)
+    val videoAspect: StateFlow<Float> = _videoAspect.asStateFlow()
+
+    // --- Subtitles ---
+    private val _subtitles = MutableStateFlow<List<SubtitleTrack>>(emptyList())
+    val subtitles: StateFlow<List<SubtitleTrack>> = _subtitles.asStateFlow()
+    private val _currentSubtitle = MutableStateFlow<SubtitleTrack?>(null)
+    val currentSubtitle: StateFlow<SubtitleTrack?> = _currentSubtitle.asStateFlow()
+    private var subtitleConfigs: List<ExoMediaItem.SubtitleConfiguration> = emptyList()
+    private var preferredSubCode: String? = null
+
+    /** Outlives [viewModelScope] so final progress + torrent-stop survive onCleared(). */
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        load()
+    }
+
+    fun retry() {
+        _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Loading…")
+        load()
+    }
+
+    // --- Cast (Chromecast) state for the UI ---------------------------------
+    val castAvailable: Boolean get() = castManager.isAvailable
+    val castMergedSelector: MediaRouteSelector? get() = castManager.castContext?.mergedSelector
+    fun isCastConnected(): Boolean = castManager.isConnected()
+
+    /** Stop casting and continue on this device. The CastPlayer's onCastSessionUnavailable()
+     *  callback (wired in ensureCastPlayer) drives transferToLocal() at the cast position. */
+    fun stopCasting() = castManager.stopCasting(stopReceiver = true)
+
+    private fun load() {
+        viewModelScope.launch {
+            _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Fetching details…")
+            val d = when (val r = catalogRepository.getDetails(mediaId, mediaType)) {
+                is DataResult.Success -> r.data
+                is DataResult.Error -> {
+                    _uiState.value = PlayerUiState.Error(r.message)
+                    return@launch
+                }
+            }
+            details = d
+            _title.value = buildTitle(d)
+            viewModelScope.launch { loadSubtitles(d) }
+
+            _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
+            val list = when (val r = sourceRepository.resolve(d, season, episode)) {
+                is DataResult.Success -> r.data
+                is DataResult.Error -> {
+                    _uiState.value = PlayerUiState.Error(r.message)
+                    return@launch
+                }
+            }
+            if (list.isEmpty()) {
+                _uiState.value = PlayerUiState.Error("No streamable sources found.")
+                return@launch
+            }
+            _sources.value = list.sortedByDescending { it.rank }
+
+            // Auto-pick the best source within the user's per-network quality cap.
+            val best = pickPreferred(list, networkQualityPreference())
+            startSource(best)
+        }
+    }
+
+    /** Switch to a different quality/source, keeping the previous download cached. */
+    fun selectSource(source: StreamSource) {
+        if (source.infoHash == _currentSource.value?.infoHash) return
+        viewModelScope.launch {
+            // Persist where we are before tearing the current stream down.
+            saveProgressNow()
+            stopActiveStream(removeFiles = false)
+            startSource(source)
+        }
+    }
+
+    private suspend fun networkQualityPreference(): QualityPreference {
+        val settings = settingsRepository.current()
+        return if (isOnUnmeteredNetwork()) settings.wifiQuality else settings.cellularQuality
+    }
+
+    /** Highest-ranked source within the quality cap; fall back to the best overall if none fit. */
+    private fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
+        val capped = list.filter { QualityPreference.tierOf(it.quality) <= pref.maxTier }
+        return capped.ifEmpty { list }.maxByOrNull { it.rank } ?: list.first()
+    }
+
+    private fun isOnUnmeteredNetwork(): Boolean {
+        val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return true
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return true
+        // Authoritative: the system's own "not metered" signal (handles metered Wi-Fi correctly).
+        if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) return true
+        // Wi-Fi / Ethernet use the "Wi-Fi" cap; cellular uses the mobile-data cap.
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+
+    private fun startSource(source: StreamSource) {
+        _currentSource.value = source
+        hasSeekedToResume = false
+        activeInfoHash = source.infoHash
+        prefetchTriggeredForEpisode = false
+        prefetchJob?.cancel()
+        _uiState.value = PlayerUiState.Buffering(
+            percent = 0,
+            seeders = source.seeders ?: 0,
+            downloadRateBytes = 0,
+            label = "Connecting to peers…",
+        )
+
+        streamJob?.cancel()
+        streamJob = viewModelScope.launch {
+            torrentStreamer.start(source).collect { status ->
+                handleStatus(status, source)
+            }
+        }
+    }
+
+    private fun handleStatus(status: StreamStatus, source: StreamSource) {
+        val url = status.streamUrl
+        if (url != null) {
+            ensurePlayer(url)
+            if (status.state == StreamState.ERROR && status.errorMessage != null) {
+                _uiState.value = PlayerUiState.Error(status.errorMessage!!)
+            }
+            return
+        }
+
+        if (status.state == StreamState.ERROR) {
+            _uiState.value = PlayerUiState.Error(status.errorMessage ?: "Streaming failed.")
+            return
+        }
+
+        // No URL yet — still pre-buffering. Don't clobber a Playing state.
+        if (_uiState.value is PlayerUiState.Playing) return
+
+        val label = when (status.state) {
+            StreamState.METADATA -> "Fetching torrent metadata…"
+            StreamState.BUFFERING -> "Buffering…"
+            StreamState.IDLE -> "Connecting to peers…"
+            else -> "Buffering…"
+        }
+        _uiState.value = PlayerUiState.Buffering(
+            percent = (status.progress * 100f).toInt().coerceIn(0, 100),
+            seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
+            downloadRateBytes = status.downloadRateBytes,
+            label = label,
+        )
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun ensurePlayer(url: String) {
+        val existing = _player.value
+        if (existing != null) {
+            // Only reload on a genuine URL change (source switch); steady-state
+            // READY re-emissions carry the same URL and must be no-ops.
+            if (currentMediaUrl == url) return
+            existing.setMediaItem(buildMediaItem(url))
+            existing.prepare()
+            // While casting, keep the local surface paused and push the new source to the TV.
+            existing.playWhenReady = !_isCasting.value
+            currentMediaUrl = url
+            if (_isCasting.value) loadCastMedia(fromPositionMs = 0L)
+            return
+        }
+
+        // Start playing with a small buffer so we don't sit idle while the torrent fills ahead.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                15_000, // minBufferMs
+                50_000, // maxBufferMs
+                1_500,  // bufferForPlaybackMs — begin playback this fast
+                3_000,  // bufferForPlaybackAfterRebufferMs
+            )
+            .build()
+        val exo = ExoPlayer.Builder(appContext).setLoadControl(loadControl).build().apply {
+            setMediaItem(buildMediaItem(url))
+            prepare()
+            playWhenReady = true
+        }
+        currentMediaUrl = url
+
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                when (playbackState) {
+                    Player.STATE_READY -> {
+                        maybeSeekToResume(exo)
+                        _uiState.value = PlayerUiState.Playing
+                    }
+                    Player.STATE_BUFFERING -> {
+                        if (_uiState.value !is PlayerUiState.Playing) {
+                            val s = _currentSource.value
+                            _uiState.value = PlayerUiState.Buffering(
+                                percent = 100,
+                                seeders = s?.seeders ?: 0,
+                                downloadRateBytes = 0,
+                                label = "Buffering…",
+                            )
+                        }
+                    }
+                    Player.STATE_ENDED -> saveProgressNow()
+                    else -> Unit
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (!isPlaying) saveProgressNow()
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                val w = videoSize.width
+                val h = videoSize.height
+                if (w > 0 && h > 0) {
+                    val par = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
+                    _videoAspect.value = (w * par) / h
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                _uiState.value = PlayerUiState.Error(
+                    error.localizedMessage ?: "Playback error."
+                )
+            }
+        }
+        exo.addListener(listener)
+        playerListener = listener
+        _player.value = exo
+        if (!_isCasting.value) _currentPlayer.value = exo
+        if (preferredSubCode != null) applyPreferredSub()
+        startProgressTicker()
+        ensureCastPlayer()
+    }
+
+    // --- Subtitles ----------------------------------------------------------
+
+    private suspend fun loadSubtitles(d: MediaDetails) {
+        val settings = settingsRepository.current()
+        preferredSubCode = if (settings.subtitlesEnabled) settings.subtitleLanguage.code else null
+        val subs = subtitleRepository.fetch(d, season, episode)
+        _subtitles.value = subs
+        subtitleConfigs = subs.map(::buildSubConfig)
+        // If the player already started before subs arrived, re-attach them at the live position.
+        val exo = _player.value ?: return
+        val url = currentMediaUrl ?: return
+        if (subtitleConfigs.isNotEmpty()) {
+            val pos = exo.currentPosition
+            exo.setMediaItem(buildMediaItem(url), pos)
+            exo.prepare()
+        }
+        if (preferredSubCode != null) applyPreferredSub()
+    }
+
+    /** Pick an external/embedded subtitle track (null = turn subtitles off). */
+    fun selectSubtitle(track: SubtitleTrack?) {
+        val exo = _player.value ?: return
+        exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon().apply {
+            if (track == null) {
+                setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            } else {
+                setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                setPreferredTextLanguage(track.languageCode)
+            }
+        }.build()
+        _currentSubtitle.value = track
+    }
+
+    /** Re-query the subtitle addon (the in-player "search") and re-attach to the live player. */
+    fun refreshSubtitles() {
+        val d = details ?: return
+        viewModelScope.launch {
+            val subs = subtitleRepository.fetch(d, season, episode)
+            _subtitles.value = subs
+            subtitleConfigs = subs.map(::buildSubConfig)
+            val exo = _player.value ?: return@launch
+            val url = currentMediaUrl ?: return@launch
+            exo.setMediaItem(buildMediaItem(url), exo.currentPosition)
+            exo.prepare()
+            _currentSubtitle.value?.let { selectSubtitle(it) }
+        }
+    }
+
+    private fun applyPreferredSub() {
+        val code = preferredSubCode ?: return
+        val exo = _player.value ?: return
+        exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            .setPreferredTextLanguage(code)
+            .build()
+        _currentSubtitle.value = _subtitles.value.firstOrNull { it.languageCode.equals(code, true) }
+    }
+
+    private fun buildMediaItem(url: String): ExoMediaItem =
+        ExoMediaItem.Builder()
+            .setUri(url)
+            .setSubtitleConfigurations(subtitleConfigs)
+            .build()
+
+    private fun buildSubConfig(track: SubtitleTrack): ExoMediaItem.SubtitleConfiguration =
+        ExoMediaItem.SubtitleConfiguration.Builder(Uri.parse(track.url))
+            .setMimeType(subtitleMime(track.url))
+            .setLanguage(track.languageCode)
+            .setLabel(track.label)
+            .build()
+
+    private fun subtitleMime(url: String): String = when {
+        url.endsWith(".vtt", ignoreCase = true) -> MimeTypes.TEXT_VTT
+        url.endsWith(".ass", ignoreCase = true) || url.endsWith(".ssa", ignoreCase = true) -> MimeTypes.TEXT_SSA
+        else -> MimeTypes.APPLICATION_SUBRIP
+    }
+
+    // --- Cast playback transfer ---------------------------------------------
+
+    @OptIn(UnstableApi::class)
+    private fun ensureCastPlayer() {
+        if (castPlayer != null) return
+        val ctx = castManager.castContext ?: return
+        val cp = CastPlayer(ctx)
+        cp.setSessionAvailabilityListener(object : SessionAvailabilityListener {
+            override fun onCastSessionAvailable() = transferToCast()
+            override fun onCastSessionUnavailable() = transferToLocal()
+        })
+        castPlayer = cp
+        // A Cast session may already be live when the player screen opens.
+        if (cp.isCastSessionAvailable) transferToCast()
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun transferToCast() {
+        val startPos = _player.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        _player.value?.playWhenReady = false
+        _isCasting.value = true
+        loadCastMedia(fromPositionMs = startPos)
+        _currentPlayer.value = castPlayer
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun loadCastMedia(fromPositionMs: Long) {
+        val url = currentMediaUrl ?: return
+        val remoteUrl = castManager.toLanUrl(url)
+        if (remoteUrl == null) {
+            _uiState.value = PlayerUiState.Error("Can't cast: no Wi-Fi network found to reach the TV.")
+            return
+        }
+        val item = ExoMediaItem.Builder()
+            .setUri(remoteUrl)
+            .setMimeType(guessMimeType())
+            .build()
+        castPlayer?.apply {
+            setMediaItem(item, fromPositionMs)
+            playWhenReady = true
+            prepare()
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun transferToLocal() {
+        val resumePos = castPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        _isCasting.value = false
+        val exo = _player.value
+        if (exo != null) {
+            exo.seekTo(resumePos)
+            exo.playWhenReady = true
+        }
+        _currentPlayer.value = exo
+    }
+
+    /** Best-effort MIME for the Cast receiver, inferred from the chosen source's title. */
+    private fun guessMimeType(): String {
+        val t = _currentSource.value?.title?.lowercase().orEmpty()
+        return when {
+            "mkv" in t -> "video/x-matroska"
+            "webm" in t -> "video/webm"
+            "avi" in t -> "video/x-msvideo"
+            else -> "video/mp4"
+        }
+    }
+
+    private fun maybeSeekToResume(exo: ExoPlayer) {
+        if (hasSeekedToResume) return
+        hasSeekedToResume = true
+        viewModelScope.launch {
+            val saved = libraryRepository.getProgress(mediaId, mediaType, season, episode)
+            if (saved != null && !saved.isFinished && saved.positionMs > 0) {
+                exo.seekTo(saved.positionMs)
+            }
+        }
+    }
+
+    private fun startProgressTicker() {
+        progressTickJob?.cancel()
+        progressTickJob = viewModelScope.launch {
+            while (isActive) {
+                delay(PROGRESS_INTERVAL_MS)
+                saveProgressNow()
+                maybeWarmNextEpisode()
+            }
+        }
+    }
+
+    private fun saveProgressNow() {
+        val exo = _player.value ?: return
+        val d = details ?: return
+        val duration = exo.duration
+        val position = exo.currentPosition
+        if (duration <= 0L || position < 0L) return
+        val item: MediaItem = d.item
+        val progress = PlaybackProgress(
+            mediaId = mediaId,
+            mediaType = mediaType,
+            season = season,
+            episode = episode,
+            positionMs = position,
+            durationMs = duration,
+            updatedAt = System.currentTimeMillis(),
+            infoHash = activeInfoHash,
+        )
+        // Use cleanupScope so it still completes if invoked during teardown.
+        cleanupScope.launch {
+            runCatching { libraryRepository.saveProgress(item, progress) }
+        }
+    }
+
+    private suspend fun stopActiveStream(removeFiles: Boolean) {
+        streamJob?.cancel()
+        streamJob = null
+        activeInfoHash?.let { hash ->
+            runCatching { torrentStreamer.stop(hash, removeFiles = removeFiles) }
+        }
+    }
+
+    private fun buildTitle(d: MediaDetails): String {
+        val base = d.item.title
+        return if (season != null && episode != null) "$base · S${season}E${episode}" else base
+    }
+
+    // --- Next-episode prefetch (TV only) ------------------------------------
+
+    /** Warm the next episode when within [PREFETCH_LEAD_MS] / [PREFETCH_PCT] of the end. */
+    private fun maybeWarmNextEpisode() {
+        if (mediaType != MediaType.TV) return
+        if (prefetchTriggeredForEpisode) return
+        if (_isCasting.value) return                 // remote playback: a phone-side head buffer is useless
+        if (!isOnUnmeteredNetwork()) return
+        val exo = _player.value ?: return
+        val duration = exo.duration
+        val position = exo.currentPosition
+        if (duration <= 0L || position < 0L) return
+
+        val remainingMs = duration - position
+        val pctDone = position.toFloat() / duration
+        if (remainingMs !in 0..PREFETCH_LEAD_MS && pctDone < PREFETCH_PCT) return
+
+        prefetchTriggeredForEpisode = true           // claim the slot before the await
+        prefetchJob?.cancel()
+        prefetchJob = viewModelScope.launch { warmEpisode() }
+    }
+
+    private suspend fun warmEpisode() {
+        val d = details ?: return
+        val s = season ?: return
+        val e = episode ?: return
+        val (nextSeason, nextEpisode) = nextEpisodeCoords(d, s, e) ?: return
+
+        val sources = when (val r = sourceRepository.resolve(d, nextSeason, nextEpisode)) {
+            is DataResult.Success -> r.data
+            is DataResult.Error -> return
+        }
+        if (sources.isEmpty()) return
+        val best = pickPreferred(sources, networkQualityPreference())
+
+        val playing = activeInfoHash
+        if (best.infoHash == playing) return
+        if (best.infoHash in torrentStreamer.cachedTorrents()) {
+            prefetchedInfoHash = best.infoHash
+            return
+        }
+        prefetchedInfoHash = torrentStreamer.prefetch(best, setOfNotNull(playing))
+    }
+
+    /** Next-episode coordinates: same-season next, else episode 1 of the next real season. */
+    private suspend fun nextEpisodeCoords(
+        d: MediaDetails,
+        curSeason: Int,
+        curEpisode: Int,
+    ): Pair<Int, Int>? {
+        val curCount = when (val r = catalogRepository.getEpisodes(mediaId, curSeason)) {
+            is DataResult.Success -> r.data.size
+            is DataResult.Error -> return null
+        }
+        if (curEpisode < curCount) return curSeason to (curEpisode + 1)
+
+        val nextSeason = d.seasons
+            .map { it.seasonNumber }
+            .filter { it > curSeason && it >= 1 }
+            .minOrNull() ?: return null
+        val nextCount = when (val r = catalogRepository.getEpisodes(mediaId, nextSeason)) {
+            is DataResult.Success -> r.data.size
+            is DataResult.Error -> return null
+        }
+        if (nextCount <= 0) return null
+        return nextSeason to 1
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        // Save final progress, release the player, and stop the torrent — keeping the
+        // partial download cached (removeFiles = false) for fast resume next time.
+        saveProgressNow()
+        progressTickJob?.cancel()
+        streamJob?.cancel()
+        prefetchJob?.cancel() // warmed next-episode torrent stays paused + cached intentionally
+        val exo = _player.value
+        playerListener?.let { exo?.removeListener(it) }
+        exo?.release()
+        _player.value = null
+        castPlayer?.setSessionAvailabilityListener(null)
+        castPlayer?.release()
+        castPlayer = null
+        _currentPlayer.value = null
+        val hash = activeInfoHash
+        if (hash != null) {
+            cleanupScope.launch {
+                runCatching { torrentStreamer.stop(hash, removeFiles = false) }
+            }
+        }
+    }
+
+    private companion object {
+        const val PROGRESS_INTERVAL_MS = 10_000L
+        /** Start warming the next episode when this close to the end (~3 min). */
+        const val PREFETCH_LEAD_MS = 3 * 60_000L
+        /** ...or once past this fraction of the runtime, whichever comes first. */
+        const val PREFETCH_PCT = 0.85f
+    }
+}

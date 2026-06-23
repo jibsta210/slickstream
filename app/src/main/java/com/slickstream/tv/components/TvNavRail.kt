@@ -1,0 +1,166 @@
+package com.slickstream.tv.components
+
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.tv.material3.Icon
+import androidx.tv.material3.MaterialTheme
+import androidx.tv.material3.Surface
+import androidx.tv.material3.ClickableSurfaceDefaults
+import androidx.tv.material3.Text
+import com.slickstream.ui.theme.Brand
+
+/** A single destination shown in the left navigation rail. */
+enum class TvDestination(val route: String, val label: String, val icon: ImageVector) {
+    BROWSE(com.slickstream.navigation.Routes.HOME, "Browse", Icons.Rounded.Home),
+    SEARCH(com.slickstream.navigation.Routes.SEARCH, "Search", Icons.Rounded.Search),
+    FAVORITES(com.slickstream.navigation.Routes.FAVORITES, "Favorites", Icons.Rounded.Favorite),
+    PROFILE(com.slickstream.navigation.Routes.PROFILE, "Profile", Icons.Rounded.Person),
+}
+
+/**
+ * Left navigation rail for the TV shell. Collapsed to icons by default; expands to show labels
+ * while any rail item holds focus (a common 10-foot pattern). Selecting an item invokes
+ * [onSelect] with the destination's route.
+ */
+@Composable
+fun TvNavRail(
+    selectedRoute: String,
+    onSelect: (TvDestination) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var anyFocused by remember { mutableStateOf(false) }
+    val expanded = anyFocused
+
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .background(
+                Brush.horizontalGradient(
+                    0f to Color(0xFF101019),
+                    1f to Brand.Background,
+                ),
+            )
+            .width(if (expanded) 220.dp else 88.dp)
+            .animateContentSize()
+            .selectableGroup()
+            .padding(vertical = 28.dp, horizontal = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalAlignment = Alignment.Start,
+    ) {
+        // Brand mark.
+        Text(
+            text = if (expanded) "SlickStream" else "S",
+            style = MaterialTheme.typography.titleLarge,
+            color = Brand.Violet,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(start = 12.dp, bottom = 16.dp),
+        )
+
+        TvDestination.entries.forEach { dest ->
+            TvNavItem(
+                destination = dest,
+                selected = dest.route == selectedRoute,
+                expanded = expanded,
+                onSelect = { onSelect(dest) },
+                onFocusChanged = { focused -> if (focused) anyFocused = true },
+            )
+        }
+
+        Spacer(Modifier.height(1.dp))
+    }
+}
+
+@Composable
+private fun TvNavItem(
+    destination: TvDestination,
+    selected: Boolean,
+    expanded: Boolean,
+    onSelect: () -> Unit,
+    onFocusChanged: (Boolean) -> Unit,
+) {
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    // Bubble focus up so the rail can expand.
+    androidx.compose.runtime.LaunchedEffect(focused) { onFocusChanged(focused) }
+
+    val shape = RoundedCornerShape(14.dp)
+    val activeTint = when {
+        focused -> Color.White
+        selected -> Brand.Violet
+        else -> Brand.OnSurfaceDim
+    }
+
+    Surface(
+        onClick = onSelect,
+        interactionSource = interaction,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (selected) Brand.SurfaceVariant else Color.Transparent,
+            focusedContainerColor = Brand.Violet,
+            pressedContainerColor = Brand.VioletDim,
+            focusedContentColor = Color.White,
+            contentColor = activeTint,
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            androidx.compose.foundation.layout.Row(
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = destination.icon,
+                    contentDescription = destination.label,
+                    tint = if (focused) Color.White else activeTint,
+                    modifier = Modifier.size(26.dp),
+                )
+                if (expanded) {
+                    Spacer(Modifier.width(16.dp))
+                    Text(
+                        text = destination.label,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (focused) Color.White else activeTint,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
