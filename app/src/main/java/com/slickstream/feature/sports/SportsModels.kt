@@ -15,6 +15,8 @@ data class SportEvent(
     val posterUrl: String?,
     val isLive: Boolean,
     val sources: List<SportSourceRef>,
+    /** FanCode-style direct feed that needs no resolution (skips the streamed.pk source dance). */
+    val directStream: SportStream? = null,
 )
 
 /** Points at one provider's copy of an event's streams ({source}/{id} for the stream endpoint). */
@@ -29,4 +31,10 @@ data class SportStream(
     val label: String,
     val url: String,
     val headers: Map<String, String>,
+    /**
+     * When true, [url] is an obfuscated embed PAGE (streamed.pk) that must be run through the
+     * WebView resolver to capture the real .m3u8 before ExoPlayer can play it. When false, [url]
+     * is already a playable HLS master (FanCode).
+     */
+    val needsResolution: Boolean = false,
 )

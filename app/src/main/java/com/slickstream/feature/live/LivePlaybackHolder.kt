@@ -14,13 +14,15 @@ class LivePlaybackHolder @Inject constructor() {
     var current: Selection? = null
         private set
 
-    fun set(title: String, url: String, headers: Map<String, String>) {
-        current = Selection(title, url, headers)
+    fun set(title: String, url: String, headers: Map<String, String>, needsResolution: Boolean) {
+        current = Selection(title, url, headers, needsResolution)
     }
 
     data class Selection(
         val title: String,
         val url: String,
         val headers: Map<String, String>,
+        /** url is an embed page to resolve via WebView before playing (vs a direct m3u8). */
+        val needsResolution: Boolean,
     )
 }

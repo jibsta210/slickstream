@@ -3,6 +3,7 @@ package com.slickstream.feature.live
 import android.content.Context
 import androidx.annotation.OptIn
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -14,19 +15,24 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
- * A lightweight HLS player for live sports — completely separate from the torrent
+ * A lightweight HLS player for live sports — separate from the torrent
  * [com.slickstream.feature.player.PlayerViewModel]. Reads the selected feed from
- * [LivePlaybackHolder] and plays it via ExoPlayer with the host's required request headers
- * (Referer / User-Agent) injected on every playlist + segment request.
+ * [LivePlaybackHolder] and plays it via ExoPlayer with the host's required request headers.
+ *
+ * If the feed is an obfuscated embed (streamed.pk, `needsResolution`), it's first run through
+ * [WebViewStreamResolver] to capture the real `.m3u8`; FanCode direct feeds play immediately.
+ * Because resolution is async, [player] is a StateFlow set once the stream is ready.
  */
 @OptIn(UnstableApi::class)
 @HiltViewModel
 class LivePlayerViewModel @Inject constructor(
-    @ApplicationContext appContext: Context,
+    @ApplicationContext private val appContext: Context,
     private val holder: LivePlaybackHolder,
+    private val resolver: WebViewStreamResolver,
 ) : ViewModel() {
 
     sealed interface UiState {
@@ -39,18 +45,46 @@ class LivePlayerViewModel @Inject constructor(
     private val _uiState = MutableStateFlow<UiState>(UiState.Buffering)
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
+    private val _player = MutableStateFlow<ExoPlayer?>(null)
+    val player: StateFlow<ExoPlayer?> = _player.asStateFlow()
+
     val title: String = holder.current?.title ?: "Live"
 
-    val player: ExoPlayer? = holder.current?.let { sel ->
+    init {
+        val sel = holder.current
+        if (sel == null) {
+            _uiState.value = UiState.NoStream
+        } else {
+            viewModelScope.launch {
+                val playUrl = if (sel.needsResolution) {
+                    // Resolve the embed -> m3u8 invisibly (shows the buffering overlay meanwhile).
+                    resolver.resolve(
+                        embedUrl = sel.url,
+                        referer = sel.headers["Referer"] ?: "https://streamed.pk/",
+                        userAgent = sel.headers["User-Agent"] ?: DEFAULT_UA,
+                    )
+                } else {
+                    sel.url
+                }
+                if (playUrl.isNullOrBlank()) {
+                    _uiState.value = UiState.Error("Couldn't find a playable stream for this feed. Try another source.")
+                } else {
+                    buildPlayer(playUrl, sel.headers)
+                }
+            }
+        }
+    }
+
+    private fun buildPlayer(url: String, headers: Map<String, String>) {
         val http = DefaultHttpDataSource.Factory()
-            .setDefaultRequestProperties(sel.headers)
+            .setDefaultRequestProperties(headers)
             .setAllowCrossProtocolRedirects(true)
-            .setUserAgent(sel.headers["User-Agent"])
-        ExoPlayer.Builder(appContext)
+            .setUserAgent(headers["User-Agent"] ?: DEFAULT_UA)
+        val exo = ExoPlayer.Builder(appContext)
             .setMediaSourceFactory(DefaultMediaSourceFactory(http))
             .build()
             .apply {
-                setMediaItem(MediaItem.fromUri(sel.url))
+                setMediaItem(MediaItem.fromUri(url))
                 addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(state: Int) {
                         when (state) {
@@ -68,21 +102,23 @@ class LivePlayerViewModel @Inject constructor(
                 prepare()
                 playWhenReady = true
             }
-    }
-
-    init {
-        if (holder.current == null) _uiState.value = UiState.NoStream
+        _player.value = exo
     }
 
     fun retry() {
-        val p = player ?: return
+        val p = _player.value ?: return
         _uiState.value = UiState.Buffering
         p.prepare()
         p.playWhenReady = true
     }
 
     override fun onCleared() {
-        player?.release()
+        _player.value?.release()
         super.onCleared()
+    }
+
+    private companion object {
+        const val DEFAULT_UA =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36"
     }
 }

@@ -2,6 +2,7 @@ package com.slickstream.feature.sports.di
 
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.slickstream.core.common.Sports
+import com.slickstream.feature.sports.FanCodeSource
 import com.slickstream.feature.sports.SportsApi
 import com.slickstream.feature.sports.SportsRepository
 import com.slickstream.feature.sports.SportsRepositoryImpl
@@ -40,6 +41,6 @@ object SportsModule {
 
     @Provides
     @Singleton
-    fun provideSportsRepository(api: SportsApi): SportsRepository =
-        SportsRepositoryImpl(api, Sports.BASE_URL)
+    fun provideSportsRepository(api: SportsApi, fanCode: FanCodeSource): SportsRepository =
+        SportsRepositoryImpl(api, fanCode, Sports.BASE_URL)
 }

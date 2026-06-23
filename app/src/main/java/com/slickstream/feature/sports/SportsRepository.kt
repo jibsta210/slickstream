@@ -26,39 +26,64 @@ interface SportsRepository {
 
 class SportsRepositoryImpl(
     private val api: SportsApi,
+    private val fanCode: FanCodeSource,
     private val baseUrl: String,
 ) : SportsRepository {
 
-    override val enabled: Boolean get() = baseUrl.isNotBlank()
+    private val streamedEnabled: Boolean get() = baseUrl.isNotBlank()
+
+    // FanCode is always available (keyless community feed), so the tab is never fully disabled.
+    override val enabled: Boolean get() = true
 
     override suspend fun categories(): DataResult<List<SportCategory>> = guard {
         val live = SportCategory(SportsRepository.LIVE_CATEGORY_ID, "Live now")
-        val rest = api.sports()
-            .filter { it.id.isNotBlank() }
-            .map { SportCategory(it.id, it.name.ifBlank { it.id.replaceFirstChar(Char::uppercase) }) }
-        listOf(live) + rest
+        val fanCats = runCatching { fanCode.liveMatches() }.getOrDefault(emptyList())
+            .map { it.categoryId }
+            .distinct()
+            .map { id ->
+                SportCategory(id, id.removePrefix(FanCodeSource.FC_PREFIX).replaceFirstChar(Char::uppercase))
+            }
+        val streamedCats = if (!streamedEnabled) emptyList() else
+            runCatching { api.sports() }.getOrDefault(emptyList())
+                .filter { it.id.isNotBlank() }
+                .map { SportCategory(it.id, it.name.ifBlank { it.id.replaceFirstChar(Char::uppercase) }) }
+        (listOf(live) + fanCats + streamedCats).distinctBy { it.id }
     }
 
     override suspend fun events(categoryId: String): DataResult<List<SportEvent>> = guard {
-        val matches = if (categoryId == SportsRepository.LIVE_CATEGORY_ID) {
-            api.liveMatches()
-        } else {
-            api.matches(categoryId)
-        }
         val now = System.currentTimeMillis()
-        matches
-            .filter { it.id.isNotBlank() && it.sources.isNotEmpty() }
-            .map { it.toEvent(now, forcedLive = categoryId == SportsRepository.LIVE_CATEGORY_ID) }
-            .sortedWith(compareByDescending<SportEvent> { it.isLive }.thenBy { it.startEpochMs })
+        when {
+            categoryId == SportsRepository.LIVE_CATEGORY_ID -> {
+                val fc = runCatching { fanCode.liveMatches() }.getOrDefault(emptyList())
+                val sp = if (!streamedEnabled) emptyList() else
+                    runCatching { api.liveMatches() }.getOrDefault(emptyList())
+                        .filter { it.id.isNotBlank() && it.sources.isNotEmpty() }
+                        .map { it.toEvent(now, forcedLive = true) }
+                (fc + sp).sortedWith(compareByDescending<SportEvent> { it.isLive }.thenBy { it.startEpochMs })
+            }
+            categoryId.startsWith(FanCodeSource.FC_PREFIX) ->
+                runCatching { fanCode.liveMatches() }.getOrDefault(emptyList())
+                    .filter { it.categoryId == categoryId }
+            else ->
+                api.matches(categoryId)
+                    .filter { it.id.isNotBlank() && it.sources.isNotEmpty() }
+                    .map { it.toEvent(now, forcedLive = false) }
+                    .sortedWith(compareByDescending<SportEvent> { it.isLive }.thenBy { it.startEpochMs })
+        }
     }
 
     override suspend fun streams(event: SportEvent): DataResult<List<SportStream>> = guard {
-        coroutineScope {
-            event.sources
-                .map { ref -> async(Dispatchers.IO) { runCatching { api.streams(ref.source, ref.id) }.getOrDefault(emptyList()) } }
-                .flatMap { it.await() }
-                .filter { it.embedUrl.isNotBlank() }
-                .map { it.toStream() }
+        val direct = event.directStream
+        if (direct != null) {
+            listOf(direct)
+        } else {
+            coroutineScope {
+                event.sources
+                    .map { ref -> async(Dispatchers.IO) { runCatching { api.streams(ref.source, ref.id) }.getOrDefault(emptyList()) } }
+                    .flatMap { it.await() }
+                    .filter { it.embedUrl.isNotBlank() }
+                    .map { it.toStream() }
+            }
         }
     }
 
@@ -86,18 +111,18 @@ class SportsRepositoryImpl(
             if (hd) append(" · HD")
             if (streamNo > 0) append(" · #$streamNo")
         }
-        // These hosts validate Referer + User-Agent on the playlist and segments.
-        val origin = runCatching { java.net.URI(embedUrl).let { "${it.scheme}://${it.host}/" } }
-            .getOrDefault(embedUrl)
+        // The embed renders + the resulting playlist/segments 403 unless the referrer is streamed.pk.
+        // url is the embed PAGE; needsResolution=true routes it through the WebView resolver first.
         return SportStream(
             id = "$source-$id-$streamNo",
             label = label,
             url = embedUrl,
             headers = mapOf(
-                "Referer" to origin,
+                "Referer" to "https://streamed.pk/",
+                "Origin" to "https://streamed.pk",
                 "User-Agent" to USER_AGENT,
-                "Origin" to origin.trimEnd('/'),
             ),
+            needsResolution = true,
         )
     }
 

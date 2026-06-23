@@ -56,8 +56,9 @@ fun LivePlayerScreen(
     val backFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
 
+    val player by viewModel.player.collectAsStateWithLifecycle()
+
     Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
-        val player = viewModel.player
         if (player != null) {
             AndroidView(
                 factory = { ctx ->
