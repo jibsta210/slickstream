@@ -22,6 +22,7 @@ import com.slickstream.tv.components.TvNavRail
 import com.slickstream.feature.live.LivePlayerScreen
 import com.slickstream.tv.screen.TvCatalogScreen
 import com.slickstream.tv.screen.TvCategoryScreen
+import com.slickstream.tv.screen.TvSettingsScreen
 import com.slickstream.tv.screen.TvSportsScreen
 import com.slickstream.tv.screen.TvDetailsScreen
 import com.slickstream.tv.screen.TvFavoritesScreen
@@ -161,7 +162,11 @@ fun TvApp() {
                         }
 
                         composable(Routes.PROFILE) {
-                            TvProfileScreen()
+                            TvProfileScreen(onOpenSettings = { navController.navigate(Routes.SETTINGS) })
+                        }
+
+                        composable(Routes.SETTINGS) {
+                            TvSettingsScreen()
                         }
 
                         composable(

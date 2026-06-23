@@ -23,6 +23,7 @@ import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -94,6 +95,7 @@ private fun Context.findActivity(): Activity? {
  */
 @Composable
 fun TvProfileScreen(
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
@@ -140,11 +142,15 @@ fun TvProfileScreen(
                         }
                     },
                 )
-                ProfileAction(
-                    icon = Icons.Rounded.Devices,
-                    label = "Pair with a code instead",
-                    onClick = { signInError = null; showPairing = true },
-                )
+                // Only offer code-pairing when the TV OAuth client is actually configured — an
+                // unconfigured button just dead-ends in "TV sign-in isn't configured yet".
+                if (com.slickstream.core.common.Auth.GOOGLE_TV_CLIENT_ID.isNotBlank()) {
+                    ProfileAction(
+                        icon = Icons.Rounded.Devices,
+                        label = "Pair with a code instead",
+                        onClick = { signInError = null; showPairing = true },
+                    )
+                }
             } else {
                 ProfileAction(
                     icon = Icons.Rounded.Logout,
@@ -152,6 +158,12 @@ fun TvProfileScreen(
                     onClick = { dialog = ProfileDialog.SignOut },
                 )
             }
+
+            ProfileAction(
+                icon = Icons.Rounded.Settings,
+                label = "Settings",
+                onClick = onOpenSettings,
+            )
 
             ProfileAction(
                 icon = Icons.Rounded.DeleteSweep,
