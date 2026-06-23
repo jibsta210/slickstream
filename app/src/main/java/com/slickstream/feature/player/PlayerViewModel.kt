@@ -17,6 +17,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.CastPlayer
 import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.mediarouter.media.MediaRouteSelector
 import com.slickstream.cast.CastManager
@@ -230,10 +231,21 @@ class PlayerViewModel @Inject constructor(
         return if (isOnUnmeteredNetwork()) settings.wifiQuality else settings.cellularQuality
     }
 
-    /** Highest-ranked source within the quality cap; fall back to the best overall if none fit. */
+    /**
+     * Auto-pick a source. SEEDERS are the primary key (with a health floor) — NOT quality rank —
+     * so a starved 4K/3-seeder is never chosen over a healthy 1080p/500-seeder. On low-power TV we
+     * also cap at 1080p under AUTO, since 4K is the heaviest to sustain on the conservative engine
+     * profile (and the dominant cause of "playback failed" on TV). Quality only tiebreaks.
+     */
     private fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
-        val capped = list.filter { QualityPreference.tierOf(it.quality) <= pref.maxTier }
-        return capped.ifEmpty { list }.maxByOrNull { it.rank } ?: list.first()
+        val effectiveTier =
+            if (deviceProfile.isLowPower) minOf(pref.maxTier, QualityPreference.FHD_1080.maxTier)
+            else pref.maxTier
+        val capped = list.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }.ifEmpty { list }
+        val healthy = capped.filter { (it.seeders ?: 0) >= MIN_SEEDERS }.ifEmpty { capped }
+        return healthy.maxWithOrNull(
+            compareBy<StreamSource> { it.seeders ?: 0 }.thenBy { it.rank },
+        ) ?: list.first()
     }
 
     private fun isOnUnmeteredNetwork(): Boolean {
@@ -335,7 +347,11 @@ class PlayerViewModel @Inject constructor(
                 }
             }
             .build()
-        val exo = ExoPlayer.Builder(appContext).setLoadControl(loadControl).build().apply {
+        // Decoder fallback: on a weak TV a single HEVC/10-bit/4K decoder-init failure would
+        // otherwise dead-end straight into Error; fallback retries on a secondary/software decoder.
+        // No behaviour change when the primary decoder works (the phone path).
+        val renderers = DefaultRenderersFactory(appContext).setEnableDecoderFallback(true)
+        val exo = ExoPlayer.Builder(appContext, renderers).setLoadControl(loadControl).build().apply {
             setMediaItem(buildMediaItem(url))
             prepare()
             playWhenReady = true
@@ -691,6 +707,8 @@ class PlayerViewModel @Inject constructor(
     }
 
     private companion object {
+        /** Auto-pick floor: don't choose a torrent under this many seeders if a healthier one exists. */
+        const val MIN_SEEDERS = 8
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L

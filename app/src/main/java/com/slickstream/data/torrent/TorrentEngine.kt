@@ -45,6 +45,17 @@ class TorrentEngine @Inject constructor(
     private val session = SessionManager()
     private val started = AtomicBoolean(false)
 
+    /**
+     * Serializes EVERY native libtorrent handle/session call. The piece-status readers
+     * (status(QUERY_PIECES) -> bitfield) run from the 500ms poll coroutine and from every NanoHTTPD
+     * read worker, concurrently with stop()/session.remove() (source-switch + cache eviction). A
+     * read racing a remove is a use-after-free in the release .so (asserts stripped) -> SIGSEGV that
+     * kills the whole process — the real "app lock". runCatching can't catch a native crash and
+     * isValid is TOCTOU; one lock closes the race. All these calls are OFF the main thread, so this
+     * can never cause a UI ANR. Re-entrant (snapshot -> contiguousHeadBytes both lock).
+     */
+    private val nativeLock = Any()
+
     /** Sliding look-ahead band size (smaller on low-power devices). Set in [ensureStarted]. */
     @Volatile
     private var readaheadBytes: Int = READAHEAD_BYTES
@@ -113,7 +124,11 @@ class TorrentEngine @Inject constructor(
             setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), !lowPower)
-            setInteger(settings_pack.int_types.upload_rate_limit.swigValue(), 0)
+            // Cap upload to 100 KB/s on ALL devices. We're a streaming/leech client, not a seedbox —
+            // an uncapped upload saturates the (usually small) home upstream and tanks the whole
+            // connection while a cached torrent keeps seeding after you've watched. 100 KB/s is plenty
+            // for tit-for-tat peer reciprocity without choking the link.
+            setInteger(settings_pack.int_types.upload_rate_limit.swigValue(), UPLOAD_RATE_LIMIT)
             // THE biggest freeze lever: an 8 MB/s download cap on low-power bounds SHA-1 hashing
             // throughput + eMMC write pressure + ExoPlayer buffer-fill rate all at once. 8 (not 4)
             // MB/s keeps the 6 MB head + 1 MB moov startup fuel arriving in <1s (preserves the
@@ -200,7 +215,8 @@ class TorrentEngine @Inject constructor(
     private fun completeDeferredRemoval(handle: TorrentHandle) {
         val ih = runCatching { handle.infoHash().toHex().lowercase() }.getOrNull() ?: return
         if (pendingRemoval.remove(ih) && handle.isValid) {
-            runCatching { session.remove(handle) }
+            // session.remove races the piece-status readers — serialize (see nativeLock).
+            synchronized(nativeLock) { runCatching { session.remove(handle) } }
         }
     }
 
@@ -372,8 +388,8 @@ class TorrentEngine @Inject constructor(
         val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
-        // which then throw — prioritisation isn't worth crashing over.
-        runCatching {
+        // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
+        synchronized(nativeLock) { runCatching {
             for (i in 0 until headPieces) {
                 val p = active.firstPiece + i
                 if (p in active.firstPiece..active.lastPiece) {
@@ -390,7 +406,7 @@ class TorrentEngine @Inject constructor(
                     handle.setPieceDeadline(p, (i + 1) * 50)
                 }
             }
-        }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) }
+        }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
     }
 
     /**
@@ -409,13 +425,15 @@ class TorrentEngine @Inject constructor(
 
         // Bump priority + deadlines so libtorrent fetches these next, in order. Best-effort: a
         // concurrent stop() can invalidate the handle mid-loop, making the native call throw.
-        runCatching {
-            var deadline = 0
-            for (p in firstNeeded..lastNeeded) {
-                if (p in active.firstPiece..active.lastPiece) {
-                    handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, deadline)
-                    deadline += 30
+        synchronized(nativeLock) {
+            runCatching {
+                var deadline = 0
+                for (p in firstNeeded..lastNeeded) {
+                    if (p in active.firstPiece..active.lastPiece) {
+                        handle.piecePriority(p, Priority.TOP_PRIORITY)
+                        handle.setPieceDeadline(p, deadline)
+                        deadline += 30
+                    }
                 }
             }
         }
@@ -433,32 +451,34 @@ class TorrentEngine @Inject constructor(
         active: ActiveTorrent,
         firstNeeded: Int,
         lastNeeded: Int,
-    ): Boolean {
-        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull() ?: return false
+    ): Boolean = synchronized(nativeLock) {
+        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
+            ?: return@synchronized false
         // pieces() never returns null — but the underlying native bitfield may be EMPTY (size 0,
         // null buffer) before any piece data exists (just-added/checking/paused window). getBit()
         // on it dereferences a null native buffer (the bounds/null asserts are compiled out in the
         // release .so) -> SIGSEGV. size() is null-safe (returns 0), so gate on it and bounds-check.
         val pieces = status.pieces()
         val pieceCount = pieces.size()
-        if (pieceCount == 0) return false
+        if (pieceCount == 0) return@synchronized false
         for (p in firstNeeded..lastNeeded) {
             if (p in active.firstPiece..active.lastPiece) {
-                if (p >= pieceCount || !pieces.getBit(p)) return false
+                if (p >= pieceCount || !pieces.getBit(p)) return@synchronized false
             }
         }
-        return true
+        true
     }
 
     /** How many contiguous head bytes (from the start of the file) are downloaded. */
-    fun contiguousHeadBytes(infoHash: String): Long {
-        val active = torrents[infoHash] ?: return 0L
-        val handle = active.handle?.takeIf { it.isValid } ?: return 0L
-        if (active.pieceLength <= 0) return 0L
-        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull() ?: return 0L
+    fun contiguousHeadBytes(infoHash: String): Long = synchronized(nativeLock) {
+        val active = torrents[infoHash] ?: return@synchronized 0L
+        val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized 0L
+        if (active.pieceLength <= 0) return@synchronized 0L
+        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
+            ?: return@synchronized 0L
         val pieces = status.pieces()
         val pieceCount = pieces.size()
-        if (pieceCount == 0) return 0L
+        if (pieceCount == 0) return@synchronized 0L
 
         var contiguousPieces = 0
         var p = active.firstPiece
@@ -466,30 +486,31 @@ class TorrentEngine @Inject constructor(
             contiguousPieces++
             p++
         }
-        if (contiguousPieces == 0) return 0L
+        if (contiguousPieces == 0) return@synchronized 0L
         val bytesFromPieceStart = contiguousPieces.toLong() * active.pieceLength
         // The first piece may begin before the file (shared with the previous file).
         val headOffsetInFirstPiece = active.fileOffset % active.pieceLength
-        return (bytesFromPieceStart - headOffsetInFirstPiece).coerceIn(0L, active.fileLength)
+        (bytesFromPieceStart - headOffsetInFirstPiece).coerceIn(0L, active.fileLength)
     }
 
     /** True if the tail pieces (needed for mp4 moov atoms) are present. */
-    fun tailAvailable(infoHash: String): Boolean {
-        val active = torrents[infoHash] ?: return false
-        val handle = active.handle?.takeIf { it.isValid } ?: return false
-        if (active.pieceLength <= 0) return false
+    fun tailAvailable(infoHash: String): Boolean = synchronized(nativeLock) {
+        val active = torrents[infoHash] ?: return@synchronized false
+        val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized false
+        if (active.pieceLength <= 0) return@synchronized false
         val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
-        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull() ?: return false
+        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
+            ?: return@synchronized false
         val pieces = status.pieces()
         val pieceCount = pieces.size()
-        if (pieceCount == 0) return false
+        if (pieceCount == 0) return@synchronized false
         for (i in 0 until tailPieces) {
             val p = active.lastPiece - i
             if (p in active.firstPiece..active.lastPiece) {
-                if (p >= pieceCount || !pieces.getBit(p)) return false
+                if (p >= pieceCount || !pieces.getBit(p)) return@synchronized false
             }
         }
-        return true
+        true
     }
 
     /** Absolute path of the selected file, once chosen. */
@@ -499,17 +520,17 @@ class TorrentEngine @Inject constructor(
     fun fileLength(infoHash: String): Long = torrents[infoHash]?.fileLength ?: 0L
 
     /** Live status snapshot, or null if the torrent isn't active. */
-    fun snapshot(infoHash: String): EngineStatus? {
-        val active = torrents[infoHash] ?: return null
-        val handle = active.handle?.takeIf { it.isValid } ?: return null
+    fun snapshot(infoHash: String): EngineStatus? = synchronized(nativeLock) {
+        val active = torrents[infoHash] ?: return@synchronized null
+        val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized null
         val st = handle.status()
         val fileTotal = active.fileLength.takeIf { it > 0 } ?: st.total()
-        val downloadedFile = (contiguousHeadBytes(infoHash)).coerceAtMost(fileTotal)
+        val downloadedFile = (contiguousHeadBytes(infoHash)).coerceAtMost(fileTotal) // re-entrant lock
         // Progress on the selected file (sequential => contiguous head is a good proxy),
         // but never report less than libtorrent's own file-aware progress.
         val byHead = if (fileTotal > 0) downloadedFile.toFloat() / fileTotal else 0f
         val progress = maxOf(byHead, st.progress()).coerceIn(0f, 1f)
-        return EngineStatus(
+        EngineStatus(
             progress = progress,
             downloadRate = st.downloadRate(),
             uploadRate = st.uploadRate(),
@@ -523,7 +544,7 @@ class TorrentEngine @Inject constructor(
     }
 
     fun pause(infoHash: String) {
-        torrents[infoHash]?.handle?.takeIf { it.isValid }?.pause()
+        synchronized(nativeLock) { torrents[infoHash]?.handle?.takeIf { it.isValid }?.pause() }
         saveResume(infoHash)
     }
 
@@ -557,8 +578,12 @@ class TorrentEngine @Inject constructor(
         val active = torrents[infoHash]
         val handle = active?.handle
         if (removeFiles) {
-            if (handle != null && handle.isValid) {
-                session.remove(handle, session_handle.delete_files)
+            // session.remove frees the native torrent; serialize against the piece-status readers
+            // or a concurrent read use-after-frees -> SIGSEGV (the whole-app lock).
+            synchronized(nativeLock) {
+                if (handle != null && handle.isValid) {
+                    session.remove(handle, session_handle.delete_files)
+                }
             }
             torrents.remove(infoHash)
             runCatching {
@@ -574,7 +599,7 @@ class TorrentEngine @Inject constructor(
                 // TorrentRemovedAlert clears the torrents map (keeping snapshot()/isActive()
                 // consistent until the blob exists).
                 pendingRemoval.add(infoHash)
-                handle.pause()
+                synchronized(nativeLock) { handle.pause() }
                 saveResume(infoHash)
                 saveSessionState()
             } else {
@@ -623,7 +648,7 @@ class TorrentEngine @Inject constructor(
         active.readHeadPiece = curPiece
 
         val readahead = (readaheadBytes / active.pieceLength + 1)
-        runCatching {
+        synchronized(nativeLock) { runCatching {
             if (prev >= 0) {
                 for (p in prev until curPiece) {
                     if (p in active.firstPiece..active.lastPiece) handle.resetPieceDeadline(p)
@@ -638,7 +663,7 @@ class TorrentEngine @Inject constructor(
                     deadline += 25
                 }
             }
-        }.onFailure { Log.w(TAG, "advanceReadHead failed", it) }
+        }.onFailure { Log.w(TAG, "advanceReadHead failed", it) } }
     }
 
     private fun resumeFileFor(infoHash: String) = File(resumeDir, "$infoHash.resume")
@@ -656,6 +681,9 @@ class TorrentEngine @Inject constructor(
         /** ~6 MB head buffer + ~1 MB tail (mp4 moov atom). */
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
         const val TAIL_PRIORITY_BYTES = 1 * 1024 * 1024
+
+        /** Seed/upload cap (bytes/s) — keep a streaming client from saturating the home upstream. */
+        const val UPLOAD_RATE_LIMIT = 100 * 1024
 
         /** ~16 MB sliding look-ahead band kept hot ahead of the player's read position. */
         const val READAHEAD_BYTES = 16 * 1024 * 1024

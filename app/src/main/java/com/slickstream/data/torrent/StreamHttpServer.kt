@@ -189,6 +189,12 @@ class StreamHttpServer(
         private var chunkStart = -1L
         private var chunkLen = 0
 
+        // Fail fast on low-power TV: a stalled read that would otherwise pin a NanoHTTPD worker for
+        // up to 60s (and hold the native handle) becomes a quick recoverable retry. 8s is safe —
+        // head/moov fuel arrives in <1s under the 8 MB/s cap.
+        private val readWaitMs = if (engine.isLowPower) 8_000L else READ_WAIT_TIMEOUT_MS
+        private val flushWaitMs = if (engine.isLowPower) 8_000L else FLUSH_WAIT_BUDGET_MS
+
         private fun raf(): RandomAccessFile =
             raf ?: RandomAccessFile(file, "r").also { raf = it }
 
@@ -222,7 +228,7 @@ class StreamHttpServer(
             // position) so head prioritisation tracks where the player really is.
             engine.advanceReadHead(infoHash, fillStart)
             val ready = runBlocking {
-                engine.ensureRange(infoHash, fillStart, fillEnd, READ_WAIT_TIMEOUT_MS)
+                engine.ensureRange(infoHash, fillStart, fillEnd, readWaitMs)
             }
             if (!ready) throw IOException("range $fillStart-$fillEnd not available")
 
@@ -231,7 +237,7 @@ class StreamHttpServer(
             // wall-clock deadline, re-seeking the SAME handle (reopening does NOT surface unflushed
             // data — that just storms open()/close()/seek() syscalls at flash blocks libtorrent is
             // mid-write on). Only reopen on a real IOException.
-            val deadlineNanos = System.nanoTime() + FLUSH_WAIT_BUDGET_MS * 1_000_000L
+            val deadlineNanos = System.nanoTime() + flushWaitMs * 1_000_000L
             var backoff = 10L
             var filled = 0
             while (filled < want) {
