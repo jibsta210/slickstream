@@ -12,16 +12,22 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
@@ -41,6 +47,18 @@ fun TvFavoritesScreen(
     viewModel: FavoritesViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+
+    val firstFocus = remember { FocusRequester() }
+    var didFocus by remember { mutableStateOf(false) }
+    LaunchedEffect(state.isEmpty) {
+        if (!state.isEmpty && !didFocus) {
+            didFocus = true
+            repeat(12) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
 
     Column(
         modifier = modifier
@@ -65,14 +83,16 @@ fun TvFavoritesScreen(
                 verticalArrangement = Arrangement.spacedBy(24.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                items(
+                itemsIndexed(
                     state.favorites.map { it.media },
-                    key = { "${it.mediaType.name}-${it.id}" },
-                ) { item ->
+                    key = { _, it -> "${it.mediaType.name}-${it.id}" },
+                ) { index, item ->
                     TvPosterCard(
                         item = item,
                         onClick = onMediaClick,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
                     )
                 }
             }

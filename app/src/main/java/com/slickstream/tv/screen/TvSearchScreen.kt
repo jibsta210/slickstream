@@ -25,6 +25,7 @@ import androidx.compose.material.icons.rounded.Keyboard
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -32,6 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -69,6 +71,17 @@ fun TvSearchScreen(
 
     var showKeyboard by remember { mutableStateOf(false) }
 
+    // Land focus on the mic (the voice-first hero) on entry.
+    val micFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    LaunchedEffect(showKeyboard) {
+        if (!showKeyboard) {
+            repeat(12) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { micFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
+
     // RECORD_AUDIO permission launcher; on grant we immediately start listening.
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -101,6 +114,7 @@ fun TvSearchScreen(
                 MicTile(
                     listening = voice.isListening,
                     rmsDb = voice.rmsDb,
+                    focusRequester = micFocus,
                     onClick = {
                         // Ask for the mic permission first if needed, else start directly.
                         viewModel.acknowledgeVoice()
@@ -159,6 +173,7 @@ private fun MicTile(
     listening: Boolean,
     rmsDb: Float,
     onClick: () -> Unit,
+    focusRequester: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -185,7 +200,10 @@ private fun MicTile(
             ),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.08f),
-        modifier = Modifier.size(168.dp).scale(if (listening) pulse else 1f),
+        modifier = Modifier
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .size(168.dp)
+            .scale(if (listening) pulse else 1f),
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Icon(

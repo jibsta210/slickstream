@@ -19,9 +19,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -34,7 +37,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.tv.material3.Button
 import androidx.tv.material3.Carousel
+import androidx.tv.material3.CarouselDefaults
+import androidx.tv.material3.CarouselState
 import androidx.tv.material3.ExperimentalTvMaterial3Api
+import androidx.tv.material3.rememberCarouselState
 import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
@@ -102,6 +108,18 @@ private fun HomeContent(
         state.continueWatching.map { it.media }
     }
 
+    // Land focus on the hero Play button on entry (it was unfocused, so Play looked inert until you
+    // pressed Enter). Focusing it also pauses the carousel auto-advance — the right 10-ft behavior.
+    val heroPlayFocus = remember { FocusRequester() }
+    LaunchedEffect(carouselItems.isNotEmpty()) {
+        if (carouselItems.isNotEmpty()) {
+            repeat(16) {
+                kotlinx.coroutines.delay(60)
+                if (runCatching { heroPlayFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(26.dp),
@@ -113,6 +131,7 @@ private fun HomeContent(
                     items = carouselItems,
                     onPlay = onPlayClick,
                     onDetails = onMediaClick,
+                    playFocus = heroPlayFocus,
                 )
             }
         }
@@ -145,18 +164,29 @@ internal fun FeaturedCarousel(
     items: List<MediaItem>,
     onPlay: (MediaItem) -> Unit,
     onDetails: (MediaItem) -> Unit,
+    playFocus: FocusRequester? = null,
+    carouselState: CarouselState = rememberCarouselState(),
 ) {
     Carousel(
         itemCount = items.size,
+        carouselState = carouselState,
         modifier = Modifier
             .fillMaxWidth()
             .height(420.dp)
             .padding(horizontal = 48.dp)
             .background(Brand.Surface, RoundedCornerShape(20.dp)),
-        carouselIndicator = { /* indicators drawn inline below the slide content */ },
+        carouselIndicator = {
+            CarouselDefaults.IndicatorRow(
+                itemCount = items.size,
+                activeItemIndex = carouselState.activeItemIndex,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp),
+            )
+        },
     ) { index ->
         val item = items[index]
-        FeaturedSlide(item = item, onPlay = onPlay, onDetails = onDetails)
+        FeaturedSlide(item = item, onPlay = onPlay, onDetails = onDetails, playFocus = playFocus)
     }
 }
 
@@ -165,6 +195,7 @@ private fun FeaturedSlide(
     item: MediaItem,
     onPlay: (MediaItem) -> Unit,
     onDetails: (MediaItem) -> Unit,
+    playFocus: FocusRequester? = null,
 ) {
     Box(
         modifier = Modifier
@@ -240,7 +271,10 @@ private fun FeaturedSlide(
             )
             Spacer(Modifier.height(20.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                Button(onClick = { onPlay(item) }) {
+                Button(
+                    onClick = { onPlay(item) },
+                    modifier = if (playFocus != null) Modifier.focusRequester(playFocus) else Modifier,
+                ) {
                     Icon(
                         imageVector = Icons.Rounded.PlayArrow,
                         contentDescription = null,

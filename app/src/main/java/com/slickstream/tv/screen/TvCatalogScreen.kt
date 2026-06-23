@@ -14,6 +14,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -77,6 +78,16 @@ private fun CatalogContent(
             ?: listOfNotNull(state.featured)
     }
 
+    val heroPlayFocus = remember { FocusRequester() }
+    LaunchedEffect(carouselItems.isNotEmpty()) {
+        if (carouselItems.isNotEmpty()) {
+            repeat(16) {
+                kotlinx.coroutines.delay(60)
+                if (runCatching { heroPlayFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(26.dp),
@@ -84,7 +95,7 @@ private fun CatalogContent(
     ) {
         if (carouselItems.isNotEmpty()) {
             item(key = "featured-carousel") {
-                FeaturedCarousel(items = carouselItems, onPlay = onPlayClick, onDetails = onMediaClick)
+                FeaturedCarousel(items = carouselItems, onPlay = onPlayClick, onDetails = onMediaClick, playFocus = heroPlayFocus)
             }
         }
         if (categories.isNotEmpty()) {

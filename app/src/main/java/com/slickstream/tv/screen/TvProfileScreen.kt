@@ -33,6 +33,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -111,6 +112,15 @@ fun TvProfileScreen(
     var signInError by remember { mutableStateOf<String?>(null) }
     var showPairing by remember { mutableStateOf(false) }
 
+    // Land focus on the first action (Sign in / Sign out) on entry.
+    val firstFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    LaunchedEffect(user == null) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -132,12 +142,14 @@ fun TvProfileScreen(
                     icon = Icons.Rounded.Login,
                     label = "Sign in with Google",
                     onClick = { signInError = null; showPairing = true },
+                    focusRequester = firstFocus,
                 )
             } else {
                 ProfileAction(
                     icon = Icons.Rounded.Logout,
                     label = "Sign out",
                     onClick = { dialog = ProfileDialog.SignOut },
+                    focusRequester = firstFocus,
                 )
             }
 
@@ -263,6 +275,7 @@ private fun ProfileAction(
     label: String,
     onClick: () -> Unit,
     destructive: Boolean = false,
+    focusRequester: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     val shape = RoundedCornerShape(14.dp)
     Surface(
@@ -284,7 +297,10 @@ private fun ProfileAction(
             ),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
-        modifier = Modifier.fillMaxWidth().height(64.dp),
+        modifier = Modifier
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .fillMaxWidth()
+            .height(64.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxSize().padding(horizontal = 22.dp),
