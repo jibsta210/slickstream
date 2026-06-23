@@ -1,8 +1,8 @@
 {
-  "versionCode": 2,
-  "versionName": "1.1.0",
+  "versionCode": 3,
+  "versionName": "1.1.1",
   "apkUrl": "https://github.com/jibsta210/slickstream/releases/latest/download/slickstream.apk",
-  "notes": "What's new:\n- Android TV: no more whole-device freeze during streaming (low-power profile)\n- Android TV: reliable TV detection so the TV menu + quick-pair show up\n- Much faster torrent start (sequential head/tail)\n- Subtitles, picture-in-picture, categories, live sports\n- In-app updates",
+  "notes": "What's new:\n- Android TV: live sports player now exits with Back (no more getting stuck)\n- Android TV: subtitles/sources menus are now focusable with the remote\n- Reliable TV detection + no whole-device freeze during streaming\n- Faster torrent start, categories, live sports, subtitles, PiP",
   "mandatory": false,
-  "sha256": "0b753f3ed3d270bf30d42f82e25644d0fd57b9116e601ee0397e8c2ba7538a67"
+  "sha256": "9d34e0fe33dbcc506ac81f4e6f8d23e1a3cd44801a460ef000c5a3197a8b09a2"
 }
