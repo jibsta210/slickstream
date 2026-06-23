@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- APK download target: context.externalCacheDir (preferred) and context.cacheDir (fallback). -->
+    <external-cache-path name="apk_ext" path="." />
+    <cache-path name="apk_int" path="." />
+</paths>

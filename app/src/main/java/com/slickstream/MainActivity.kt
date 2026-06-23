@@ -13,10 +13,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.annotation.RequiresApi
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
+import com.slickstream.feature.update.UpdateGate
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -116,7 +120,11 @@ class MainActivity : ComponentActivity() {
                 LocalPipController provides pipController,
             ) {
                 SlickStreamTheme {
-                    if (onTv) TvApp() else PhoneApp()
+                    Box(Modifier.fillMaxSize()) {
+                        if (onTv) TvApp() else PhoneApp()
+                        // Overlays both shells; checks for a self-hosted update on launch.
+                        UpdateGate()
+                    }
                 }
             }
         }
