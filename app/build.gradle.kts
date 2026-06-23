@@ -54,9 +54,14 @@ android {
         buildConfigField("String", "SUBTITLE_BASE_URL", "\"${secret("SUBTITLE_BASE_URL", "https://opensubtitles-v3.strem.io/")}\"")
         // Live-sports schedule/stream source (streamed.pk-compatible REST). Keyless, user-overridable.
         buildConfigField("String", "SPORTS_BASE_URL", "\"${secret("SPORTS_BASE_URL", "https://streamed.pk/")}\"")
-        // In-app updater: version manifest on a PUBLIC releases repo (a private repo's release
-        // assets aren't anonymously downloadable). Override in local.properties.
-        buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${secret("UPDATE_MANIFEST_URL", "https://github.com/jibsta210/slickstream-releases/releases/latest/download/update.json")}\"")
+        // In-app updater: version manifest on the (public) GitHub repo's latest release.
+        buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${secret("UPDATE_MANIFEST_URL", "https://github.com/jibsta210/slickstream/releases/latest/download/update.json")}\"")
+
+        // Ship only ARM (real phones + TV boxes). Dropping x86/x86_64 (emulator-only) removes
+        // ~25 MB of duplicate libtorrent .so files. Add them back here if you need an x86 emulator.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"${secret("GOOGLE_WEB_CLIENT_ID")}\"")
         // "TVs and Limited Input devices" OAuth client for the Android TV device-pairing flow.
         buildConfigField("String", "GOOGLE_TV_CLIENT_ID", "\"${secret("GOOGLE_TV_CLIENT_ID")}\"")
@@ -81,7 +86,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
+            isMinifyEnabled = true       // R8 code shrink (keep rules in proguard-rules.pro)
+            isShrinkResources = true      // drop unused resources
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }

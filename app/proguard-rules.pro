@@ -1,3 +1,9 @@
+# Shrink + optimize, but DON'T rename. Removing unused code/resources + ABI filtering is where the
+# size win comes from; name-mangling saves little and is the usual source of reflection crashes
+# (Retrofit interfaces, kotlinx.serialization, libtorrent JNI). Keeping names makes the production
+# build safe to ship via self-update without an on-device test pass. Revisit once proven.
+-dontobfuscate
+
 # kotlinx.serialization
 -keepattributes *Annotation*, InnerClasses
 -dontnote kotlinx.serialization.**
@@ -24,3 +30,29 @@
 
 # NanoHTTPD
 -keep class fi.iki.elonen.** { *; }
+
+# App @Serializable models / DTOs (defensive — keep names so generated serializers resolve)
+-keep @kotlinx.serialization.Serializable class com.slickstream.** { *; }
+-keepclassmembers enum com.slickstream.** { *; }
+
+# Hilt / Dagger generated graph + injected ViewModels
+-keep class dagger.hilt.** { *; }
+-keep class * extends androidx.lifecycle.ViewModel { <init>(...); }
+
+# Coroutines
+-keepclassmembers class kotlinx.coroutines.** { volatile <fields>; }
+-dontwarn kotlinx.coroutines.**
+
+# Optional / transitive deps that R8 may warn about (warnings fail the build otherwise)
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
+-dontwarn com.google.firebase.**
+-dontwarn javax.annotation.**
+
+# Keep enough JNI/native plumbing for libtorrent's swig layer (also covered above; explicit here)
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
