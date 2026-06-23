@@ -578,9 +578,14 @@ class PlayerViewModel @Inject constructor(
     private fun saveProgressNow() {
         val exo = _player.value ?: return
         val d = details ?: return
-        val duration = exo.duration
         val position = exo.currentPosition
-        if (duration <= 0L || position < 0L) return
+        if (position <= 0L) return
+        // exo.duration is C.TIME_UNSET (negative) until the container tail (mp4 moov / mkv cues) is
+        // parsed — common on low-power TV that starts via the tail-grace path. Don't drop the save:
+        // persist a 0 "unknown" duration so the resume point survives; the next ticker save fills in
+        // the real duration once ExoPlayer learns it. (This was the TV "forgot my spot" bug.)
+        val rawDuration = exo.duration
+        val duration = if (rawDuration > 0L) rawDuration else 0L
         val item: MediaItem = d.item
         val progress = PlaybackProgress(
             mediaId = mediaId,

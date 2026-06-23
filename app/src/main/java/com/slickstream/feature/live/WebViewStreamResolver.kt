@@ -2,6 +2,7 @@ package com.slickstream.feature.live
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -16,25 +17,24 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Resolves a streamed.pk-style obfuscated embed PAGE into the real HLS `.m3u8` URL.
+ * Resolves a streamed.pk / embed.st obfuscated embed PAGE into the real HLS `.m3u8` URL by loading
+ * it in an off-screen [WebView] and capturing the first playlist request it fires.
  *
- * As of 2026 these embeds mint a rotating token in client-side JS, so there's no plain-HTTP
- * formula — the only reliable path is to load the embed in an off-screen [WebView] and intercept
- * the first `.m3u8` request it fires. The base URL trick (`loadDataWithBaseURL(referer, …)`) makes
- * the WebView's origin the referrer the embed requires, so its requests aren't rejected.
- *
- * Entirely invisible — no view is ever attached; the user only ever sees ExoPlayer.
+ * These embeds (now on embed.st) mint a rotating token in client-side JS and fetch the manifest via
+ * a Swarmcloud-P2P HLS engine — frequently over `fetch`/XHR that `shouldInterceptRequest` doesn't
+ * surface. So we capture from BOTH: the network interceptor AND a JS hook that overrides
+ * `window.fetch` + `XMLHttpRequest.open`. Entirely invisible; the user only ever sees ExoPlayer.
  */
 @Singleton
 class WebViewStreamResolver @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface", "AddJavascriptInterface")
     suspend fun resolve(
         embedUrl: String,
-        referer: String,
+        pageReferer: String,
         userAgent: String,
-        timeoutMs: Long = 30_000L,
+        timeoutMs: Long = 40_000L,
     ): String? = withContext(Dispatchers.Main) {
         val captured = CompletableDeferred<String>()
         var webView: WebView? = null
@@ -50,8 +50,16 @@ class WebViewStreamResolver @Inject constructor(
                     loadsImagesAutomatically = false
                     blockNetworkImage = true
                 }
+                // JS-side capture: hook fetch + XHR for manifest URLs the interceptor can miss.
+                addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun onUrl(u: String?) {
+                        if (u != null && !captured.isCompleted && looksLikeStream(u)) captured.complete(u)
+                    }
+                }, "SlickCapture")
+
                 webViewClient = object : WebViewClient() {
-                    // Called on a background WebView thread — completing the deferred is thread-safe.
+                    // Network-side capture (covers most direct .m3u8 requests).
                     override fun shouldInterceptRequest(
                         view: WebView?,
                         request: WebResourceRequest?,
@@ -60,18 +68,17 @@ class WebViewStreamResolver @Inject constructor(
                         if (!captured.isCompleted && looksLikeStream(u)) captured.complete(u)
                         return null
                     }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        // Override fetch + XHR to report every requested URL back to native, and
+                        // strip sandbox off any nested iframes so the embed's player can run.
+                        view?.evaluateJavascript(HOOK_JS, null)
+                    }
                 }
             }
-            // One sandbox-free iframe pointed at the embed; base URL = referer so the embed's
-            // referrer/origin check passes and it actually loads its player + token.
-            val html = """
-                <!doctype html><html><head><meta name="viewport" content="width=device-width"></head>
-                <body style="margin:0;background:#000">
-                <iframe src="$embedUrl" style="position:fixed;inset:0;width:100%;height:100%;border:0"
-                  allow="autoplay; encrypted-media; fullscreen; picture-in-picture"></iframe>
-                </body></html>
-            """.trimIndent()
-            webView.loadDataWithBaseURL(referer, html, "text/html", "UTF-8", null)
+            // Load the embed PAGE with a Referer of its parent site (streamed.pk), which is what the
+            // embed's referrer check expects.
+            webView.loadUrl(embedUrl, mapOf("Referer" to pageReferer))
 
             withTimeoutOrNull(timeoutMs) { captured.await() }
         } catch (e: Exception) {
@@ -80,6 +87,7 @@ class WebViewStreamResolver @Inject constructor(
             webView?.let { wv ->
                 runCatching {
                     wv.stopLoading()
+                    wv.removeJavascriptInterface("SlickCapture")
                     wv.webViewClient = WebViewClient()
                     wv.loadUrl("about:blank")
                     wv.destroy()
@@ -88,9 +96,29 @@ class WebViewStreamResolver @Inject constructor(
         }
     }
 
-    /** First playlist request wins — the master .m3u8 (or the known token CDN hosts). */
-    private fun looksLikeStream(u: String): Boolean =
-        u.contains(".m3u8", ignoreCase = true) ||
-            u.contains("strmd.st", ignoreCase = true) ||
-            u.contains("vipstreams.in", ignoreCase = true)
+    private fun looksLikeStream(u: String): Boolean {
+        val s = u.lowercase()
+        return s.contains(".m3u8") ||
+            s.contains("/playlist") || s.contains("/master") || s.contains("/index.") ||
+            s.contains("strmd.st") || s.contains("vipstreams.in")
+    }
+
+    private companion object {
+        // Re-report fetch/XHR targets to native, and unsandbox nested iframes + autoplay videos.
+        const val HOOK_JS = """
+            (function(){
+              try {
+                var of = window.fetch;
+                if (of) window.fetch = function(){ try { var a = arguments[0];
+                  var u = (typeof a === 'string') ? a : (a && a.url); if (u) SlickCapture.onUrl(u); } catch(e){}
+                  return of.apply(this, arguments); };
+                var ox = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function(m,u){ try { if (u) SlickCapture.onUrl(u); } catch(e){}
+                  return ox.apply(this, arguments); };
+                document.querySelectorAll('iframe').forEach(function(f){ f.removeAttribute('sandbox'); });
+                document.querySelectorAll('video').forEach(function(v){ try { v.play(); } catch(e){} });
+              } catch(e){}
+            })();
+        """
+    }
 }

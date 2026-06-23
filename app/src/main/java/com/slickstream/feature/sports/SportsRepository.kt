@@ -44,10 +44,14 @@ class SportsRepositoryImpl(
                 SportCategory(id, id.removePrefix(FanCodeSource.FC_PREFIX).replaceFirstChar(Char::uppercase))
             }
         val streamedCats = if (!streamedEnabled) emptyList() else
-            runCatching { api.sports() }.getOrDefault(emptyList())
+            runCatching { api.sports() }
+                .onFailure { android.util.Log.w("SportsRepository", "streamed.pk categories failed", it) }
+                .getOrDefault(emptyList())
                 .filter { it.id.isNotBlank() }
                 .map { SportCategory(it.id, it.name.ifBlank { it.id.replaceFirstChar(Char::uppercase) }) }
-        (listOf(live) + fanCats + streamedCats).distinctBy { it.id }
+        // Foreground the streamed SPORT categories (football/basketball/…) — that's where the full
+        // multi-stream pickers live; FanCode (live-only, often geo-blocked) goes last.
+        (listOf(live) + streamedCats + fanCats).distinctBy { it.id }
     }
 
     override suspend fun events(categoryId: String): DataResult<List<SportEvent>> = guard {
@@ -118,8 +122,9 @@ class SportsRepositoryImpl(
             label = label,
             url = embedUrl,
             headers = mapOf(
-                "Referer" to "https://streamed.pk/",
-                "Origin" to "https://streamed.pk",
+                // Playback headers for the resolved m3u8 — the CDN expects the embed host (embed.st).
+                "Referer" to "https://embed.st/",
+                "Origin" to "https://embed.st",
                 "User-Agent" to USER_AGENT,
             ),
             needsResolution = true,

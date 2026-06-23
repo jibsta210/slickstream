@@ -58,9 +58,11 @@ class LivePlayerViewModel @Inject constructor(
             viewModelScope.launch {
                 val playUrl = if (sel.needsResolution) {
                     // Resolve the embed -> m3u8 invisibly (shows the buffering overlay meanwhile).
+                    // The embed page's referrer check wants its PARENT site (streamed.pk); the
+                    // resulting m3u8 is then played with the embed.st headers in sel.headers.
                     resolver.resolve(
                         embedUrl = sel.url,
-                        referer = sel.headers["Referer"] ?: "https://streamed.pk/",
+                        pageReferer = "https://streamed.pk/",
                         userAgent = sel.headers["User-Agent"] ?: DEFAULT_UA,
                     )
                 } else {
