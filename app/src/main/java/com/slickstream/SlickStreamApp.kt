@@ -10,6 +10,7 @@ import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import com.slickstream.data.torrent.TorrentEngine
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltAndroidApp
@@ -20,6 +21,13 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
 
     override fun onCreate() {
         super.onCreate()
+        // Warm the libtorrent session + DHT at launch (off-main) so the DHT routing table is already
+        // bootstrapped — and the persisted .session_state restored — by the time the user presses
+        // Play. Otherwise the first stream pays session.start + DHT bootstrap on the critical path.
+        // ensureStarted() is idempotent (AtomicBoolean guard), so this is safe to fire-and-forget.
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            runCatching { torrentEngine.ensureStarted() }
+        }
         // When the whole app goes to background, flush libtorrent's DHT/session state so the next
         // cold start finds peers fast even if the process is later killed.
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {

@@ -40,7 +40,7 @@ import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
-import com.slickstream.data.settings.StreamSizePreference
+import com.slickstream.data.source.StreamPicker
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.subtitle.SubtitleRepository
@@ -271,39 +271,7 @@ class PlayerViewModel @Inject constructor(
      */
     private suspend fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
         val sizePref = settingsRepository.current().streamSize
-        val effectiveTier =
-            if (deviceProfile.isLowPower) minOf(pref.maxTier, QualityPreference.FHD_1080.maxTier)
-            else pref.maxTier
-        val capped = list.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }.ifEmpty { list }
-        val healthy = capped.filter { (it.seeders ?: 0) >= MIN_SEEDERS }.ifEmpty { capped }
-        // Within the (resolution-capped, well-seeded) set, the size preference decides where on the
-        // size/bitrate range to land — a 1080p episode can be 700 MB or 4 GB.
-        val picked = when (sizePref) {
-            StreamSizePreference.HIGHEST ->
-                // Best quality: most seeders, then the LARGEST file (highest bitrate).
-                healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
-            StreamSizePreference.SMALLEST -> {
-                // Leanest well-seeded copy: smallest known size, ties to more seeders.
-                val withSize = healthy.filter { (it.sizeBytes ?: 0L) > 0L }
-                if (withSize.isNotEmpty()) {
-                    withSize.minWithOrNull(
-                        compareBy<StreamSource> { it.sizeBytes ?: 0L }.thenByDescending { it.seeders ?: 0 },
-                    )
-                } else {
-                    healthy.maxByOrNull { it.seeders ?: 0 }
-                }
-            }
-            StreamSizePreference.BALANCED -> {
-                // Drop the biggest ~third (remux/bluray outliers), then take the best-seeded of the
-                // rest (smaller on a tie) — lean but not over-compressed.
-                val withSize = healthy.filter { (it.sizeBytes ?: 0L) > 0L }.sortedBy { it.sizeBytes ?: 0L }
-                val pool = if (withSize.size >= 4) withSize.take((withSize.size * 2 + 2) / 3) else healthy
-                pool.minWithOrNull(
-                    compareByDescending<StreamSource> { it.seeders ?: 0 }.thenBy { it.sizeBytes ?: Long.MAX_VALUE },
-                )
-            }
-        }
-        return picked ?: list.first()
+        return StreamPicker.pick(list, pref.maxTier, sizePref, deviceProfile.isLowPower) ?: list.first()
     }
 
     private fun isOnUnmeteredNetwork(): Boolean {

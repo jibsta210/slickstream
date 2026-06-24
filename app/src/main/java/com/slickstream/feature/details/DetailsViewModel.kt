@@ -9,10 +9,16 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.Season
+import com.slickstream.core.common.DeviceProfile
 import com.slickstream.core.repository.CatalogRepository
 import com.slickstream.core.repository.LibraryRepository
+import com.slickstream.core.repository.SourceRepository
+import com.slickstream.core.repository.TorrentStreamer
+import com.slickstream.data.settings.SettingsRepository
+import com.slickstream.data.source.StreamPicker
 import com.slickstream.navigation.NavArg
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -44,8 +50,15 @@ data class DetailsUiState(
 class DetailsViewModel @Inject constructor(
     private val catalogRepository: CatalogRepository,
     private val libraryRepository: LibraryRepository,
+    private val sourceRepository: SourceRepository,
+    private val torrentStreamer: TorrentStreamer,
+    private val settingsRepository: SettingsRepository,
+    private val deviceProfile: DeviceProfile,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
+
+    /** Single-flight prewarm job — cancelled+replaced on season switch so it can't stack. */
+    private var warmJob: Job? = null
 
     private val mediaType: MediaType =
         MediaType.fromName(savedStateHandle.get<String>(NavArg.MEDIA_TYPE))
@@ -97,6 +110,10 @@ class DetailsViewModel @Inject constructor(
                     // Default-select the first season for TV shows and eagerly load it.
                     if (details.item.mediaType == MediaType.TV) {
                         playableSeasons.firstOrNull()?.let { selectSeason(it.seasonNumber) }
+                    } else {
+                        // Movie: prewarm the torrent NOW (while the user reads the synopsis) so Play
+                        // hits a metadata-cache + 2MB head instead of a cold 30-60s fetch.
+                        warmSource(details, season = null, episode = null)
                     }
                     loadSimilar()
                 }
@@ -119,6 +136,34 @@ class DetailsViewModel @Inject constructor(
                 is DataResult.Error -> Unit // similar is non-critical; ignore failures
             }
         }
+    }
+
+    /**
+     * Prewarm the torrent for this title/episode while the user is still on the details screen, so
+     * pressing Play hits a metadata cache + an already-buffered 2 MB head instead of a cold 30-60s
+     * fetch. Picks the SAME source the player will ([StreamPicker]); single-flight + cancel-on-switch.
+     * Safe even on low-power TV: nothing is decoding yet, so it doesn't trip the playback freeze gate.
+     */
+    private fun warmSource(d: MediaDetails, season: Int?, episode: Int?) {
+        warmJob?.cancel()
+        warmJob = viewModelScope.launch {
+            runCatching {
+                val list = when (val r = sourceRepository.resolve(d, season, episode)) {
+                    is DataResult.Success -> r.data
+                    is DataResult.Error -> return@launch
+                }
+                if (list.isEmpty()) return@launch
+                val settings = settingsRepository.current()
+                val best = StreamPicker.pick(list, settings.wifiQuality.maxTier, settings.streamSize, deviceProfile.isLowPower)
+                    ?: return@launch
+                torrentStreamer.prefetch(best)
+            }
+        }
+    }
+
+    override fun onCleared() {
+        warmJob?.cancel()
+        super.onCleared()
     }
 
     /** Pick a season and lazy-load its episodes. No-op if it is already selected & loaded. */
@@ -148,6 +193,14 @@ class DetailsViewModel @Inject constructor(
                             episodesError = null,
                         )
                         loadEpisodeProgress(seasonNumber, result.data)
+                        // Prewarm the first not-yet-finished episode of this season so Play is fast.
+                        val d = _uiState.value.details
+                        if (d != null) {
+                            val firstUnwatched = result.data
+                                .firstOrNull { (_uiState.value.episodeProgress[it.episodeNumber] ?: 0f) < 0.92f }
+                                ?: result.data.firstOrNull()
+                            warmSource(d, season = seasonNumber, episode = firstUnwatched?.episodeNumber ?: 1)
+                        }
                     }
                 }
 

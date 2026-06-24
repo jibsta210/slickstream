@@ -138,21 +138,22 @@ class SourceRepositoryImpl @Inject constructor(
         val SIZE_REGEX = Regex("""(\d+(?:[.,]\d+)?)\s*(TB|TiB|GB|GiB|MB|MiB|KB|KiB)""", RegexOption.IGNORE_CASE)
 
         /** Common public BitTorrent trackers appended to every magnet for faster peer discovery. */
+        // Live, high-population trackers (ngosang trackers_best snapshot). Dead trackers were pruned
+        // (9.rarbg, internetwarriors, leechers-paradise, coppersurfer, harry.lu, dler, i2p.rocks):
+        // each dead UDP tracker wastes an 8s connect timeout before falling through to DHT, slowing
+        // the metadata fetch. libtorrent honours these for ut_metadata, so a live tracker returns
+        // peers in ~1-2s vs a cold DHT. DHT stays on as the backstop.
         val TRACKERS = listOf(
             "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.demonii.com:1337/announce",
             "udp://open.tracker.cl:1337/announce",
-            "udp://9.rarbg.com:2810/announce",
             "udp://tracker.openbittorrent.com:6969/announce",
             "udp://exodus.desync.com:6969/announce",
             "udp://tracker.torrent.eu.org:451/announce",
-            "udp://opentracker.i2p.rocks:6969/announce",
-            "udp://tracker.internetwarriors.net:1337/announce",
-            "udp://tracker.leechers-paradise.org:6969/announce",
-            "udp://tracker.coppersurfer.tk:6969/announce",
-            "udp://tracker.dler.org:6969/announce",
             "udp://open.stealth.si:80/announce",
-            "udp://ipv4.tracker.harry.lu:80/announce",
             "udp://explodie.org:6969/announce",
+            "udp://tracker.gbitt.info:80/announce",
+            "udp://opentracker.io:6969/announce",
             "https://tracker.gbitt.info:443/announce",
         )
     }

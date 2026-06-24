@@ -121,6 +121,15 @@ class TorrentEngine @Inject constructor(
             // Keep DHT (needed for poorly-seeded discovery), but drop LSD/UPnP/NAT-PMP background
             // network+CPU work a pure leech/stream TV client never needs.
             setBoolean(settings_pack.bool_types.enable_dht.swigValue(), true)
+            // Seed the DHT with known-good routers so a COLD DHT (fresh install / after cache clear)
+            // finds nodes in seconds instead of stalling on a single default introducer — a chunk of
+            // the cold metadata-fetch latency. Guarded in case the key name differs in this build.
+            runCatching {
+                setString(
+                    settings_pack.string_types.dht_bootstrap_nodes.swigValue(),
+                    "router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881,router.bitcomet.com:6881,dht.libtorrent.org:25401",
+                )
+            }
             setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), !lowPower)
