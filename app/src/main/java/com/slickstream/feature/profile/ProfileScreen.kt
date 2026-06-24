@@ -22,6 +22,7 @@ import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
@@ -62,12 +63,14 @@ import com.slickstream.ui.theme.Brand
 fun ProfileScreen(
     onSignIn: () -> Unit,
     onOpenSettings: () -> Unit,
+    onSwitchProfile: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     authViewModel: AuthViewModel = hiltViewModel(),
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val user by authViewModel.user.collectAsStateWithLifecycle()
+    val activeProfile by profileViewModel.activeProfile.collectAsStateWithLifecycle()
 
     var showSignOutDialog by remember { mutableStateOf(false) }
     var showClearHistoryDialog by remember { mutableStateOf(false) }
@@ -104,6 +107,17 @@ fun ProfileScreen(
         } else {
             SignedOutHeader(onSignIn = onSignIn)
         }
+
+        Spacer(Modifier.height(24.dp))
+
+        SectionHeader(title = "Profiles")
+        SettingRow(
+            icon = { Icon(Icons.Rounded.SwitchAccount, contentDescription = null, tint = Brand.Violet) },
+            title = "Switch profile",
+            subtitle = activeProfile?.let { "Watching as ${it.name} — tap to switch or add profiles." }
+                ?: "Choose who's watching, or add a kids profile.",
+            onClick = onSwitchProfile,
+        )
 
         Spacer(Modifier.height(24.dp))
 

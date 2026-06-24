@@ -190,7 +190,10 @@ fun PhoneApp() {
                 TopBar(
                     activeProfile = activeProfile,
                     onSearch = { navController.navigate(Routes.SEARCH) { launchSingleTop = true } },
-                    onProfile = { navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true } },
+                    // The avatar opens the account hub (Settings, sign-in/out, Link TV, switch
+                    // profile). The "Switch profile" row there reaches the picker — going straight to
+                    // the picker used to hide Settings entirely.
+                    onProfile = { navController.navigate(Routes.PROFILE) { launchSingleTop = true } },
                 )
             }
         },
@@ -274,6 +277,7 @@ fun PhoneApp() {
                 ProfileScreen(
                     onSignIn = onSignIn,
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
+                    onSwitchProfile = { navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true } },
                     onBack = {
                         if (!navController.popBackStack()) {
                             navController.navigateToTopLevel(TopLevelDestination.entries.first())
