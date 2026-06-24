@@ -19,6 +19,8 @@ import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.mediarouter.media.MediaRouteSelector
 import com.slickstream.cast.CastManager
 import com.slickstream.core.common.DeviceProfile
@@ -157,6 +159,8 @@ class PlayerViewModel @Inject constructor(
     private var progressTickJob: Job? = null
     private var activeInfoHash: String? = null
     private var hasSeekedToResume = false
+    /** Consecutive transient source-error re-prepares; reset on a fresh source or once playing. */
+    private var sourceErrorRetries = 0
     private var playerListener: Player.Listener? = null
     private var currentMediaUrl: String? = null
     private var castPlayer: CastPlayer? = null
@@ -376,6 +380,7 @@ class PlayerViewModel @Inject constructor(
             existing.prepare()
             // While casting, keep the local surface paused and push the new source to the TV.
             existing.playWhenReady = !_isCasting.value
+            sourceErrorRetries = 0
             currentMediaUrl = url
             if (_isCasting.value) loadCastMedia(fromPositionMs = 0L)
             return
@@ -405,17 +410,28 @@ class PlayerViewModel @Inject constructor(
         // otherwise dead-end straight into Error; fallback retries on a secondary/software decoder.
         // No behaviour change when the primary decoder works (the phone path).
         val renderers = DefaultRenderersFactory(appContext).setEnableDecoderFallback(true)
-        val exo = ExoPlayer.Builder(appContext, renderers).setLoadControl(loadControl).build().apply {
-            setMediaItem(buildMediaItem(url))
-            prepare()
-            playWhenReady = true
-        }
+        // Keep playing through a torrent stall. Our local HTTP server throws when a piece isn't on
+        // disk YET (slow swarm) — ExoPlayer would otherwise treat that as a FATAL source error and
+        // kill the stream. A high source-retry count makes it rebuffer + re-request the byte range
+        // (the bytes are downloading) instead. This is the real fix for "the stream died".
+        val mediaSourceFactory = DefaultMediaSourceFactory(appContext)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(SOURCE_LOAD_RETRIES))
+        val exo = ExoPlayer.Builder(appContext, renderers)
+            .setLoadControl(loadControl)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build().apply {
+                setMediaItem(buildMediaItem(url))
+                prepare()
+                playWhenReady = true
+            }
+        sourceErrorRetries = 0
         currentMediaUrl = url
 
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
                     Player.STATE_READY -> {
+                        sourceErrorRetries = 0 // recovered / playing — forget transient stalls
                         maybeSeekToResume(exo)
                         _uiState.value = PlayerUiState.Playing
                     }
@@ -453,9 +469,27 @@ class PlayerViewModel @Inject constructor(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                _uiState.value = PlayerUiState.Error(
-                    error.localizedMessage ?: "Playback error."
-                )
+                val p = _player.value
+                // ERROR_CODE_IO_* (2000-2999) on a torrent = pieces aren't downloaded YET, NOT a dead
+                // stream. Back off to let them arrive, then re-prepare (ExoPlayer keeps the position)
+                // and keep playing. Only show the error screen once retries are genuinely exhausted
+                // (e.g. a 0-seeder torrent that will never fill).
+                val transient = error.errorCode in 2000..2999
+                if (transient && !_isCasting.value && p != null && sourceErrorRetries < MAX_SOURCE_RETRIES) {
+                    sourceErrorRetries++
+                    _uiState.value = PlayerUiState.Buffering(
+                        percent = 0,
+                        seeders = _currentSource.value?.seeders ?: 0,
+                        downloadRateBytes = 0,
+                        label = "Reconnecting…",
+                    )
+                    viewModelScope.launch {
+                        delay(SOURCE_RETRY_BACKOFF_MS * sourceErrorRetries)
+                        runCatching { p.prepare(); p.playWhenReady = true }
+                    }
+                } else {
+                    _uiState.value = PlayerUiState.Error(error.localizedMessage ?: "Playback error.")
+                }
             }
         }
         exo.addListener(listener)
@@ -895,6 +929,12 @@ class PlayerViewModel @Inject constructor(
     private companion object {
         /** Auto-pick floor: don't choose a torrent under this many seeders if a healthier one exists. */
         const val MIN_SEEDERS = 8
+
+        /** ExoPlayer's own per-load retry count — keeps re-requesting a not-yet-downloaded range. */
+        const val SOURCE_LOAD_RETRIES = 12
+        /** Backstop: re-prepare the player up to this many times after a load gives up entirely. */
+        const val MAX_SOURCE_RETRIES = 8
+        const val SOURCE_RETRY_BACKOFF_MS = 1_500L
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L
