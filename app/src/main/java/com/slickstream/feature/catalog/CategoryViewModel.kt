@@ -8,8 +8,11 @@ import com.slickstream.core.model.MediaType
 import com.slickstream.core.repository.CatalogRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -37,6 +40,25 @@ class CategoryViewModel @Inject constructor(
     private val _state = MutableStateFlow(State())
     val state: StateFlow<State> = _state.asStateFlow()
 
+    /** In-grid search text. Filtering is purely client-side over already-loaded pages. */
+    private val _query = MutableStateFlow("")
+    val query: StateFlow<String> = _query.asStateFlow()
+
+    /**
+     * Items to render: when [query] is non-blank, the loaded items whose title contains the query
+     * (case-insensitive); otherwise the full loaded list. Note: this filters loaded results only —
+     * paging via [loadMore] still walks the complete genre list, not the filtered subset.
+     */
+    val visibleItems: StateFlow<List<MediaItem>> = combine(_state, _query) { state, query ->
+        val q = query.trim()
+        if (q.isBlank()) state.items
+        else state.items.filter { it.title.contains(q, ignoreCase = true) }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun setQuery(text: String) {
+        _query.value = text
+    }
+
     private var mediaType: MediaType? = null
     private var genreId: Int = -1
     private var page = 0
@@ -47,6 +69,7 @@ class CategoryViewModel @Inject constructor(
         if (this.mediaType == type && this.genreId == genreId && _state.value.items.isNotEmpty()) return
         this.mediaType = type
         this.genreId = genreId
+        _query.value = ""
         page = 0
         _state.value = State(isLoading = true)
         loadNext()

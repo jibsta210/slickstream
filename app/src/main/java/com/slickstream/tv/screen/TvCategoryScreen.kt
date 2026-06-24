@@ -32,6 +32,7 @@ import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.feature.catalog.CategoryViewModel
 import com.slickstream.tv.components.TvPosterCard
+import com.slickstream.tv.components.TvSearchField
 import com.slickstream.ui.theme.Brand
 
 /**
@@ -50,6 +51,8 @@ fun TvCategoryScreen(
 ) {
     LaunchedEffect(mediaType, genreId) { viewModel.init(mediaType, genreId) }
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val query by viewModel.query.collectAsStateWithLifecycle()
+    val visibleItems by viewModel.visibleItems.collectAsStateWithLifecycle()
     val gridState = rememberLazyGridState()
 
     BackHandler { onBack() }
@@ -88,8 +91,19 @@ fun TvCategoryScreen(
             style = MaterialTheme.typography.headlineMedium,
             color = Brand.OnSurface,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(bottom = 20.dp),
+            modifier = Modifier.padding(bottom = 16.dp),
         )
+
+        // In-grid search across the titles loaded so far. Only shown once there is something to
+        // filter, so the initial loading/error/empty states stay clean.
+        if (!state.isEmpty) {
+            TvSearchField(
+                value = query,
+                onValueChange = viewModel::setQuery,
+                onSubmit = {},
+                modifier = Modifier.padding(bottom = 20.dp),
+            )
+        }
 
         when {
             state.isLoading && state.isEmpty -> TvLoading(Modifier.fillMaxSize())
@@ -102,6 +116,13 @@ fun TvCategoryScreen(
                     color = Brand.OnSurfaceDim,
                 )
             }
+            visibleItems.isEmpty() -> Box(Modifier.fillMaxSize()) {
+                Text(
+                    "No matches for \"${query.trim()}\"",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Brand.OnSurfaceDim,
+                )
+            }
             else -> LazyVerticalGrid(
                 state = gridState,
                 columns = GridCells.Adaptive(minSize = 150.dp),
@@ -110,7 +131,7 @@ fun TvCategoryScreen(
                 verticalArrangement = Arrangement.spacedBy(24.dp),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                itemsIndexed(state.items, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
+                itemsIndexed(visibleItems, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
                     TvPosterCard(
                         item = item,
                         onClick = onMediaClick,

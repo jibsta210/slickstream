@@ -73,6 +73,7 @@ fun TvSettingsScreen(
             TvSettingSection("Streaming quality") {
                 TvOptionRow("On Wi-Fi / Ethernet", QualityPreference.entries, settings.wifiQuality, { it.label }, viewModel::setWifiQuality, firstChipFocus = firstFocus)
                 TvOptionRow("On mobile data", QualityPreference.entries, settings.cellularQuality, { it.label }, viewModel::setCellularQuality)
+                TvOptionRow("File size (within quality)", com.slickstream.data.settings.StreamSizePreference.entries, settings.streamSize, { it.label }, viewModel::setStreamSize)
             }
         }
 

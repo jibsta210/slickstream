@@ -38,6 +38,22 @@ enum class QualityPreference(val label: String, val maxTier: Int) {
     }
 }
 
+/**
+ * Bias the torrent auto-pick toward smaller files vs higher bitrate, WITHIN the resolution cap.
+ * A 1080p episode can be 700 MB or 4 GB; this picks where on that range to land so you don't pull
+ * a 10 GB remux when a lean web-dl will do.
+ */
+enum class StreamSizePreference(val label: String) {
+    SMALLEST("Smaller files"),
+    BALANCED("Balanced"),
+    HIGHEST("Best quality"),
+    ;
+
+    companion object {
+        val DEFAULT = BALANCED
+    }
+}
+
 /** Preferred subtitle language; [code] is the addon's 3-letter code used for ExoPlayer matching. */
 enum class SubtitleLanguage(val label: String, val code: String) {
     ENGLISH("English", "eng"),
@@ -99,6 +115,7 @@ data class AppSettings(
     val subtitleLanguage: SubtitleLanguage = SubtitleLanguage.ENGLISH,
     val subtitleSize: SubtitleSize = SubtitleSize.DEFAULT,
     val subtitleStyle: SubtitleStyle = SubtitleStyle.DEFAULT,
+    val streamSize: StreamSizePreference = StreamSizePreference.DEFAULT,
     val maxCacheSize: CacheSize = CacheSize.DEFAULT,
 )
 
@@ -123,6 +140,8 @@ class SettingsRepository @Inject constructor(
                 ?: SubtitleSize.DEFAULT,
             subtitleStyle = p[KEY_SUB_STYLE]?.let { runCatching { SubtitleStyle.valueOf(it) }.getOrNull() }
                 ?: SubtitleStyle.DEFAULT,
+            streamSize = p[KEY_STREAM_SIZE]?.let { runCatching { StreamSizePreference.valueOf(it) }.getOrNull() }
+                ?: StreamSizePreference.DEFAULT,
             maxCacheSize = p[KEY_MAX_CACHE]?.let { runCatching { CacheSize.valueOf(it) }.getOrNull() }
                 ?: CacheSize.DEFAULT,
         )
@@ -137,6 +156,7 @@ class SettingsRepository @Inject constructor(
     suspend fun setSubtitleLanguage(lang: SubtitleLanguage) = dataStore.edit { it[KEY_SUB_LANG] = lang.name }
     suspend fun setSubtitleSize(size: SubtitleSize) = dataStore.edit { it[KEY_SUB_SIZE] = size.name }
     suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name }
+    suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
 
     private fun String?.toQuality(default: QualityPreference): QualityPreference =
@@ -150,6 +170,7 @@ class SettingsRepository @Inject constructor(
         val KEY_SUB_LANG = stringPreferencesKey("sub_language")
         val KEY_SUB_SIZE = stringPreferencesKey("sub_size")
         val KEY_SUB_STYLE = stringPreferencesKey("sub_style")
+        val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
     }
 }

@@ -33,6 +33,8 @@ data class DetailsUiState(
     val episodes: List<Episode> = emptyList(),
     val isLoadingEpisodes: Boolean = false,
     val episodesError: String? = null,
+    /** Local watch progress (percent 0f..1f) for the selected season, keyed by episodeNumber. */
+    val episodeProgress: Map<Int, Float> = emptyMap(),
 ) {
     val mediaType: MediaType? get() = details?.item?.mediaType
     val isTv: Boolean get() = mediaType == MediaType.TV
@@ -133,6 +135,7 @@ class DetailsViewModel @Inject constructor(
             isLoadingEpisodes = true,
             episodesError = null,
             episodes = emptyList(),
+            episodeProgress = emptyMap(),
         )
         viewModelScope.launch {
             when (val result = catalogRepository.getEpisodes(mediaId, seasonNumber)) {
@@ -144,6 +147,7 @@ class DetailsViewModel @Inject constructor(
                             episodes = result.data,
                             episodesError = null,
                         )
+                        loadEpisodeProgress(seasonNumber, result.data)
                     }
                 }
 
@@ -155,6 +159,33 @@ class DetailsViewModel @Inject constructor(
                         )
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Look up local resume progress for each episode of [seasonNumber] and publish it as a
+     * episodeNumber -> percent map. Runs after a season's episodes resolve (and on season switch)
+     * so returning to details reflects newly-watched episodes. Stale if the user has since
+     * switched seasons, so the result is dropped unless the season still matches.
+     */
+    private fun loadEpisodeProgress(seasonNumber: Int, episodes: List<Episode>) {
+        viewModelScope.launch {
+            val progress = buildMap {
+                for (ep in episodes) {
+                    val saved = libraryRepository.getProgress(
+                        mediaId,
+                        MediaType.TV,
+                        ep.seasonNumber,
+                        ep.episodeNumber,
+                    )
+                    if (saved != null && saved.percent > 0f) {
+                        put(ep.episodeNumber, saved.percent)
+                    }
+                }
+            }
+            if (_uiState.value.selectedSeasonNumber == seasonNumber) {
+                _uiState.value = _uiState.value.copy(episodeProgress = progress)
             }
         }
     }

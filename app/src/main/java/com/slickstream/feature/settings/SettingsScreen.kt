@@ -99,8 +99,16 @@ fun SettingsScreen(
                 labelOf = { it.label },
                 onSelect = viewModel::setCellularQuality,
             )
+            Spacer(Modifier.height(16.dp))
+            OptionGroup(
+                label = "File size",
+                options = com.slickstream.data.settings.StreamSizePreference.entries,
+                selected = settings.streamSize,
+                labelOf = { it.label },
+                onSelect = viewModel::setStreamSize,
+            )
             Spacer(Modifier.height(6.dp))
-            Hint("Caps the quality of the source auto-picked when you hit Play. You can still choose any source manually from the player's Quality sheet.")
+            Hint("Caps the quality of the source auto-picked when you hit Play, and how big a file to prefer within that quality (a 1080p episode can be 700 MB or 4 GB). You can still pick any source manually from the player's Quality sheet.")
         }
 
         SettingsSection("Display") {

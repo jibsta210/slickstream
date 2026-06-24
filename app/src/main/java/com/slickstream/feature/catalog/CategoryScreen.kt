@@ -13,12 +13,17 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -55,6 +60,8 @@ fun CategoryScreen(
 ) {
     LaunchedEffect(mediaType, genreId) { viewModel.init(mediaType, genreId) }
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val query by viewModel.query.collectAsStateWithLifecycle()
+    val visibleItems by viewModel.visibleItems.collectAsStateWithLifecycle()
     val gridState = rememberLazyGridState()
 
     // Trigger pagination a little before the very end so it feels seamless.
@@ -71,6 +78,15 @@ fun CategoryScreen(
     androidx.compose.foundation.layout.Column(modifier = modifier.fillMaxSize()) {
         CategoryTopBar(title = genreName, mediaType = mediaType, onBack = onBack)
 
+        // Filters the loaded titles client-side; paging still walks the full genre list.
+        if (!state.isEmpty) {
+            CategorySearchField(
+                query = query,
+                onQueryChange = viewModel::setQuery,
+                modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 8.dp),
+            )
+        }
+
         when {
             state.isLoading && state.isEmpty -> LoadingState(modifier = Modifier.fillMaxSize())
 
@@ -80,6 +96,17 @@ fun CategoryScreen(
                 modifier = Modifier.fillMaxSize(),
             )
 
+            visibleItems.isEmpty() && query.isNotBlank() -> Box(
+                Modifier.fillMaxSize().padding(24.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "No matches for \"${query.trim()}\"",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Brand.OnSurfaceDim,
+                )
+            }
+
             else -> LazyVerticalGrid(
                 state = gridState,
                 columns = GridCells.Adaptive(minSize = 120.dp),
@@ -88,10 +115,11 @@ fun CategoryScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                items(state.items, key = { "${it.mediaType.name}-${it.id}" }) { item ->
+                items(visibleItems, key = { "${it.mediaType.name}-${it.id}" }) { item ->
                     PosterCard(item = item, onClick = onMediaClick, modifier = Modifier.fillMaxWidth())
                 }
-                if (state.isPaging) {
+                // Only paginate the unfiltered list; while searching, the spinner would be misleading.
+                if (state.isPaging && query.isBlank()) {
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator(color = Brand.Violet, strokeWidth = 3.dp, modifier = Modifier.size(28.dp))
@@ -101,6 +129,43 @@ fun CategoryScreen(
             }
         }
     }
+}
+
+@Composable
+private fun CategorySearchField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = modifier,
+        singleLine = true,
+        shape = RoundedCornerShape(14.dp),
+        placeholder = {
+            Text("Search this category", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge)
+        },
+        leadingIcon = {
+            Icon(Icons.Rounded.Search, contentDescription = null, tint = Brand.OnSurfaceDim)
+        },
+        trailingIcon = {
+            if (query.isNotEmpty()) {
+                IconButton(onClick = { onQueryChange("") }) {
+                    Icon(Icons.Rounded.Close, contentDescription = "Clear search", tint = Brand.OnSurfaceDim)
+                }
+            }
+        },
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = Brand.OnSurface,
+            unfocusedTextColor = Brand.OnSurface,
+            cursorColor = Brand.Cyan,
+            focusedBorderColor = Brand.Violet,
+            unfocusedBorderColor = Brand.SurfaceVariant,
+            focusedContainerColor = Brand.Surface,
+            unfocusedContainerColor = Brand.Surface,
+        ),
+    )
 }
 
 @Composable

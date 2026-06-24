@@ -73,4 +73,6 @@ class SettingsViewModel @Inject constructor(
     fun setSubtitleLanguage(lang: SubtitleLanguage) = viewModelScope.launch { repo.setSubtitleLanguage(lang) }
     fun setSubtitleSize(size: SubtitleSize) = viewModelScope.launch { repo.setSubtitleSize(size) }
     fun setSubtitleStyle(style: SubtitleStyle) = viewModelScope.launch { repo.setSubtitleStyle(style) }
+    fun setStreamSize(s: com.slickstream.data.settings.StreamSizePreference) =
+        viewModelScope.launch { repo.setStreamSize(s) }
 }

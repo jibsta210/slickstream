@@ -29,6 +29,9 @@ import androidx.compose.material.icons.rounded.Forward10
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Replay10
+import androidx.compose.material.icons.rounded.SkipNext
+import androidx.compose.material.icons.rounded.SkipPrevious
+import androidx.compose.material.icons.rounded.Subscriptions
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -71,6 +74,7 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.slickstream.core.model.Episode
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.feature.player.PlayerUiState
@@ -101,10 +105,16 @@ fun TvPlayerScreen(
     val subtitles by viewModel.subtitles.collectAsStateWithLifecycle()
     val currentSubtitle by viewModel.currentSubtitle.collectAsStateWithLifecycle()
     val captionPrefs by viewModel.captionPrefs.collectAsStateWithLifecycle()
+    val episodes by viewModel.episodes.collectAsStateWithLifecycle()
+    val currentSeasonNumber by viewModel.currentSeasonNumber.collectAsStateWithLifecycle()
+    val currentEpisodeNumber by viewModel.currentEpisodeNumber.collectAsStateWithLifecycle()
+    val hasNext by viewModel.hasNext.collectAsStateWithLifecycle()
+    val hasPrevious by viewModel.hasPrevious.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
     var subsPanelOpen by remember { mutableStateOf(false) }
+    var episodesPanelOpen by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
     var scrubbing by remember { mutableStateOf(false) }
 
@@ -123,7 +133,7 @@ fun TvPlayerScreen(
         onDispose { p?.removeListener(listener) }
     }
 
-    val anyPanelOpen = panelOpen || subsPanelOpen
+    val anyPanelOpen = panelOpen || subsPanelOpen || episodesPanelOpen
 
     // Auto-hide the transport overlay after a few seconds of no interaction (never while a panel is
     // open or a scrub is in progress).
@@ -145,6 +155,7 @@ fun TvPlayerScreen(
 
     BackHandler {
         when {
+            episodesPanelOpen -> episodesPanelOpen = false
             subsPanelOpen -> subsPanelOpen = false
             panelOpen -> panelOpen = false
             // While buffering/fetching or errored there's no transport to dismiss — leave at once.
@@ -259,6 +270,13 @@ fun TvPlayerScreen(
                         controlsVisible = true
                         if (subtitles.isEmpty()) viewModel.refreshSubtitles()
                     },
+                    // Episode navigation — only present for TV shows (episode list resolved).
+                    hasEpisodes = episodes.isNotEmpty(),
+                    hasPrevious = hasPrevious,
+                    hasNext = hasNext,
+                    onPrevious = { viewModel.previousEpisode(); controlsVisible = true },
+                    onNext = { viewModel.nextEpisode(); controlsVisible = true },
+                    onOpenEpisodes = { episodesPanelOpen = true; controlsVisible = true },
                 )
             }
         }
@@ -297,6 +315,25 @@ fun TvPlayerScreen(
                 },
                 onSearch = { viewModel.refreshSubtitles() },
                 onClose = { subsPanelOpen = false },
+            )
+        }
+
+        // Focusable episodes side-panel (TV shows): pick any episode to play it.
+        AnimatedVisibility(
+            visible = episodesPanelOpen,
+            enter = slideInHorizontally { it } + fadeIn(),
+            exit = slideOutHorizontally { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.CenterEnd),
+        ) {
+            EpisodesPanel(
+                episodes = episodes,
+                currentSeason = currentSeasonNumber,
+                currentEpisode = currentEpisodeNumber,
+                onSelect = { ep ->
+                    viewModel.playEpisode(ep.seasonNumber, ep.episodeNumber)
+                    episodesPanelOpen = false
+                },
+                onClose = { episodesPanelOpen = false },
             )
         }
     }
@@ -398,6 +435,12 @@ private fun TransportOverlay(
     onOpenSources: () -> Unit,
     subtitlesActive: Boolean,
     onOpenSubtitles: () -> Unit,
+    hasEpisodes: Boolean,
+    hasPrevious: Boolean,
+    hasNext: Boolean,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onOpenEpisodes: () -> Unit,
 ) {
     Box(
         modifier = Modifier
@@ -455,23 +498,44 @@ private fun TransportOverlay(
                 horizontalArrangement = Arrangement.spacedBy(20.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // Previous episode (TV only) — disabled at the very first episode.
+                if (hasEpisodes) {
+                    TransportButton(
+                        Icons.Rounded.SkipPrevious,
+                        "Previous episode",
+                        onPrevious,
+                        enabled = hasPrevious,
+                    )
+                }
                 TransportButton(Icons.Rounded.Replay10, "Rewind 10 seconds", onSeekBack)
-            TransportButton(
-                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                if (isPlaying) "Pause" else "Play",
-                onPlayPause,
-                large = true,
-                modifier = Modifier.focusRequester(playPauseFocus),
-            )
-            TransportButton(Icons.Rounded.Forward10, "Forward 10 seconds", onSeekForward)
-            Spacer(Modifier.width(24.dp))
-            TransportButton(
-                Icons.Rounded.ClosedCaption,
-                "Subtitles",
-                onOpenSubtitles,
-                tint = if (subtitlesActive) Brand.Cyan else Color.White,
-            )
-            TransportButton(Icons.Rounded.Tune, "Sources & quality", onOpenSources)
+                TransportButton(
+                    if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    if (isPlaying) "Pause" else "Play",
+                    onPlayPause,
+                    large = true,
+                    modifier = Modifier.focusRequester(playPauseFocus),
+                )
+                TransportButton(Icons.Rounded.Forward10, "Forward 10 seconds", onSeekForward)
+                // Next episode (TV only) — disabled at the season/series finale.
+                if (hasEpisodes) {
+                    TransportButton(
+                        Icons.Rounded.SkipNext,
+                        "Next episode",
+                        onNext,
+                        enabled = hasNext,
+                    )
+                }
+                Spacer(Modifier.width(24.dp))
+                if (hasEpisodes) {
+                    TransportButton(Icons.Rounded.Subscriptions, "Episodes", onOpenEpisodes)
+                }
+                TransportButton(
+                    Icons.Rounded.ClosedCaption,
+                    "Subtitles",
+                    onOpenSubtitles,
+                    tint = if (subtitlesActive) Brand.Cyan else Color.White,
+                )
+                TransportButton(Icons.Rounded.Tune, "Sources & quality", onOpenSources)
             }
         }
     }
@@ -593,17 +657,20 @@ private fun TransportButton(
     onClick: () -> Unit,
     large: Boolean = false,
     tint: Color = Color.White,
+    enabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     val dim = if (large) 84.dp else 64.dp
     val shape = RoundedCornerShape(percent = 50)
     Surface(
         onClick = onClick,
+        enabled = enabled,
         shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Color(0x66151520),
             focusedContainerColor = Brand.Violet,
             pressedContainerColor = Brand.VioletDim,
+            disabledContainerColor = Color(0x33151520),
         ),
         border = ClickableSurfaceDefaults.border(
             focusedBorder = Border(
@@ -618,7 +685,7 @@ private fun TransportButton(
             Icon(
                 imageVector = icon,
                 contentDescription = contentDescription,
-                tint = tint,
+                tint = if (enabled) tint else tint.copy(alpha = 0.35f),
                 modifier = Modifier.size(if (large) 44.dp else 32.dp),
             )
         }
@@ -832,6 +899,128 @@ private fun TvSubtitleRow(
             if (selected) {
                 Spacer(Modifier.width(10.dp))
                 Text("●", color = Brand.Cyan, style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
+@Composable
+private fun EpisodesPanel(
+    episodes: List<Episode>,
+    currentSeason: Int?,
+    currentEpisode: Int?,
+    onSelect: (Episode) -> Unit,
+    onClose: () -> Unit,
+) {
+    BackHandler(enabled = true) { onClose() }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val currentFocus = remember { FocusRequester() }
+    // Land focus on the currently-playing episode (and scroll it into view) when the panel opens.
+    val currentIndex = remember(episodes, currentSeason, currentEpisode) {
+        episodes.indexOfFirst {
+            it.seasonNumber == currentSeason && it.episodeNumber == currentEpisode
+        }.takeIf { it >= 0 } ?: 0
+    }
+    LaunchedEffect(Unit) {
+        runCatching { listState.scrollToItem(currentIndex) }
+        runCatching { currentFocus.requestFocus() }
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(460.dp)
+            .background(Color(0xF2101019))
+            .padding(28.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text(
+            text = "Episodes",
+            style = MaterialTheme.typography.titleLarge,
+            color = Brand.OnSurface,
+        )
+        Text(
+            text = currentSeason?.let { "Season $it" } ?: "Pick an episode to play.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Brand.OnSurfaceDim,
+        )
+        LazyColumn(
+            state = listState,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
+        ) {
+            itemsIndexed(
+                episodes,
+                key = { _, ep -> "${ep.seasonNumber}-${ep.episodeNumber}" },
+            ) { index, episode ->
+                EpisodeRow(
+                    episode = episode,
+                    selected = episode.seasonNumber == currentSeason &&
+                        episode.episodeNumber == currentEpisode,
+                    onClick = { onSelect(episode) },
+                    modifier = if (index == currentIndex) Modifier.focusRequester(currentFocus) else Modifier,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EpisodeRow(
+    episode: Episode,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (selected) Brand.SurfaceVariant else Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(
+                border = androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet),
+                shape = shape,
+            ),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "S${episode.seasonNumber}E${episode.episodeNumber}",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = if (selected) Brand.Cyan else Brand.OnSurfaceDim,
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = episode.name,
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (selected) {
+                    Spacer(Modifier.width(8.dp))
+                    Text("●", color = Brand.Cyan, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+            if (episode.overview.isNotBlank()) {
+                Text(
+                    text = episode.overview,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Brand.OnSurfaceDim,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }

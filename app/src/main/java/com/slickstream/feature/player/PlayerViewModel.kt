@@ -23,6 +23,7 @@ import androidx.mediarouter.media.MediaRouteSelector
 import com.slickstream.cast.CastManager
 import com.slickstream.core.common.DeviceProfile
 import com.slickstream.core.model.DataResult
+import com.slickstream.core.model.Episode
 import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
@@ -37,6 +38,7 @@ import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
+import com.slickstream.data.settings.StreamSizePreference
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.subtitle.SubtitleRepository
@@ -94,10 +96,16 @@ class PlayerViewModel @Inject constructor(
     private val mediaType: MediaType =
         MediaType.fromName(savedStateHandle.get<String>(NavArg.MEDIA_TYPE))
     private val mediaId: Int = savedStateHandle.get<Int>(NavArg.MEDIA_ID) ?: -1
-    private val season: Int? =
+    private val navSeason: Int? =
         savedStateHandle.get<Int>(NavArg.SEASON)?.takeIf { it >= 0 }
-    private val episode: Int? =
+    private val navEpisode: Int? =
         savedStateHandle.get<Int>(NavArg.EPISODE)?.takeIf { it >= 0 }
+
+    // The currently-playing episode. Mutable so in-player navigation (next/previous/auto-advance)
+    // can switch episodes without recreating the screen. Movies leave these null and behave exactly
+    // as before. Seeded from the nav args.
+    private var currentSeason: Int? = navSeason
+    private var currentEpisode: Int? = navEpisode
 
     // --- UI state -----------------------------------------------------------
     private val _uiState = MutableStateFlow<PlayerUiState>(
@@ -123,6 +131,25 @@ class PlayerViewModel @Inject constructor(
 
     private val _title = MutableStateFlow("Now Playing")
     val title: StateFlow<String> = _title.asStateFlow()
+
+    // --- Episode navigation (TV only) ---------------------------------------
+    /** Episodes of the current season — empty for movies; drives the episode-list UI. */
+    private val _episodes = MutableStateFlow<List<Episode>>(emptyList())
+    val episodes: StateFlow<List<Episode>> = _episodes.asStateFlow()
+
+    /** Currently-playing episode number within [episodes] (null for movies). */
+    private val _currentEpisodeNumber = MutableStateFlow<Int?>(navEpisode)
+    val currentEpisodeNumber: StateFlow<Int?> = _currentEpisodeNumber.asStateFlow()
+
+    /** Currently-playing season number (null for movies). */
+    private val _currentSeasonNumber = MutableStateFlow<Int?>(navSeason)
+    val currentSeasonNumber: StateFlow<Int?> = _currentSeasonNumber.asStateFlow()
+
+    private val _hasNext = MutableStateFlow(false)
+    val hasNext: StateFlow<Boolean> = _hasNext.asStateFlow()
+
+    private val _hasPrevious = MutableStateFlow(false)
+    val hasPrevious: StateFlow<Boolean> = _hasPrevious.asStateFlow()
 
     // --- Internal -----------------------------------------------------------
     private var details: MediaDetails? = null
@@ -194,9 +221,10 @@ class PlayerViewModel @Inject constructor(
             details = d
             _title.value = buildTitle(d)
             viewModelScope.launch { loadSubtitles(d) }
+            viewModelScope.launch { loadEpisodeList() }
 
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
-            val list = when (val r = sourceRepository.resolve(d, season, episode)) {
+            val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {
                 is DataResult.Success -> r.data
                 is DataResult.Error -> {
                     _uiState.value = PlayerUiState.Error(r.message)
@@ -237,15 +265,41 @@ class PlayerViewModel @Inject constructor(
      * also cap at 1080p under AUTO, since 4K is the heaviest to sustain on the conservative engine
      * profile (and the dominant cause of "playback failed" on TV). Quality only tiebreaks.
      */
-    private fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
+    private suspend fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
+        val sizePref = settingsRepository.current().streamSize
         val effectiveTier =
             if (deviceProfile.isLowPower) minOf(pref.maxTier, QualityPreference.FHD_1080.maxTier)
             else pref.maxTier
         val capped = list.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }.ifEmpty { list }
         val healthy = capped.filter { (it.seeders ?: 0) >= MIN_SEEDERS }.ifEmpty { capped }
-        return healthy.maxWithOrNull(
-            compareBy<StreamSource> { it.seeders ?: 0 }.thenBy { it.rank },
-        ) ?: list.first()
+        // Within the (resolution-capped, well-seeded) set, the size preference decides where on the
+        // size/bitrate range to land — a 1080p episode can be 700 MB or 4 GB.
+        val picked = when (sizePref) {
+            StreamSizePreference.HIGHEST ->
+                // Best quality: most seeders, then the LARGEST file (highest bitrate).
+                healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
+            StreamSizePreference.SMALLEST -> {
+                // Leanest well-seeded copy: smallest known size, ties to more seeders.
+                val withSize = healthy.filter { (it.sizeBytes ?: 0L) > 0L }
+                if (withSize.isNotEmpty()) {
+                    withSize.minWithOrNull(
+                        compareBy<StreamSource> { it.sizeBytes ?: 0L }.thenByDescending { it.seeders ?: 0 },
+                    )
+                } else {
+                    healthy.maxByOrNull { it.seeders ?: 0 }
+                }
+            }
+            StreamSizePreference.BALANCED -> {
+                // Drop the biggest ~third (remux/bluray outliers), then take the best-seeded of the
+                // rest (smaller on a tie) — lean but not over-compressed.
+                val withSize = healthy.filter { (it.sizeBytes ?: 0L) > 0L }.sortedBy { it.sizeBytes ?: 0L }
+                val pool = if (withSize.size >= 4) withSize.take((withSize.size * 2 + 2) / 3) else healthy
+                pool.minWithOrNull(
+                    compareByDescending<StreamSource> { it.seeders ?: 0 }.thenBy { it.sizeBytes ?: Long.MAX_VALUE },
+                )
+            }
+        }
+        return picked ?: list.first()
     }
 
     private fun isOnUnmeteredNetwork(): Boolean {
@@ -376,7 +430,11 @@ class PlayerViewModel @Inject constructor(
                             )
                         }
                     }
-                    Player.STATE_ENDED -> saveProgressNow()
+                    Player.STATE_ENDED -> {
+                        saveProgressNow()
+                        // Auto-play the next episode of a TV series when one finishes.
+                        if (mediaType == MediaType.TV && _hasNext.value) nextEpisode()
+                    }
                     else -> Unit
                 }
             }
@@ -414,7 +472,7 @@ class PlayerViewModel @Inject constructor(
     private suspend fun loadSubtitles(d: MediaDetails) {
         val settings = settingsRepository.current()
         preferredSubCode = if (settings.subtitlesEnabled) settings.subtitleLanguage.code else null
-        val subs = subtitleRepository.fetch(d, season, episode)
+        val subs = subtitleRepository.fetch(d, currentSeason, currentEpisode)
         _subtitles.value = subs
         subtitleConfigs = subs.map(::buildSubConfig)
         // If the player already started before subs arrived, re-attach them at the live position.
@@ -446,7 +504,7 @@ class PlayerViewModel @Inject constructor(
     fun refreshSubtitles() {
         val d = details ?: return
         viewModelScope.launch {
-            val subs = subtitleRepository.fetch(d, season, episode)
+            val subs = subtitleRepository.fetch(d, currentSeason, currentEpisode)
             _subtitles.value = subs
             subtitleConfigs = subs.map(::buildSubConfig)
             val exo = _player.value ?: return@launch
@@ -557,7 +615,7 @@ class PlayerViewModel @Inject constructor(
         if (hasSeekedToResume) return
         hasSeekedToResume = true
         viewModelScope.launch {
-            val saved = libraryRepository.getProgress(mediaId, mediaType, season, episode)
+            val saved = libraryRepository.getProgress(mediaId, mediaType, currentSeason, currentEpisode)
             if (saved != null && !saved.isFinished && saved.positionMs > 0) {
                 exo.seekTo(saved.positionMs)
             }
@@ -590,8 +648,8 @@ class PlayerViewModel @Inject constructor(
         val progress = PlaybackProgress(
             mediaId = mediaId,
             mediaType = mediaType,
-            season = season,
-            episode = episode,
+            season = currentSeason,
+            episode = currentEpisode,
             positionMs = position,
             durationMs = duration,
             updatedAt = System.currentTimeMillis(),
@@ -613,7 +671,9 @@ class PlayerViewModel @Inject constructor(
 
     private fun buildTitle(d: MediaDetails): String {
         val base = d.item.title
-        return if (season != null && episode != null) "$base · S${season}E${episode}" else base
+        val s = currentSeason
+        val e = currentEpisode
+        return if (s != null && e != null) "$base · S${s}E${e}" else base
     }
 
     // --- Next-episode prefetch (TV only) ------------------------------------
@@ -643,8 +703,8 @@ class PlayerViewModel @Inject constructor(
 
     private suspend fun warmEpisode() {
         val d = details ?: return
-        val s = season ?: return
-        val e = episode ?: return
+        val s = currentSeason ?: return
+        val e = currentEpisode ?: return
         val (nextSeason, nextEpisode) = nextEpisodeCoords(d, s, e) ?: return
 
         val sources = when (val r = sourceRepository.resolve(d, nextSeason, nextEpisode)) {
@@ -685,6 +745,127 @@ class PlayerViewModel @Inject constructor(
         }
         if (nextCount <= 0) return null
         return nextSeason to 1
+    }
+
+    /** Previous-episode coordinates: same-season -1, else the last episode of the previous real season. */
+    private suspend fun previousEpisodeCoords(
+        d: MediaDetails,
+        curSeason: Int,
+        curEpisode: Int,
+    ): Pair<Int, Int>? {
+        if (curEpisode > 1) return curSeason to (curEpisode - 1)
+
+        val prevSeason = d.seasons
+            .map { it.seasonNumber }
+            .filter { it < curSeason && it >= 1 }
+            .maxOrNull() ?: return null
+        val prevCount = when (val r = catalogRepository.getEpisodes(mediaId, prevSeason)) {
+            is DataResult.Success -> r.data.size
+            is DataResult.Error -> return null
+        }
+        if (prevCount <= 0) return null
+        return prevSeason to prevCount
+    }
+
+    // --- In-player episode navigation (TV only) -----------------------------
+
+    /** Load the current season's episode list and refresh next/previous availability. */
+    private suspend fun loadEpisodeList() {
+        val s = currentSeason ?: return   // movies have no episode list
+        when (val r = catalogRepository.getEpisodes(mediaId, s)) {
+            is DataResult.Success -> _episodes.value = r.data
+            is DataResult.Error -> _episodes.value = emptyList()
+        }
+        refreshNavAvailability()
+    }
+
+    private suspend fun refreshNavAvailability() {
+        val d = details
+        val s = currentSeason
+        val e = currentEpisode
+        if (d == null || s == null || e == null) {
+            _hasNext.value = false
+            _hasPrevious.value = false
+            return
+        }
+        _hasNext.value = nextEpisodeCoords(d, s, e) != null
+        _hasPrevious.value = previousEpisodeCoords(d, s, e) != null
+    }
+
+    /**
+     * Switch playback to a specific episode of this series: save the current spot, tear down the
+     * active stream, re-resolve sources for the target episode and start it — mirroring [load]'s
+     * resolve+start path (reset resume seek, reload subtitles, rebuild ExoPlayer via [startSource]).
+     */
+    fun playEpisode(season: Int, episode: Int) {
+        if (mediaType != MediaType.TV) return
+        val d = details ?: return
+        if (season == currentSeason && episode == currentEpisode) return
+
+        viewModelScope.launch {
+            // Persist where we are in the OUTGOING episode before switching coords.
+            saveProgressNow()
+            stopActiveStream(removeFiles = false)
+            prefetchJob?.cancel()
+            prefetchedInfoHash = null
+
+            currentSeason = season
+            currentEpisode = episode
+            _currentSeasonNumber.value = season
+            _currentEpisodeNumber.value = episode
+            hasSeekedToResume = false
+
+            _title.value = buildTitle(d)
+            _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Loading…")
+
+            // Refresh the season's episode list if we crossed a season boundary, and nav availability.
+            if (season != (_episodes.value.firstOrNull()?.seasonNumber)) {
+                loadEpisodeList()
+            } else {
+                refreshNavAvailability()
+            }
+
+            // Reload subtitles for the new episode.
+            viewModelScope.launch { loadSubtitles(d) }
+
+            _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
+            val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {
+                is DataResult.Success -> r.data
+                is DataResult.Error -> {
+                    _uiState.value = PlayerUiState.Error(r.message)
+                    return@launch
+                }
+            }
+            if (list.isEmpty()) {
+                _uiState.value = PlayerUiState.Error("No streamable sources found.")
+                return@launch
+            }
+            _sources.value = list.sortedByDescending { it.rank }
+            val best = pickPreferred(list, networkQualityPreference())
+            startSource(best)
+        }
+    }
+
+    /** Advance to the next episode (same-season next, else episode 1 of the next real season). */
+    fun nextEpisode() {
+        val d = details ?: return
+        val s = currentSeason ?: return
+        val e = currentEpisode ?: return
+        viewModelScope.launch {
+            val (ns, ne) = nextEpisodeCoords(d, s, e) ?: return@launch
+            playEpisode(ns, ne)
+        }
+    }
+
+    /** Go to the previous episode (same-season -1, else last episode of the previous real season). */
+    fun previousEpisode() {
+        val d = details ?: return
+        val s = currentSeason ?: return
+        val e = currentEpisode ?: return
+        viewModelScope.launch {
+            val (ps, pe) = previousEpisodeCoords(d, s, e) ?: return@launch
+            playEpisode(ps, pe)
+        }
     }
 
     override fun onCleared() {

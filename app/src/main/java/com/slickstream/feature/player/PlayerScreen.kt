@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.Close
@@ -34,6 +35,8 @@ import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -80,6 +83,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.slickstream.core.model.Episode
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.ui.theme.Brand
@@ -113,13 +117,20 @@ fun PlayerScreen(
     val subtitles by viewModel.subtitles.collectAsState()
     val currentSubtitle by viewModel.currentSubtitle.collectAsState()
     val captionPrefs by viewModel.captionPrefs.collectAsState()
+    val episodes by viewModel.episodes.collectAsState()
+    val currentSeasonNumber by viewModel.currentSeasonNumber.collectAsState()
+    val currentEpisodeNumber by viewModel.currentEpisodeNumber.collectAsState()
+    val hasNext by viewModel.hasNext.collectAsState()
+    val hasPrevious by viewModel.hasPrevious.collectAsState()
     val context = LocalContext.current
 
     var showSources by remember { mutableStateOf(false) }
     var showSubtitles by remember { mutableStateOf(false) }
+    var showEpisodes by remember { mutableStateOf(false) }
     var overlayVisible by remember { mutableStateOf(true) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val subtitleSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val episodeSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
 
     // Fullscreen + Picture-in-Picture
@@ -238,6 +249,13 @@ fun PlayerScreen(
                 showSourcesButton = sources.isNotEmpty(),
                 onSubtitles = { showSubtitles = true },
                 subtitlesActive = currentSubtitle != null,
+                // Episode navigation — only present for TV shows (episode list resolved).
+                hasEpisodes = episodes.isNotEmpty(),
+                hasPrevious = hasPrevious,
+                hasNext = hasNext,
+                onPrevious = { viewModel.previousEpisode() },
+                onNext = { viewModel.nextEpisode() },
+                onEpisodes = { showEpisodes = true },
                 pipSupported = pipController?.isSupported == true && !isCasting,
                 onPip = { pipController?.enter() },
                 castAvailable = viewModel.castAvailable,
@@ -318,6 +336,27 @@ fun PlayerScreen(
             )
         }
     }
+
+    if (showEpisodes) {
+        ModalBottomSheet(
+            onDismissRequest = { showEpisodes = false },
+            sheetState = episodeSheetState,
+            containerColor = Brand.Surface,
+            contentColor = Brand.OnSurface,
+        ) {
+            EpisodesSheetContent(
+                episodes = episodes,
+                currentSeason = currentSeasonNumber,
+                currentEpisode = currentEpisodeNumber,
+                onSelect = { ep ->
+                    viewModel.playEpisode(ep.seasonNumber, ep.episodeNumber)
+                    scope.launch { episodeSheetState.hide() }.invokeOnCompletion {
+                        if (!episodeSheetState.isVisible) showEpisodes = false
+                    }
+                },
+            )
+        }
+    }
 }
 
 @Composable
@@ -328,6 +367,12 @@ private fun TopOverlay(
     showSourcesButton: Boolean,
     onSubtitles: () -> Unit,
     subtitlesActive: Boolean,
+    hasEpisodes: Boolean,
+    hasPrevious: Boolean,
+    hasNext: Boolean,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onEpisodes: () -> Unit,
     pipSupported: Boolean,
     onPip: () -> Unit,
     castAvailable: Boolean,
@@ -363,6 +408,30 @@ private fun TopOverlay(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        // Episode navigation (TV only).
+        if (hasEpisodes) {
+            IconButton(onClick = onPrevious, enabled = hasPrevious) {
+                Icon(
+                    imageVector = Icons.Filled.SkipPrevious,
+                    contentDescription = "Previous episode",
+                    tint = if (hasPrevious) Brand.OnSurface else Brand.OnSurface.copy(alpha = 0.35f),
+                )
+            }
+            IconButton(onClick = onNext, enabled = hasNext) {
+                Icon(
+                    imageVector = Icons.Filled.SkipNext,
+                    contentDescription = "Next episode",
+                    tint = if (hasNext) Brand.OnSurface else Brand.OnSurface.copy(alpha = 0.35f),
+                )
+            }
+            IconButton(onClick = onEpisodes) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.PlaylistPlay,
+                    contentDescription = "Episodes",
+                    tint = Brand.OnSurface,
+                )
+            }
+        }
         IconButton(onClick = onSubtitles) {
             Icon(
                 imageVector = Icons.Filled.ClosedCaption,
@@ -688,6 +757,84 @@ private fun SubtitleRow(label: String, selected: Boolean, onClick: () -> Unit) {
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             fontSize = 15.sp,
         )
+    }
+}
+
+@Composable
+private fun EpisodesSheetContent(
+    episodes: List<Episode>,
+    currentSeason: Int?,
+    currentEpisode: Int?,
+    onSelect: (Episode) -> Unit,
+) {
+    Column(modifier = Modifier.padding(bottom = 24.dp)) {
+        Text(
+            text = "Episodes",
+            color = Brand.OnSurface,
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 4.dp),
+        )
+        Text(
+            text = currentSeason?.let { "Season $it" } ?: "${episodes.size} episodes",
+            color = Brand.OnSurfaceDim,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(start = 20.dp, bottom = 12.dp),
+        )
+        LazyColumn {
+            items(episodes, key = { "${it.seasonNumber}-${it.episodeNumber}" }) { episode ->
+                EpisodeRow(
+                    episode = episode,
+                    selected = episode.seasonNumber == currentSeason &&
+                        episode.episodeNumber == currentEpisode,
+                    onClick = { onSelect(episode) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EpisodeRow(
+    episode: Episode,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .background(if (selected) Brand.Violet.copy(alpha = 0.12f) else Color.Transparent)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "S${episode.seasonNumber}E${episode.episodeNumber}",
+            color = if (selected) Brand.Cyan else Brand.OnSurfaceDim,
+            fontWeight = FontWeight.Bold,
+            fontSize = 13.sp,
+        )
+        Spacer(Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = episode.name,
+                color = if (selected) Brand.Violet else Brand.OnSurface,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (episode.overview.isNotBlank()) {
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = episode.overview,
+                    color = Brand.OnSurfaceDim,
+                    fontSize = 12.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 

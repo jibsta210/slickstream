@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -385,15 +386,25 @@ private fun EpisodeList(
                 key = { "${it.seasonNumber}-${it.episodeNumber}" },
                 contentType = { "episode" },
             ) { ep ->
-                EpisodeCard(episode = ep, onClick = { onPlayEpisode(ep) })
+                EpisodeCard(
+                    episode = ep,
+                    progress = state.episodeProgress[ep.episodeNumber],
+                    onClick = { onPlayEpisode(ep) },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun EpisodeCard(episode: Episode, onClick: () -> Unit) {
+private fun EpisodeCard(
+    episode: Episode,
+    progress: Float?,
+    onClick: () -> Unit,
+) {
     val shape = RoundedCornerShape(12.dp)
+    // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode shows a check.
+    val isWatched = (progress ?: 0f) >= 0.92f
     Surface(
         onClick = onClick,
         shape = ClickableSurfaceDefaults.shape(shape = shape),
@@ -443,6 +454,38 @@ private fun EpisodeCard(episode: Episode, onClick: () -> Unit) {
                         tint = Color.White,
                         modifier = Modifier.size(28.dp),
                     )
+                }
+
+                // Watched check sits in the top-end corner once the episode is essentially done.
+                if (isWatched) {
+                    Icon(
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = "Watched",
+                        tint = Brand.Cyan,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .size(24.dp),
+                    )
+                }
+
+                // Thin resume bar pinned to the bottom of the still (Violet fill over a
+                // translucent track), mirroring TvPosterCard. No bar when progress is null/0.
+                progress?.takeIf { it > 0f }?.let { p ->
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .background(Color(0x55000000)),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(p.coerceIn(0f, 1f))
+                                .fillMaxSize()
+                                .background(Brand.Violet),
+                        )
+                    }
                 }
             }
             Column(
