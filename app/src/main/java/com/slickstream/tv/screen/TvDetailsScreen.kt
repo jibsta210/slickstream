@@ -396,6 +396,20 @@ private fun EpisodeList(
     }
 }
 
+private val MONTH_ABBR =
+    arrayOf("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+/** "2024-11-28" -> "Nov 28, 2024". Null/blank/odd input -> null. */
+internal fun formatAirDate(raw: String?): String? {
+    if (raw.isNullOrBlank()) return null
+    val parts = raw.split("-")
+    if (parts.size != 3) return raw
+    val month = parts[1].toIntOrNull() ?: return raw
+    val day = parts[2].toIntOrNull() ?: return raw
+    val mon = MONTH_ABBR.getOrNull(month - 1) ?: return raw
+    return "$mon $day, ${parts[0]}"
+}
+
 @Composable
 private fun EpisodeCard(
     episode: Episode,
@@ -509,6 +523,13 @@ private fun EpisodeCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                formatAirDate(episode.airDate)?.let { date ->
+                    Text(
+                        text = date,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Brand.Cyan,
+                    )
+                }
                 Text(
                     text = episode.overview.ifBlank { "No description available." },
                     style = MaterialTheme.typography.bodyMedium,

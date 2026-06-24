@@ -432,12 +432,23 @@ class TorrentEngine @Inject constructor(
         val firstNeeded = ((active.fileOffset + start) / active.pieceLength).toInt()
         val lastNeeded = ((active.fileOffset + endInclusive) / active.pieceLength).toInt()
 
+        // If this request reaches into the tail/EOF band, it's the player fetching the moov atom /
+        // mkv cues. Under SEQUENTIAL_DOWNLOAD the sequential cursor sits at the head and will NOT
+        // reach EOF pieces for minutes, so deadline-fetch EVERYTHING from here to the last piece in
+        // one shot — not just the 512 KB slice blockForRange asked for. Otherwise the moov read walks
+        // forward one 1 MB chunk at a time, each chunk racing the head cursor, and stalls for >1 min.
+        // set_piece_deadline marks these "time critical" and libtorrent fetches them AHEAD of the
+        // sequential cursor, so the whole moov arrives promptly and the moov gate never deadlocks.
+        val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
+        val tailFrom = active.lastPiece - tailPieces + 1
+        val deadlineLast = if (lastNeeded >= tailFrom) active.lastPiece else lastNeeded
+
         // Bump priority + deadlines so libtorrent fetches these next, in order. Best-effort: a
         // concurrent stop() can invalidate the handle mid-loop, making the native call throw.
         synchronized(nativeLock) {
             runCatching {
                 var deadline = 0
-                for (p in firstNeeded..lastNeeded) {
+                for (p in firstNeeded..deadlineLast) {
                     if (p in active.firstPiece..active.lastPiece) {
                         handle.piecePriority(p, Priority.TOP_PRIORITY)
                         handle.setPieceDeadline(p, deadline)
@@ -657,10 +668,18 @@ class TorrentEngine @Inject constructor(
         active.readHeadPiece = curPiece
 
         val readahead = (readaheadBytes / active.pieceLength + 1)
+        // Never strip deadlines off the tail/moov band. ExoPlayer re-reads the moov atom / mkv cues
+        // (at EOF) on every seek; if a forward-walking read head reset those pieces, a later seek
+        // would have to re-fetch the moov against the sequential cursor and stall again. Keep the
+        // tail permanently time-critical.
+        val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
+        val tailFrom = active.lastPiece - tailPieces + 1
         synchronized(nativeLock) { runCatching {
             if (prev >= 0) {
                 for (p in prev until curPiece) {
-                    if (p in active.firstPiece..active.lastPiece) handle.resetPieceDeadline(p)
+                    if (p in active.firstPiece..active.lastPiece && p < tailFrom) {
+                        handle.resetPieceDeadline(p)
+                    }
                 }
             }
             var deadline = 0
@@ -687,9 +706,18 @@ class TorrentEngine @Inject constructor(
         private const val HANDLE_POLL_INTERVAL_MS = 50L
         private const val RANGE_POLL_INTERVAL_MS = 100L
 
-        /** ~6 MB head buffer + ~1 MB tail (mp4 moov atom). */
+        /** ~6 MB head buffer + ~8 MB tail (mp4 moov atom / mkv cues at EOF).
+         *
+         * The moov of a 2 h 1080p/4K mp4 routinely runs several MB (one stco/stsz/stts table per
+         * track, scaled by frame count). A 1 MB tail only covered the last 1 MB of the file, so the
+         * REST of the moov landed on un-prioritised EOF pieces. With SEQUENTIAL_DOWNLOAD on, the
+         * sequential cursor sits at the head and won't reach those EOF pieces for many minutes —
+         * yet ExoPlayer must read the entire moov before the first frame. Result: the readiness gate
+         * flips to READY in <8 s (head + last-1 MB present), the player attaches, ranges to the moov
+         * at EOF, and then blocks for >1 min waiting on moov pieces sequential download won't fetch.
+         * 8 MB comfortably spans a feature-length moov so the whole atom is deadline-fetched up front. */
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
-        const val TAIL_PRIORITY_BYTES = 1 * 1024 * 1024
+        const val TAIL_PRIORITY_BYTES = 8 * 1024 * 1024
 
         /** Seed/upload cap (bytes/s) — keep a streaming client from saturating the home upstream. */
         const val UPLOAD_RATE_LIMIT = 100 * 1024

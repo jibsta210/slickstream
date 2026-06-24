@@ -53,6 +53,9 @@ class TorrentStreamerImpl @Inject constructor(
     /** infoHash -> source, so resume()/pause() can re-derive parameters if needed. */
     private val sources = ConcurrentHashMap<String, StreamSource>()
 
+    /** infoHashes currently being STREAMED by a player — a prefetch must never pause these. */
+    private val streamingHashes = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
     override fun start(source: StreamSource): Flow<StreamStatus> = callbackFlow {
         sources[source.infoHash] = source
 
@@ -79,6 +82,9 @@ class TorrentStreamerImpl @Inject constructor(
             return@callbackFlow
         }
 
+        // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
+        streamingHashes.add(infoHash)
+
         cache.touch(infoHash)
         // Make room if we're over budget (never evict the one we just added).
         runCatching { cache.enforceBudget(protectedHash = infoHash) }
@@ -99,6 +105,11 @@ class TorrentStreamerImpl @Inject constructor(
                     delay(POLL_INTERVAL_MS)
                     continue
                 }
+
+                // Self-heal: a still-running Details prewarm can race in and pause the torrent we're
+                // actively streaming (the >1min "stuck buffering" bug). If we see it paused mid-stream,
+                // resume it so the download is never silently killed.
+                if (snap.isPaused) runCatching { engine.resume(infoHash) }
 
                 val headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= READY_HEAD_BYTES
@@ -161,6 +172,7 @@ class TorrentStreamerImpl @Inject constructor(
 
         awaitClose {
             pollJob.cancel()
+            streamingHashes.remove(infoHash)
             // The flow was cancelled (player left). Pause + persist; keep files in cache.
             scope.launch {
                 runCatching { engine.pause(infoHash) }
@@ -215,7 +227,9 @@ class TorrentStreamerImpl @Inject constructor(
             if (engine.contiguousHeadBytes(infoHash) >= PREFETCH_HEAD_BYTES) break
             delay(POLL_INTERVAL_MS)
         }
-        runCatching { engine.pause(infoHash) }
+        // Park the warmed torrent — UNLESS a player has meanwhile started streaming it (Play pressed
+        // during the warm), or we'd pause the live stream out from under the player.
+        if (infoHash !in streamingHashes) runCatching { engine.pause(infoHash) }
         cache.touch(infoHash)
         infoHash
     }

@@ -390,9 +390,11 @@ private fun BufferingOverlay(
             )
             Text(title, style = MaterialTheme.typography.titleLarge, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(state.label, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
+            // Only while we're actually downloading the head (etaSeconds set). Above ~5s show the
+            // number; below that the unpredictable tail/prepare steps dominate, so "Almost ready…".
             state.etaSeconds?.let { eta ->
                 Text(
-                    text = if (eta <= 1) "Starting…" else "Starts in ~${eta}s",
+                    text = if (eta > 5) "Starts in ~${eta}s" else "Almost ready…",
                     style = MaterialTheme.typography.titleMedium,
                     color = Brand.Cyan,
                     fontWeight = FontWeight.Bold,

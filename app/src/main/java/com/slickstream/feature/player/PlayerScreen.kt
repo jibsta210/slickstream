@@ -530,7 +530,7 @@ private fun BufferingOverlay(
             state.etaSeconds?.let { eta ->
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = if (eta <= 1) "Starting…" else "Starts in ~${eta}s",
+                    text = if (eta > 5) "Starts in ~${eta}s" else "Almost ready…",
                     color = Brand.Cyan,
                     fontWeight = FontWeight.Bold,
                     fontSize = 15.sp,

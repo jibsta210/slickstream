@@ -165,7 +165,8 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                    // Fixed height so logoed and text-only chips are the SAME height.
+                    modifier = Modifier.height(48.dp).padding(horizontal = 20.dp),
                 ) {
                     if (c.logoUrl != null) {
                         AsyncImage(

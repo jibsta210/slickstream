@@ -371,11 +371,13 @@ class PlayerViewModel @Inject constructor(
             StreamState.IDLE -> "Connecting to peers…"
             else -> "Buffering…"
         }
-        // Estimate time-to-start from how much of the ~ready head buffer is left at the current
-        // rate (sequential download => downloadedBytes ≈ the contiguous head). Honest, not a file-%.
+        // Estimate time-to-start from how much of the ready head buffer is left at the current rate
+        // (sequential download => downloadedBytes ≈ the contiguous head). The ×1.6 fudge covers the
+        // moov/tail fetch + ExoPlayer prepare that still happen AFTER the head fills, so the number
+        // isn't wildly optimistic. The UI only shows it while it's still meaningfully large.
         val eta = if (status.downloadRateBytes > 0 && status.state == StreamState.BUFFERING) {
             val remaining = (READY_TARGET_BYTES - status.downloadedBytes).coerceAtLeast(0L)
-            (remaining / status.downloadRateBytes).toInt().takeIf { it in 1..600 }
+            ((remaining * 8 / 5) / status.downloadRateBytes).toInt().takeIf { it in 1..900 }
         } else {
             null
         }
@@ -542,8 +544,14 @@ class PlayerViewModel @Inject constructor(
                 // Back off to let bytes arrive, then re-prepare (position retained) and keep playing.
                 // Only show the error screen once retries are genuinely exhausted (truly dead / a codec
                 // the device can't decode, which won't recover and is what "Other streams" is for).
-                val transient = error.errorCode in 2000..3999
-                if (transient && !_isCasting.value && p != null && sourceErrorRetries < MAX_SOURCE_RETRIES) {
+                // IO (2000-2999) = pieces not here yet -> retry generously. PARSING (3000-3999) =
+                // possibly a late moov, but on a genuinely bad container/codec it just loops in a
+                // black screen, so cap it LOW: a couple of quick re-prepares, then fail to the error
+                // screen (which offers "Other streams" + shows the code) rather than looping forever.
+                val isIo = error.errorCode in 2000..2999
+                val isParse = error.errorCode in 3000..3999
+                val cap = if (isParse) 2 else MAX_SOURCE_RETRIES
+                if ((isIo || isParse) && !_isCasting.value && p != null && sourceErrorRetries < cap) {
                     sourceErrorRetries++
                     _uiState.value = PlayerUiState.Buffering(
                         percent = 0,

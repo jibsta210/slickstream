@@ -518,6 +518,20 @@ private fun SeasonSelector(
     }
 }
 
+private val EPISODE_MONTHS =
+    arrayOf("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+/** "2024-11-28" -> "Nov 28, 2024". Null/blank/odd -> null. */
+private fun formatEpisodeAirDate(raw: String?): String? {
+    if (raw.isNullOrBlank()) return null
+    val parts = raw.split("-")
+    if (parts.size != 3) return raw
+    val month = parts[1].toIntOrNull() ?: return raw
+    val day = parts[2].toIntOrNull() ?: return raw
+    val mon = EPISODE_MONTHS.getOrNull(month - 1) ?: return raw
+    return "$mon $day, ${parts[0]}"
+}
+
 @Composable
 private fun EpisodeRow(
     episode: Episode,
@@ -577,13 +591,18 @@ private fun EpisodeRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            episode.runtimeMinutes?.takeIf { it > 0 }?.let { mins ->
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    text = "${mins}m",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Brand.OnSurfaceDim,
-                )
+            run {
+                val date = formatEpisodeAirDate(episode.airDate)
+                val mins = episode.runtimeMinutes?.takeIf { it > 0 }?.let { "${it}m" }
+                val meta = listOfNotNull(date, mins).joinToString("  ·  ")
+                if (meta.isNotBlank()) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = meta,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Brand.OnSurfaceDim,
+                    )
+                }
             }
             if (episode.overview.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
