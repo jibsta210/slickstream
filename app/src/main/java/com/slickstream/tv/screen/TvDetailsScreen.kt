@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
@@ -89,6 +90,10 @@ fun TvDetailsScreen(
             onToggleFavorite = viewModel::toggleFavorite,
             onSelectSeason = viewModel::selectSeason,
             onMediaClick = onMediaClick,
+            onMarkEpisodeWatched = viewModel::markWatched,
+            onMarkEpisodeUnwatched = viewModel::markUnwatched,
+            onMarkMovieWatched = viewModel::markMovieWatched,
+            onMarkMovieUnwatched = viewModel::markMovieUnwatched,
             modifier = modifier,
         )
     }
@@ -102,6 +107,10 @@ private fun DetailsContent(
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
+    onMarkEpisodeWatched: (season: Int, episode: Int) -> Unit,
+    onMarkEpisodeUnwatched: (season: Int, episode: Int) -> Unit,
+    onMarkMovieWatched: () -> Unit,
+    onMarkMovieUnwatched: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val details = state.details ?: return
@@ -154,6 +163,8 @@ private fun DetailsContent(
                     isFavorite = isFavorite,
                     onPlay = onPlay,
                     onToggleFavorite = onToggleFavorite,
+                    onMarkMovieWatched = onMarkMovieWatched,
+                    onMarkMovieUnwatched = onMarkMovieUnwatched,
                 )
             }
 
@@ -170,6 +181,13 @@ private fun DetailsContent(
                         state = state,
                         onPlayEpisode = { ep ->
                             onPlay(MediaType.TV, item.id, ep.seasonNumber, ep.episodeNumber)
+                        },
+                        onToggleWatched = { ep, watched ->
+                            if (watched) {
+                                onMarkEpisodeUnwatched(ep.seasonNumber, ep.episodeNumber)
+                            } else {
+                                onMarkEpisodeWatched(ep.seasonNumber, ep.episodeNumber)
+                            }
                         },
                     )
                 }
@@ -194,6 +212,8 @@ private fun HeroBlock(
     isFavorite: Boolean,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
+    onMarkMovieWatched: () -> Unit,
+    onMarkMovieUnwatched: () -> Unit,
 ) {
     val details = state.details ?: return
     val item = details.item
@@ -300,6 +320,21 @@ private fun HeroBlock(
                 Spacer(Modifier.width(8.dp))
                 Text(if (isFavorite) "Favourited" else "Favourite", style = MaterialTheme.typography.labelLarge)
             }
+
+            // Movies: a focusable Mark watched / unwatched action beside Play + Favourite.
+            if (!state.isTv) {
+                val watched = state.isMovieWatched
+                Button(onClick = { if (watched) onMarkMovieUnwatched() else onMarkMovieWatched() }) {
+                    Icon(
+                        imageVector = if (watched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                        contentDescription = if (watched) "Mark unwatched" else "Mark watched",
+                        tint = if (watched) Brand.Cyan else Color.White,
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (watched) "Watched" else "Mark watched", style = MaterialTheme.typography.labelLarge)
+                }
+            }
         }
     }
 }
@@ -365,6 +400,7 @@ private fun SeasonSelector(
 private fun EpisodeList(
     state: DetailsUiState,
     onPlayEpisode: (Episode) -> Unit,
+    onToggleWatched: (Episode, watched: Boolean) -> Unit,
 ) {
     when {
         state.isLoadingEpisodes -> Box(
@@ -392,6 +428,7 @@ private fun EpisodeList(
                     episode = ep,
                     progress = state.episodeProgress[ep.episodeNumber],
                     onClick = { onPlayEpisode(ep) },
+                    onToggleWatched = { watched -> onToggleWatched(ep, watched) },
                 )
             }
         }
@@ -417,6 +454,7 @@ private fun EpisodeCard(
     episode: Episode,
     progress: Float?,
     onClick: () -> Unit,
+    onToggleWatched: (watched: Boolean) -> Unit,
 ) {
     val shape = RoundedCornerShape(12.dp)
     // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode shows a check.
@@ -539,6 +577,44 @@ private fun EpisodeCard(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+                // D-pad focusable Mark watched / unwatched toggle (distinct focus target from the
+                // card's Play click).
+                val toggleShape = RoundedCornerShape(50)
+                Surface(
+                    onClick = { onToggleWatched(isWatched) },
+                    shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor = Brand.SurfaceVariant,
+                        focusedContainerColor = Brand.Violet,
+                        contentColor = Brand.OnSurface,
+                        focusedContentColor = Color.White,
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        focusedBorder = Border(
+                            border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
+                            shape = toggleShape,
+                        ),
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                            contentDescription = null,
+                            tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = if (isWatched) "Watched" else "Mark watched",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                        )
+                    }
+                }
             }
         }
     }

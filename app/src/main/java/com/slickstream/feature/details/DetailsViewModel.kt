@@ -41,6 +41,8 @@ data class DetailsUiState(
     val episodesError: String? = null,
     /** Local watch progress (percent 0f..1f) for the selected season, keyed by episodeNumber. */
     val episodeProgress: Map<Int, Float> = emptyMap(),
+    /** Whether this movie is marked watched (always false for TV titles). */
+    val isMovieWatched: Boolean = false,
 ) {
     val mediaType: MediaType? get() = details?.item?.mediaType
     val isTv: Boolean get() = mediaType == MediaType.TV
@@ -111,8 +113,10 @@ class DetailsViewModel @Inject constructor(
                     if (details.item.mediaType == MediaType.TV) {
                         playableSeasons.firstOrNull()?.let { selectSeason(it.seasonNumber) }
                     } else {
-                        // Movie: prewarm the torrent NOW (while the user reads the synopsis) so Play
-                        // hits a metadata-cache + 2MB head instead of a cold 30-60s fetch.
+                        // Movie: reflect any saved watched state, then prewarm the torrent NOW (while
+                        // the user reads the synopsis) so Play hits a metadata-cache + 2MB head
+                        // instead of a cold 30-60s fetch.
+                        refreshMovieWatched()
                         warmSource(details, season = null, episode = null)
                     }
                     loadSimilar()
@@ -248,6 +252,59 @@ class DetailsViewModel @Inject constructor(
         val item = _uiState.value.details?.item ?: return
         viewModelScope.launch {
             libraryRepository.toggleFavorite(item)
+        }
+    }
+
+    // --- Mark watched / unwatched ---
+
+    /** Mark an episode fully watched, then refresh the per-episode progress bars. */
+    fun markWatched(season: Int, episode: Int) {
+        val item = _uiState.value.details?.item ?: return
+        viewModelScope.launch {
+            libraryRepository.markWatched(item, season, episode)
+            refreshEpisodeProgress()
+        }
+    }
+
+    /** Clear an episode's watched/in-progress row, then refresh the per-episode progress bars. */
+    fun markUnwatched(season: Int, episode: Int) {
+        val item = _uiState.value.details?.item ?: return
+        viewModelScope.launch {
+            libraryRepository.markUnwatched(item, season, episode)
+            refreshEpisodeProgress()
+        }
+    }
+
+    /** Mark the current movie fully watched. */
+    fun markMovieWatched() {
+        val item = _uiState.value.details?.item ?: return
+        viewModelScope.launch {
+            libraryRepository.markWatched(item, season = null, episode = null)
+            refreshMovieWatched()
+        }
+    }
+
+    /** Clear the current movie's watched/in-progress row. */
+    fun markMovieUnwatched() {
+        val item = _uiState.value.details?.item ?: return
+        viewModelScope.launch {
+            libraryRepository.markUnwatched(item, season = null, episode = null)
+            refreshMovieWatched()
+        }
+    }
+
+    /** Re-read per-episode progress for the currently selected season (after a watched toggle). */
+    private fun refreshEpisodeProgress() {
+        val season = _uiState.value.selectedSeasonNumber ?: return
+        val episodes = _uiState.value.episodes
+        if (episodes.isNotEmpty()) loadEpisodeProgress(season, episodes)
+    }
+
+    /** Re-read the movie's saved row and publish its watched state. */
+    private fun refreshMovieWatched() {
+        viewModelScope.launch {
+            val saved = libraryRepository.getProgress(mediaId, mediaType, season = null, episode = null)
+            _uiState.value = _uiState.value.copy(isMovieWatched = saved?.isFinished == true)
         }
     }
 }

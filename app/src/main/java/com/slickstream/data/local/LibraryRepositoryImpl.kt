@@ -52,11 +52,8 @@ class LibraryRepositoryImpl @Inject constructor(
         watchHistoryDao.observeAll().map { rows -> rows.map(WatchHistoryEntity::toWatchHistoryItem) }
 
     override suspend fun saveProgress(item: MediaItem, progress: PlaybackProgress) {
-        // A finished title shouldn't linger in the "Continue watching" rail.
-        if (progress.isFinished) {
-            watchHistoryDao.deleteById(item.id, item.mediaType)
-            return
-        }
+        // UPSERT always — even a finished episode persists (as 'watched'). The "Continue watching"
+        // rail filters finished rows out downstream (HomeViewModel), so it isn't shown there.
         watchHistoryDao.upsert(
             WatchHistoryEntity.from(item, progress, addedAt = System.currentTimeMillis()),
         )
@@ -67,18 +64,46 @@ class LibraryRepositoryImpl @Inject constructor(
         type: MediaType,
         season: Int?,
         episode: Int?,
-    ): PlaybackProgress? {
-        val row = watchHistoryDao.getByMedia(id, type) ?: return null
-        // For TV, only return the stored resume point if it matches the requested episode.
-        if (type == MediaType.TV && (row.season != season || row.episode != episode)) return null
-        return row.toPlaybackProgress()
-    }
+    ): PlaybackProgress? =
+        watchHistoryDao
+            .getByEpisode(id, type, season ?: WatchHistoryEntity.NO_KEY, episode ?: WatchHistoryEntity.NO_KEY)
+            ?.toPlaybackProgress()
 
     override suspend fun removeFromHistory(id: Int, type: MediaType) {
-        watchHistoryDao.deleteById(id, type)
+        // Remove the whole title (all episodes) from history.
+        watchHistoryDao.deleteAllForMedia(id, type)
     }
 
     override suspend fun clearHistory() {
         watchHistoryDao.clear()
+    }
+
+    override suspend fun markWatched(item: MediaItem, season: Int?, episode: Int?) {
+        // Sentinel finished row: position == duration == 1 -> percent == 1.0f (>= 0.92f).
+        val now = System.currentTimeMillis()
+        val progress = PlaybackProgress(
+            mediaId = item.id,
+            mediaType = item.mediaType,
+            season = season,
+            episode = episode,
+            positionMs = WATCHED_SENTINEL_MS,
+            durationMs = WATCHED_SENTINEL_MS,
+            updatedAt = now,
+        )
+        watchHistoryDao.upsert(WatchHistoryEntity.from(item, progress, addedAt = now))
+    }
+
+    override suspend fun markUnwatched(item: MediaItem, season: Int?, episode: Int?) {
+        watchHistoryDao.deleteEpisode(
+            item.id,
+            item.mediaType,
+            season ?: WatchHistoryEntity.NO_KEY,
+            episode ?: WatchHistoryEntity.NO_KEY,
+        )
+    }
+
+    private companion object {
+        /** position == duration == 1ms -> percent 1.0f, so the row reads as finished/watched. */
+        const val WATCHED_SENTINEL_MS = 1L
     }
 }

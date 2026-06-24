@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -53,9 +54,20 @@ class HomeViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
-    /** Live "Continue Watching" feed from the local library. */
+    /**
+     * Live "Continue Watching" feed from the local library. The store now keeps a row per episode
+     * (incl. finished ones marked watched), so here we (a) drop finished rows so a watched item
+     * leaves the rail, and (b) collapse to the single most-recent in-progress row per title. The
+     * underlying flow is already ordered most-recent-first.
+     */
     private val history: StateFlow<List<WatchHistoryItem>> =
         libraryRepository.observeHistory()
+            .map { rows ->
+                rows.asSequence()
+                    .filterNot { it.progress.isFinished }
+                    .distinctBy { it.media.id to it.media.mediaType }
+                    .toList()
+            }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     init {

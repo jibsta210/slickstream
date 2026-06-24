@@ -49,6 +49,12 @@ interface LibraryRepository {
     suspend fun getProgress(id: Int, type: MediaType, season: Int?, episode: Int?): PlaybackProgress?
     suspend fun removeFromHistory(id: Int, type: MediaType)
     suspend fun clearHistory()
+
+    /** Mark a movie (season/episode null) or a specific episode as fully watched (a finished row). */
+    suspend fun markWatched(item: MediaItem, season: Int?, episode: Int?)
+
+    /** Clear the watched/in-progress row for a movie or a specific episode. */
+    suspend fun markUnwatched(item: MediaItem, season: Int?, episode: Int?)
 }
 
 /**

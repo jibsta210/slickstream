@@ -22,6 +22,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -89,6 +91,10 @@ fun DetailsScreen(
                 onToggleFavorite = viewModel::toggleFavorite,
                 onSelectSeason = viewModel::selectSeason,
                 onMediaClick = onMediaClick,
+                onMarkEpisodeWatched = viewModel::markWatched,
+                onMarkEpisodeUnwatched = viewModel::markUnwatched,
+                onMarkMovieWatched = viewModel::markMovieWatched,
+                onMarkMovieUnwatched = viewModel::markMovieUnwatched,
             )
 
             state.isLoading -> LoadingState(Modifier.fillMaxSize())
@@ -125,6 +131,10 @@ private fun DetailsContent(
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
+    onMarkEpisodeWatched: (season: Int, episode: Int) -> Unit,
+    onMarkEpisodeUnwatched: (season: Int, episode: Int) -> Unit,
+    onMarkMovieWatched: () -> Unit,
+    onMarkMovieUnwatched: () -> Unit,
 ) {
     val item = details.item
 
@@ -163,32 +173,39 @@ private fun DetailsContent(
             }
         }
 
-        // --- Actions: Play + favourite heart ---
+        // --- Actions: Play + favourite heart (+ Mark watched for movies) ---
         item("actions") {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val isTv = item.mediaType == MediaType.TV
-                val firstSeason = state.selectedSeasonNumber ?: state.seasons.firstOrNull()?.seasonNumber
-                PlayButton(
-                    label = if (isTv) "Play S${firstSeason ?: 1}" else "Play",
-                    onClick = {
-                        if (isTv) {
-                            onPlay(item.mediaType, item.id, firstSeason ?: 1, 1)
-                        } else {
-                            onPlay(item.mediaType, item.id, null, null)
-                        }
-                    },
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(12.dp))
-                FavoriteHeart(
-                    isFavorite = isFavorite,
-                    onToggle = onToggleFavorite,
-                )
+            val isTv = item.mediaType == MediaType.TV
+            val firstSeason = state.selectedSeasonNumber ?: state.seasons.firstOrNull()?.seasonNumber
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PlayButton(
+                        label = if (isTv) "Play S${firstSeason ?: 1}" else "Play",
+                        onClick = {
+                            if (isTv) {
+                                onPlay(item.mediaType, item.id, firstSeason ?: 1, 1)
+                            } else {
+                                onPlay(item.mediaType, item.id, null, null)
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    FavoriteHeart(
+                        isFavorite = isFavorite,
+                        onToggle = onToggleFavorite,
+                    )
+                }
+                // Movies: an explicit Mark watched / unwatched toggle next to Play/Favourite.
+                if (!isTv) {
+                    Spacer(Modifier.height(12.dp))
+                    MarkWatchedButton(
+                        isWatched = state.isMovieWatched,
+                        onToggle = {
+                            if (state.isMovieWatched) onMarkMovieUnwatched() else onMarkMovieWatched()
+                        },
+                    )
+                }
             }
         }
 
@@ -266,8 +283,10 @@ private fun DetailsContent(
                     items = state.episodes,
                     key = { "ep-${it.seasonNumber}-${it.episodeNumber}" },
                 ) { episode ->
+                    val progress = state.episodeProgress[episode.episodeNumber] ?: 0f
                     EpisodeRow(
                         episode = episode,
+                        progress = progress,
                         onPlay = {
                             onPlay(
                                 item.mediaType,
@@ -275,6 +294,13 @@ private fun DetailsContent(
                                 episode.seasonNumber,
                                 episode.episodeNumber,
                             )
+                        },
+                        onToggleWatched = {
+                            if (progress >= 0.92f) {
+                                onMarkEpisodeUnwatched(episode.seasonNumber, episode.episodeNumber)
+                            } else {
+                                onMarkEpisodeWatched(episode.seasonNumber, episode.episodeNumber)
+                            }
                         },
                     )
                 }
@@ -546,9 +572,13 @@ private fun formatEpisodeAirDate(raw: String?): String? {
 @Composable
 private fun EpisodeRow(
     episode: Episode,
+    progress: Float,
     onPlay: () -> Unit,
+    onToggleWatched: () -> Unit,
 ) {
     val context = LocalContext.current
+    // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode reads as watched.
+    val isWatched = progress >= 0.92f
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -592,6 +622,36 @@ private fun EpisodeRow(
                     )
                 }
             }
+            // Watched check overlay in the top-end corner of the still.
+            if (isWatched) {
+                Icon(
+                    imageVector = Icons.Rounded.CheckCircle,
+                    contentDescription = null,
+                    tint = Brand.Cyan,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(4.dp)
+                        .size(20.dp),
+                )
+            }
+            // Thin resume/progress bar pinned to the bottom of the still. No bar at 0.
+            if (progress > 0f) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .matchProgressBarWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(bottomStart = 10.dp, bottomEnd = 10.dp))
+                        .background(Color.Black.copy(alpha = 0.33f)),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(progress.coerceIn(0f, 1f))
+                            .fillMaxSize()
+                            .background(Brand.Violet),
+                    )
+                }
+            }
         }
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
@@ -625,6 +685,66 @@ private fun EpisodeRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+        }
+        // Mark watched / unwatched toggle — filled check when watched, outline when not.
+        Spacer(Modifier.width(8.dp))
+        Surface(
+            onClick = onToggleWatched,
+            shape = CircleShape,
+            color = Color.Transparent,
+            modifier = Modifier.size(40.dp),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                    contentDescription = if (isWatched) {
+                        "Mark episode ${episode.episodeNumber} unwatched"
+                    } else {
+                        "Mark episode ${episode.episodeNumber} watched"
+                    },
+                    tint = if (isWatched) Brand.Cyan else Brand.OnSurfaceDim,
+                    modifier = Modifier.size(24.dp),
+                )
+            }
+        }
+    }
+}
+
+/** Matches the still width so the progress bar spans exactly the thumbnail. */
+private fun Modifier.matchProgressBarWidth(): Modifier = this.width(132.dp)
+
+/** Movie-only "Mark watched" / "Mark unwatched" pill, sitting under the Play/Favourite row. */
+@Composable
+private fun MarkWatchedButton(
+    isWatched: Boolean,
+    onToggle: () -> Unit,
+) {
+    Surface(
+        onClick = onToggle,
+        shape = RoundedCornerShape(14.dp),
+        color = Brand.SurfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(46.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                contentDescription = null,
+                tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = if (isWatched) "Watched" else "Mark watched",
+                style = MaterialTheme.typography.labelLarge,
+                color = Brand.OnSurface,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
     }
 }
