@@ -115,10 +115,20 @@ class TorrentStreamerImpl @Inject constructor(
                 val headReady = headBytes >= READY_HEAD_BYTES
                 if (headReady && headReadySince == 0L) headReadySince = System.currentTimeMillis()
                 // Prefer having the tail (mp4 moov / mkv cues) so playback starts instantly, but
-                // don't block forever if those pieces lag — fall back after a short grace window.
+                // don't block forever if those pieces lag — fall back after a grace window.
                 val tailReady = engine.tailAvailable(infoHash)
+                // mp4/m4v/mov carry the moov atom (MANDATORY before the first frame) at EOF. Unlike
+                // mkv — whose cues are only needed to SEEK, so it can start head-only — an mp4 that
+                // starts without its tail makes ExoPlayer attach, range to the missing moov, and
+                // dead-end on a parse/IO error. So give moov-critical containers a much longer hard
+                // cap to wait for the real tail (which prioritizeHeadAndTail is fetching aggressively);
+                // only if even that lapses do they start anyway, so the player's retries + source
+                // failover can take over instead of looping forever. mkv keeps the snappy 8s grace.
+                val ext = engine.selectedFileExt(infoHash)
+                val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
+                val graceMs = if (moovCritical) MP4_TAIL_HARD_CAP_MS else TAIL_GRACE_MS
                 val tailGraceElapsed =
-                    headReadySince > 0L && System.currentTimeMillis() - headReadySince > TAIL_GRACE_MS
+                    headReadySince > 0L && System.currentTimeMillis() - headReadySince > graceMs
                 val canStart = headReady && (tailReady || tailGraceElapsed)
 
                 if (pollCount++ % DIAG_EVERY == 0) {
@@ -352,8 +362,12 @@ class TorrentStreamerImpl @Inject constructor(
         /** Contiguous head bytes required before we declare READY (~2 MB — enough to start). */
         private const val READY_HEAD_BYTES = 2L * 1024L * 1024L
 
-        /** Max wait for the tail (moov/cues) after the head is ready before starting anyway. */
+        /** Max wait for the tail (mkv cues) after the head is ready before starting anyway. */
         private const val TAIL_GRACE_MS = 8_000L
+
+        /** Longer hard cap for moov-critical mp4/m4v/mov: wait this long for the EOF moov before
+         *  starting head-only (then the player's retries + source failover handle a truly-absent moov). */
+        private const val MP4_TAIL_HARD_CAP_MS = 30_000L
 
         /** Emit a diagnostic log line every Nth poll (~2 s at a 500 ms interval). */
         private const val DIAG_EVERY = 4

@@ -379,13 +379,22 @@ class TorrentEngine @Inject constructor(
         val files = info.files()
         val numFiles = files.numFiles()
 
-        val chosen = preferredFileIndex
-            ?.takeIf { it in 0 until numFiles }
-            ?: (0 until numFiles)
-                .filter { isVideoFile(files.fileName(it)) }
-                .maxByOrNull { files.fileSize(it) }
-            ?: (0 until numFiles).maxByOrNull { files.fileSize(it) }
-            ?: 0
+        // A supplied preferred index is only honoured if it actually points at a (non-sample) video
+        // file — otherwise an indexer's stale fileIdx could land us on a .nfo/.srt/sample clip.
+        val prefValid = preferredFileIndex
+            ?.takeIf { it in 0 until numFiles && isVideoFile(files.fileName(it)) && !isSampleFile(files.fileName(it)) }
+
+        // The largest REAL video file (sample clips excluded). Deliberately NO fallback to "largest
+        // file overall": a RAR/disc release (.rar/.r00/.iso/.001…) contains no playable video, and
+        // handing the biggest archive part to ExoPlayer just dead-ends on a parse error. Fail hard
+        // instead so the player auto-fails-over to a real single-file source (the player treats this
+        // thrown error as a source failure and advances to the next candidate).
+        val largestVideo = (0 until numFiles)
+            .filter { isVideoFile(files.fileName(it)) && !isSampleFile(files.fileName(it)) }
+            .maxByOrNull { files.fileSize(it) }
+
+        val chosen = prefValid ?: largestVideo
+            ?: error("No playable video file in this torrent (archive/RAR release)")
 
         active.fileIndex = chosen
         active.fileLength = files.fileSize(chosen)
@@ -572,6 +581,14 @@ class TorrentEngine @Inject constructor(
 
     /** Absolute path of the selected file, once chosen. */
     fun filePath(infoHash: String): String? = torrents[infoHash]?.filePath
+
+    /**
+     * Lowercase extension of the selected file (e.g. "mp4" / "mkv"), or null until a file is chosen.
+     * The streamer uses this to know whether the container needs its EOF moov atom before the first
+     * frame (mp4/m4v/mov) — those must not start on the short tail-grace the way an mkv can.
+     */
+    fun selectedFileExt(infoHash: String): String? =
+        torrents[infoHash]?.filePath?.substringAfterLast('.', "")?.lowercase()?.takeIf { it.isNotBlank() }
 
     /** Length in bytes of the selected file. */
     fun fileLength(infoHash: String): Long = torrents[infoHash]?.fileLength ?: 0L
@@ -771,6 +788,9 @@ class TorrentEngine @Inject constructor(
             val ext = name?.substringAfterLast('.', "")?.lowercase() ?: return false
             return ext in VIDEO_EXTS
         }
+
+        /** A "sample" clip bundled alongside the real release — never the file we want to stream. */
+        fun isSampleFile(name: String?): Boolean = name?.contains("sample", ignoreCase = true) == true
     }
 }
 

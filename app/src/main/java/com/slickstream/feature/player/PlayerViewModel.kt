@@ -177,6 +177,18 @@ class PlayerViewModel @Inject constructor(
     private var currentMediaUrl: String? = null
     private var castPlayer: CastPlayer? = null
 
+    // --- Automatic source failover ---
+    /** infoHashes already attempted for THIS title/episode — failover never re-picks one. */
+    private val triedInfoHashes = mutableSetOf<String>()
+    /** Automatic failovers since the last fresh load()/episode switch; capped to avoid churn. */
+    private var failoverCount = 0
+    /** Set synchronously while a failover is in progress so two triggers can't fire it twice. */
+    private var failoverInFlight = false
+    /** Watchdog that fails over when a source never reaches playable (dead / fake-seeded swarm). */
+    private var bufferWatchdogJob: Job? = null
+    /** Last downloadedBytes the streamer emitted — the watchdog's head-progress signal. */
+    @Volatile private var lastEmittedDownloadedBytes: Long = 0L
+
     // --- "Stuck buffering -> try a smaller stream" hint ---
     /** When the current continuous buffer began (uptime ms); 0 while not buffering. */
     private var bufferingSinceMs: Long = 0L
@@ -260,6 +272,9 @@ class PlayerViewModel @Inject constructor(
                 return@launch
             }
             _sources.value = list.sortedByDescending { it.rank }
+            // Fresh title -> fresh failover budget over the new candidate list.
+            triedInfoHashes.clear()
+            failoverCount = 0
 
             // Auto-pick the best source within the user's per-network quality cap.
             val best = pickPreferred(list, networkQualityPreference())
@@ -275,6 +290,7 @@ class PlayerViewModel @Inject constructor(
         viewModelScope.launch {
             // Persist where we are before tearing the current stream down.
             saveProgressNow()
+            bufferWatchdogJob?.cancel()
             stopActiveStream(removeFiles = false)
             startSource(source)
         }
@@ -326,6 +342,11 @@ class PlayerViewModel @Inject constructor(
         _currentSource.value = source
         hasSeekedToResume = false
         activeInfoHash = source.infoHash
+        // Record this attempt so failover never loops back to a source we've already tried, and clear
+        // the in-flight guard now that a new attempt is actually underway.
+        triedInfoHashes.add(source.infoHash)
+        failoverInFlight = false
+        lastEmittedDownloadedBytes = 0L
         prefetchTriggeredForEpisode = false
         prefetchJob?.cancel()
         // Fresh source — re-arm the smaller-stream hint and start its buffering clock.
@@ -345,9 +366,87 @@ class PlayerViewModel @Inject constructor(
                 handleStatus(status, source)
             }
         }
+
+        // Buffering watchdog: the dead-/fake-seeded-swarm case never reaches onPlayerError (no player
+        // is ever built), so it would otherwise spin on "Buffering…" forever. If this source hasn't
+        // become playable within the budget AND the contiguous head hasn't grown for a while, fail
+        // over to the next source. The dual condition (total budget + flat head) distinguishes a
+        // genuinely dead swarm from a slow-but-alive one, so we never punish a swarm still trickling in.
+        bufferWatchdogJob?.cancel()
+        bufferWatchdogJob = viewModelScope.launch {
+            var lastHead = -1L
+            var lastProgressAt = android.os.SystemClock.elapsedRealtime()
+            while (isActive) {
+                delay(WATCHDOG_TICK_MS)
+                if (_uiState.value is PlayerUiState.Playing) return@launch
+                val now = android.os.SystemClock.elapsedRealtime()
+                val head = lastEmittedDownloadedBytes
+                if (head > lastHead) {
+                    lastHead = head
+                    lastProgressAt = now
+                }
+                val sinceStart = now - bufferingSinceMs
+                val stalled = now - lastProgressAt
+                if (sinceStart >= FAILOVER_BUFFER_BUDGET_MS && stalled >= WATCHDOG_STALL_MS) {
+                    if (!failoverToNext()) {
+                        _uiState.value = PlayerUiState.Error("Couldn't start any source for this title.")
+                    }
+                    return@launch
+                }
+            }
+        }
+    }
+
+    /**
+     * Advance to the next-best UNTRIED source automatically. Returns true if another source was
+     * started, false when none remain (the caller then shows the terminal error). Walks DOWN the same
+     * ranked list the original auto-pick used (same quality cap + size pref), skipping every hash we
+     * already tried — so a dead/fake-seeded swarm, a missing-moov mp4, or an unplayable container
+     * self-heals to a real source instead of spinning or dead-ending on a manual "Other streams".
+     */
+    private suspend fun failoverToNext(): Boolean {
+        if (failoverInFlight) return true
+        if (failoverCount >= MAX_FAILOVERS) return false
+        val remaining = _sources.value.filter { it.infoHash !in triedInfoHashes }
+        if (remaining.isEmpty()) return false
+        // Claim synchronously (before any suspension) so the watchdog + onPlayerError can't both fire.
+        failoverInFlight = true
+        failoverCount++
+        val pref = currentNetworkMaxTier ?: networkQualityPreference().maxTier
+        val sizePref = settingsRepository.current().streamSize
+        val next = StreamPicker.pick(remaining, pref, sizePref, deviceProfile.isLowPower)
+            ?: remaining.first()
+        _suggestSmaller.value = false
+        _uiState.value = PlayerUiState.Buffering(
+            percent = 0,
+            seeders = next.seeders ?: 0,
+            downloadRateBytes = 0,
+            label = "Trying another source…",
+        )
+        // Keep the just-failed partial in cache, then tear the poisoned player down so ensurePlayer()
+        // rebuilds a clean one on the new URL. startSource() re-arms failoverInFlight = false.
+        stopActiveStream(removeFiles = false)
+        teardownPlayerForFailover()
+        startSource(next)
+        return true
+    }
+
+    /** Release the current (dead-ended) ExoPlayer so the next [ensurePlayer] builds a clean one. */
+    private fun teardownPlayerForFailover() {
+        bufferWatchdogJob?.cancel()
+        progressTickJob?.cancel()
+        val exo = _player.value
+        playerListener?.let { exo?.removeListener(it) }
+        exo?.release()
+        _player.value = null
+        if (!_isCasting.value) _currentPlayer.value = null
+        currentMediaUrl = null
+        sourceErrorRetries = 0
     }
 
     private fun handleStatus(status: StreamStatus, source: StreamSource) {
+        // Feed the buffering watchdog's head-progress signal on every emission.
+        lastEmittedDownloadedBytes = status.downloadedBytes
         val url = status.streamUrl
         if (url != null) {
             ensurePlayer(url)
@@ -358,7 +457,12 @@ class PlayerViewModel @Inject constructor(
         }
 
         if (status.state == StreamState.ERROR) {
-            _uiState.value = PlayerUiState.Error(status.errorMessage ?: "Streaming failed.")
+            // Metadata fetch failed / engine unavailable / no-playable-file (RAR release). Auto-advance
+            // to the next untried source before ever showing a terminal error.
+            val msg = status.errorMessage ?: "Streaming failed."
+            viewModelScope.launch {
+                if (!failoverToNext()) _uiState.value = PlayerUiState.Error(msg)
+            }
             return
         }
 
@@ -564,10 +668,20 @@ class PlayerViewModel @Inject constructor(
                         runCatching { p.prepare(); p.playWhenReady = true }
                     }
                 } else {
-                    // Surface the specific code so a recurring failure is diagnosable (e.g. a codec
-                    // this device can't decode vs a bad container).
+                    // Per-source ExoPlayer retries are spent (dead moov / bad container / a codec this
+                    // device can't decode). Before dead-ending, hand off to the next untried source
+                    // automatically; only surface the error (with its code) once every candidate is
+                    // exhausted. Casting can't fail over locally, so it still shows the error.
                     val msg = error.localizedMessage ?: "Playback error"
-                    _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                    if (!_isCasting.value) {
+                        viewModelScope.launch {
+                            if (!failoverToNext()) {
+                                _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                            }
+                        }
+                    } else {
+                        _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                    }
                 }
             }
         }
@@ -918,6 +1032,7 @@ class PlayerViewModel @Inject constructor(
         viewModelScope.launch {
             // Persist where we are in the OUTGOING episode before switching coords.
             saveProgressNow()
+            bufferWatchdogJob?.cancel()
             stopActiveStream(removeFiles = false)
             prefetchJob?.cancel()
             prefetchedInfoHash = null
@@ -954,6 +1069,9 @@ class PlayerViewModel @Inject constructor(
                 return@launch
             }
             _sources.value = list.sortedByDescending { it.rank }
+            // Fresh episode -> fresh failover budget over the new candidate list.
+            triedInfoHashes.clear()
+            failoverCount = 0
             val best = pickPreferred(list, networkQualityPreference())
             startSource(best)
         }
@@ -988,6 +1106,7 @@ class PlayerViewModel @Inject constructor(
         saveProgressNow()
         progressTickJob?.cancel()
         streamJob?.cancel()
+        bufferWatchdogJob?.cancel()
         prefetchJob?.cancel() // warmed next-episode torrent stays paused + cached intentionally
         val exo = _player.value
         playerListener?.let { exo?.removeListener(it) }
@@ -1014,6 +1133,15 @@ class PlayerViewModel @Inject constructor(
         /** Backstop: re-prepare the player up to this many times after a load gives up entirely. */
         const val MAX_SOURCE_RETRIES = 8
         const val SOURCE_RETRY_BACKOFF_MS = 1_500L
+
+        /** Cap automatic source failovers per title so a wholly-dead title can't loop forever. */
+        const val MAX_FAILOVERS = 5
+        /** Pre-player buffering wall-clock before the watchdog will consider a source a failure. */
+        const val FAILOVER_BUFFER_BUDGET_MS = 45_000L
+        /** Watchdog poll cadence while waiting for a source to become playable. */
+        const val WATCHDOG_TICK_MS = 3_000L
+        /** Head bytes flat this long (while still not playing) = stalled swarm -> fail over. */
+        const val WATCHDOG_STALL_MS = 20_000L
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L
