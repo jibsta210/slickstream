@@ -223,7 +223,13 @@ fun TvPlayerScreen(
                 canSwitchSource = sources.size > 1,
                 onSwitchSource = { panelOpen = true },
             )
-            is PlayerUiState.Error -> ErrorOverlay(message = s.message, onRetry = viewModel::retry, onBack = onBack)
+            is PlayerUiState.Error -> ErrorOverlay(
+                message = s.message,
+                onRetry = viewModel::retry,
+                onBack = onBack,
+                canSwitchSource = sources.size > 1,
+                onSwitchSource = { panelOpen = true },
+            )
             PlayerUiState.Playing -> Unit
         }
 
@@ -348,7 +354,12 @@ private fun BufferingOverlay(
     onSwitchSource: () -> Unit = {},
 ) {
     val backFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { backFocus.requestFocus() } }
+    LaunchedEffect(Unit) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { backFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -385,12 +396,9 @@ private fun BufferingOverlay(
             // Focusable actions so the user is never stranded on the fetch/buffer screen — and can
             // switch to a healthier torrent without waiting for playback to start (parity with phone).
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                androidx.tv.material3.Button(
-                    onClick = onBack,
-                    modifier = Modifier.focusRequester(backFocus),
-                ) { Text("Back") }
+                ErrorButton("Back", onClick = onBack, focusRequester = backFocus)
                 if (canSwitchSource) {
-                    androidx.tv.material3.Button(onClick = onSwitchSource) { Text("Switch source") }
+                    ErrorButton("Switch source", onClick = onSwitchSource)
                 }
             }
         }
@@ -398,9 +406,22 @@ private fun BufferingOverlay(
 }
 
 @Composable
-private fun ErrorOverlay(message: String, onRetry: () -> Unit, onBack: () -> Unit) {
+private fun ErrorOverlay(
+    message: String,
+    onRetry: () -> Unit,
+    onBack: () -> Unit,
+    canSwitchSource: Boolean = false,
+    onSwitchSource: () -> Unit = {},
+) {
     val retryFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { retryFocus.requestFocus() } }
+    // Retry past layout so focus reliably lands on "Try again" — a single requestFocus() fired
+    // before the buttons existed, which is why nothing was highlighted.
+    LaunchedEffect(Unit) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { retryFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
     Box(
         modifier = Modifier.fillMaxSize().background(Color(0xE6000000)),
         contentAlignment = Alignment.Center,
@@ -408,15 +429,43 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit, onBack: () -> Uni
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(20.dp),
-            modifier = Modifier.width(560.dp),
+            modifier = Modifier.width(620.dp),
         ) {
             Text("Playback failed", style = MaterialTheme.typography.titleLarge, color = Color.White)
             Text(message, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                androidx.tv.material3.Button(onClick = onRetry, modifier = Modifier.focusRequester(retryFocus)) { Text("Try again") }
-                androidx.tv.material3.Button(onClick = onBack) { Text("Back") }
+                ErrorButton("Try again", onClick = onRetry, focusRequester = retryFocus)
+                if (canSwitchSource) ErrorButton("Other streams", onClick = onSwitchSource)
+                ErrorButton("Back", onClick = onBack)
             }
         }
+    }
+}
+
+/** Error/overlay action button with an unmistakable focus highlight (violet fill + white ring). */
+@Composable
+private fun ErrorButton(
+    label: String,
+    onClick: () -> Unit,
+    focusRequester: FocusRequester? = null,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+        modifier = if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier,
+    ) {
+        Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp))
     }
 }
 
