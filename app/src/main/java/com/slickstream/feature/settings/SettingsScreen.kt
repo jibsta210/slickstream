@@ -31,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -291,7 +292,7 @@ private fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
-        color = if (selected) Brand.Background else Brand.OnSurface,
+        color = if (selected) Color.White else Brand.OnSurface,
         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
         modifier = Modifier
             .clip(RoundedCornerShape(50))

@@ -1,8 +1,10 @@
 package com.slickstream.tv.screen
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -13,6 +15,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
@@ -57,6 +60,7 @@ fun TvCatalogScreen(
         state.isLoading && state.isEmpty -> TvLoading(modifier)
         state.errorMessage != null && state.isEmpty ->
             TvErrorRetry(message = state.errorMessage!!, onRetry = viewModel::retry, modifier = modifier)
+        state.isEmpty -> TvCenteredMessage("Nothing to show right now.", modifier)
         else -> CatalogContent(state, categories, onMediaClick, onPlayClick, onCategoryClick, modifier)
     }
 }
@@ -91,7 +95,8 @@ private fun CatalogContent(
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(26.dp),
-        contentPadding = PaddingValues(top = 24.dp, bottom = 48.dp),
+        // Outer top trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+        contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp),
     ) {
         if (carouselItems.isNotEmpty()) {
             item(key = "featured-carousel") {
@@ -113,7 +118,7 @@ private fun CatalogContent(
 @Composable
 private fun TvCategoryChipRow(categories: List<Genre>, onCategoryClick: (Int, String) -> Unit) {
     LazyRow(
-        contentPadding = PaddingValues(horizontal = 48.dp),
+        contentPadding = PaddingValues(horizontal = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         items(items = categories, key = { it.id }) { genre ->
@@ -135,11 +140,16 @@ private fun TvCategoryChipRow(categories: List<Genre>, onCategoryClick: (Int, St
                 ),
                 scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
             ) {
-                Text(
-                    text = genre.name,
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
-                )
+                // Standard TV pill: fixed 48.dp height + 22.dp horizontal pad, titleSmall.
+                Box(
+                    modifier = Modifier.height(48.dp).padding(horizontal = 22.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    Text(
+                        text = genre.name,
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                }
             }
         }
     }

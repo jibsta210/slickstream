@@ -321,6 +321,8 @@ private fun SeasonSelector(
             text = "Seasons",
             style = MaterialTheme.typography.titleMedium,
             color = Brand.OnSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(start = 48.dp),
         )
         LazyRow(
@@ -329,7 +331,7 @@ private fun SeasonSelector(
         ) {
             items(seasons, key = { it.seasonNumber }) { season ->
                 val isSelected = season.seasonNumber == selected
-                val shape = RoundedCornerShape(12.dp)
+                val shape = RoundedCornerShape(50)
                 Surface(
                     onClick = { onSelect(season.seasonNumber) },
                     shape = ClickableSurfaceDefaults.shape(shape = shape),
@@ -341,7 +343,7 @@ private fun SeasonSelector(
                     ),
                     border = ClickableSurfaceDefaults.border(
                         focusedBorder = Border(
-                            border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
+                            border = androidx.compose.foundation.BorderStroke(3.dp, Color.White),
                             shape = shape,
                         ),
                     ),

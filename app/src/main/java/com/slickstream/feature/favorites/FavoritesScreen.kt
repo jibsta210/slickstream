@@ -95,7 +95,7 @@ private fun FavoritesFilterChips(
                     .clip(RoundedCornerShape(50))
                     .background(if (isSelected) Brand.Violet else Brand.SurfaceVariant)
                     .clickable { onSelect(filter) }
-                    .padding(horizontal = 18.dp, vertical = 10.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
             )
         }
     }

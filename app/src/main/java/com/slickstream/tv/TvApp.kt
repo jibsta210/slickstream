@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -93,7 +95,15 @@ fun TvApp() {
                     )
                 }
 
-                Box(Modifier.weight(1f).fillMaxSize()) {
+                // 10-foot TV safe area (overscan): one consistent inset for ALL section content,
+                // so nothing renders at the physical panel edge. Per-screen outer paddings are
+                // trimmed to small values to avoid double-insetting on top of this.
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxSize()
+                        .padding(horizontal = 32.dp, vertical = 27.dp),
+                ) {
                     NavHost(
                         navController = navController,
                         startDestination = Routes.HOME,

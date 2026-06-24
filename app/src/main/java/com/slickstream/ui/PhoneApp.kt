@@ -453,6 +453,9 @@ private fun BottomBar(
                         text = destination.label,
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        softWrap = false,
                     )
                 },
                 alwaysShowLabel = true,

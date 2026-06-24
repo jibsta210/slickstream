@@ -107,6 +107,17 @@ fun CategoryScreen(
                 )
             }
 
+            !state.isLoading && state.error == null && state.isEmpty -> Box(
+                Modifier.fillMaxSize().padding(24.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "Nothing here yet",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Brand.OnSurfaceDim,
+                )
+            }
+
             else -> LazyVerticalGrid(
                 state = gridState,
                 columns = GridCells.Adaptive(minSize = 120.dp),
@@ -184,12 +195,14 @@ private fun CategoryTopBar(title: String, mediaType: MediaType, onBack: () -> Un
             color = Brand.OnSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
         )
         Text(
             text = "  ·  ${if (mediaType == MediaType.MOVIE) "Movies" else "TV"}",
             style = MaterialTheme.typography.titleMedium,
             color = Brand.OnSurfaceDim,
             maxLines = 1,
+            softWrap = false,
         )
     }
 }

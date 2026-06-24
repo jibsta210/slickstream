@@ -23,7 +23,11 @@ object StreamPicker {
         if (list.isEmpty()) return null
         val effectiveTier = if (lowPower) minOf(maxTier, QualityPreference.FHD_1080.maxTier) else maxTier
         val capped = list.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }.ifEmpty { list }
-        val healthy = capped.filter { (it.seeders ?: 0) >= MIN_SEEDERS }.ifEmpty { capped }
+        val seeded = capped.filter { (it.seeders ?: 0) >= MIN_SEEDERS }.ifEmpty { capped }
+        // Default to English: torrent names usually flag the language (Cyrillic/CJK script, or tags
+        // like RUS/VOSTFR/Dublado). Prefer the English-looking ones; only fall back to the rest if
+        // there are none (don't leave the user with no playable option).
+        val healthy = seeded.filter { it.englishLikely }.ifEmpty { seeded }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
                 healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
@@ -46,5 +50,21 @@ object StreamPicker {
             }
         }
         return picked ?: list.first()
+    }
+
+    // Cyrillic + CJK (hiragana/katakana/CJK ideographs) — a hard non-English signal in a torrent name.
+    private val NON_LATIN = Regex("[\\u0400-\\u04FF\\u3040-\\u30FF\\u4E00-\\u9FFF]")
+    // Common language tags torrents use. 3-letter codes are bounded to avoid matching 'challenge' etc.
+    private val FOREIGN = Regex(
+        "(?i)\\b(rus|russian|ita|italian|ger|german|deutsch|fre|french|vostfr|truefrench|spa|spanish|" +
+            "castellano|latino|hindi|tamil|telugu|kor|korean|jpn|japanese|chi|chinese|dublado|legendado)\\b",
+    )
+    private val ENGLISH = Regex("(?i)\\b(eng|english)\\b")
+
+    /** True unless the torrent text clearly signals a non-English language (with no English tag). */
+    fun looksEnglish(text: String): Boolean {
+        if (NON_LATIN.containsMatchIn(text)) return false
+        if (FOREIGN.containsMatchIn(text)) return ENGLISH.containsMatchIn(text)
+        return true
     }
 }

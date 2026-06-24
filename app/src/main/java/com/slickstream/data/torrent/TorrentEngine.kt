@@ -256,6 +256,17 @@ class TorrentEngine @Inject constructor(
     suspend fun addMagnet(magnetUri: String, preferredFileIndex: Int?): String {
         ensureStarted()
 
+        // Fast path: the Details prewarm may already have this torrent live. Re-attach instead of
+        // re-resolving metadata — a second metadata fetch on an already-added torrent dead-latches
+        // for the full 60s timeout (the "stuck fetching metadata, 2000 seeders" bug).
+        parseInfoHash(magnetUri)?.let { h ->
+            val existing = torrents[h]
+            if (existing?.handle?.isValid == true) {
+                existing.handle?.let { applySequentialAndPriority(it, existing) }
+                return h
+            }
+        }
+
         val info = loadOrFetchMetadata(magnetUri)
         val infoHash = info.infoHash().toHex().lowercase()
 
@@ -303,8 +314,22 @@ class TorrentEngine @Inject constructor(
                     return it
                 }
             }
+            // If the torrent is ALREADY in the session (a concurrent prewarm added it but hasn't
+            // written the .meta cache yet), DON'T call fetchMagnet again — libtorrent4j's fetchMagnet
+            // on an already-added torrent blocks on a latch that never fires and drains the full 60s
+            // timeout. Read the metadata off the live handle instead (waiting briefly if the prewarm's
+            // fetch is still in flight).
+            val existing = findHandle(hash)
+            if (existing != null && existing.isValid) {
+                val ti = awaitMetadataFromHandle(existing)
+                    ?: error("Timed out fetching torrent metadata")
+                // (No .meta cache write here — the prewarm's own fetch path persists it; this path
+                // just needs to hand the live metadata back without re-fetching.)
+                Log.i(TAG, "metadata from existing session handle for $hash")
+                return ti
+            }
         }
-        // Cache miss — fetch over the network (60s covers DHT bootstrap), then persist for next time.
+        // Cache miss + not in session — fetch over the network (60s covers DHT bootstrap), then persist.
         val data = session.fetchMagnet(magnetUri, METADATA_TIMEOUT_SECONDS, savePath)
             ?: error("Timed out fetching torrent metadata")
         val info = TorrentInfo.bdecode(data)
@@ -312,6 +337,18 @@ class TorrentEngine @Inject constructor(
             metadataFileFor(info.infoHash().toHex().lowercase()).writeBytes(data)
         }.onFailure { Log.w(TAG, "metadata cache write failed", it) }
         return info
+    }
+
+    /** Poll an already-added torrent's handle for its metadata (avoids the dead-latch fetchMagnet). */
+    private suspend fun awaitMetadataFromHandle(handle: TorrentHandle): TorrentInfo? {
+        val deadline = System.currentTimeMillis() + METADATA_TIMEOUT_SECONDS * 1000L
+        while (System.currentTimeMillis() < deadline) {
+            if (!handle.isValid) return null
+            val hasMeta = runCatching { handle.status().hasMetadata() }.getOrDefault(false)
+            if (hasMeta) return runCatching { handle.torrentFile() }.getOrNull()
+            delay(HANDLE_POLL_INTERVAL_MS)
+        }
+        return null
     }
 
     private fun metadataFileFor(infoHash: String): File = File(metadataDir, "$infoHash.torrent")

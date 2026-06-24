@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -14,6 +15,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -61,8 +63,9 @@ fun TvSettingsScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Brand.Background)
-            .padding(start = 56.dp, end = 56.dp),
-        contentPadding = PaddingValues(top = 36.dp, bottom = 56.dp),
+            // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+            .padding(horizontal = 8.dp),
+        contentPadding = PaddingValues(top = 4.dp, bottom = 56.dp),
         verticalArrangement = Arrangement.spacedBy(26.dp),
     ) {
         item {
@@ -102,7 +105,7 @@ fun TvSettingsScreen(
                     color = Brand.OnSurfaceDim,
                     modifier = Modifier.padding(top = 4.dp, bottom = 8.dp),
                 )
-                val shape = RoundedCornerShape(12.dp)
+                val shape = RoundedCornerShape(50)
                 Surface(
                     onClick = viewModel::clearCache,
                     shape = ClickableSurfaceDefaults.shape(shape = shape),
@@ -168,12 +171,17 @@ private fun <T> TvOptionRow(
                         Modifier
                     },
                 ) {
-                    Text(
-                        text = if (isSel) "● ${labelOf(option)}" else labelOf(option),
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
-                    )
+                    // Standard TV pill: fixed 48.dp height + 22.dp horizontal pad, titleSmall.
+                    Box(
+                        modifier = Modifier.height(48.dp).padding(horizontal = 22.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = if (isSel) "● ${labelOf(option)}" else labelOf(option),
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    }
                 }
             }
         }

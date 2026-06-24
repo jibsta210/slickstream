@@ -81,15 +81,7 @@ fun DetailsScreen(
 
     Box(modifier = modifier.fillMaxSize().background(Brand.Background)) {
         when {
-            state.isLoading -> LoadingState(Modifier.fillMaxSize())
-
-            state.details == null -> ErrorRetry(
-                message = state.errorMessage ?: "Couldn't load details.",
-                onRetry = viewModel::load,
-                modifier = Modifier.fillMaxSize(),
-            )
-
-            else -> DetailsContent(
+            state.details != null -> DetailsContent(
                 details = state.details!!,
                 state = state,
                 isFavorite = isFavorite,
@@ -97,6 +89,20 @@ fun DetailsScreen(
                 onToggleFavorite = viewModel::toggleFavorite,
                 onSelectSeason = viewModel::selectSeason,
                 onMediaClick = onMediaClick,
+            )
+
+            state.isLoading -> LoadingState(Modifier.fillMaxSize())
+
+            state.errorMessage != null -> ErrorRetry(
+                message = state.errorMessage!!,
+                onRetry = viewModel::load,
+                modifier = Modifier.fillMaxSize(),
+            )
+
+            else -> ErrorRetry(
+                message = "Couldn't load details.",
+                onRetry = viewModel::load,
+                modifier = Modifier.fillMaxSize(),
             )
         }
 
@@ -139,6 +145,8 @@ private fun DetailsContent(
                     text = item.title,
                     style = MaterialTheme.typography.headlineMedium,
                     color = Brand.OnSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 if (!details.tagline.isNullOrBlank()) {
                     Spacer(Modifier.height(4.dp))
@@ -146,6 +154,8 @@ private fun DetailsContent(
                         text = details.tagline!!,
                         style = MaterialTheme.typography.bodyMedium,
                         color = Brand.Cyan,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
                 Spacer(Modifier.height(10.dp))
@@ -323,12 +333,13 @@ private fun BackdropHeader(details: MediaDetails) {
     }
 }
 
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun MetaRow(details: MediaDetails) {
     val item = details.item
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
+    androidx.compose.foundation.layout.FlowRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         RatingBadge(vote = item.voteAverage)
         item.year?.let { MetaText(it) }

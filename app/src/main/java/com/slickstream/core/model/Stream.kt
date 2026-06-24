@@ -13,6 +13,8 @@ data class StreamSource(
     val seeders: Int?,
     val provider: String,        // indexer / tracker label
     val fileIndex: Int? = null,  // which file inside a multi-file torrent, if known
+    /** False when the torrent text signals a non-English language (so we can default to English). */
+    val englishLikely: Boolean = true,
 ) {
     /** Rough sort key — higher is better. */
     val rank: Int

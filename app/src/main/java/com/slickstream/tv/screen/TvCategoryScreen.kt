@@ -19,6 +19,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -84,7 +85,8 @@ fun TvCategoryScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(start = 48.dp, end = 48.dp, top = 28.dp),
+            // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+            .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
         Text(
             text = "$genreName  ·  ${if (mediaType == MediaType.MOVIE) "Movies" else "TV"}",
@@ -109,14 +111,14 @@ fun TvCategoryScreen(
             state.isLoading && state.isEmpty -> TvLoading(Modifier.fillMaxSize())
             state.error != null && state.isEmpty ->
                 TvErrorRetry(message = state.error!!, onRetry = viewModel::retry, modifier = Modifier.fillMaxSize())
-            state.isEmpty -> Box(Modifier.fillMaxSize()) {
+            state.isEmpty -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
                     "Nothing here yet.",
                     style = MaterialTheme.typography.titleMedium,
                     color = Brand.OnSurfaceDim,
                 )
             }
-            visibleItems.isEmpty() -> Box(Modifier.fillMaxSize()) {
+            visibleItems.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
                     "No matches for \"${query.trim()}\"",
                     style = MaterialTheme.typography.titleMedium,
@@ -135,6 +137,7 @@ fun TvCategoryScreen(
                     TvPosterCard(
                         item = item,
                         onClick = onMediaClick,
+                        fillCell = true,
                         modifier = Modifier
                             .fillMaxWidth()
                             .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),

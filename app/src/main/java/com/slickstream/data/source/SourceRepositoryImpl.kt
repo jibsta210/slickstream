@@ -77,6 +77,9 @@ class SourceRepositoryImpl @Inject constructor(
             seeders = parseSeeders(haystack),
             provider = parseProvider(name),
             fileIndex = fileIdx,
+            // Detect language from the FULL text (filename + Torrentio title/description), not just
+            // the short label — so a Russian/foreign release is de-prioritized in favour of English.
+            englishLikely = StreamPicker.looksEnglish(haystack),
         )
     }
 

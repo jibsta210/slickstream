@@ -13,8 +13,11 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -130,11 +133,19 @@ private fun UpdateDialog(
                     color = Brand.OnSurface,
                 )
                 Spacer(Modifier.height(12.dp))
-                Text(
-                    text = body,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = Brand.OnSurfaceDim,
-                )
+                // Cap + scroll the (often long, multi-line) changelog so it never pushes the
+                // Update/Later buttons off the screen — especially on TV where the dialog can't grow.
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 280.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    Text(
+                        text = body,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Brand.OnSurfaceDim,
+                    )
+                }
                 if (progress != null) {
                     Spacer(Modifier.height(16.dp))
                     LinearProgressIndicator(

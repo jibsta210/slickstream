@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -59,6 +60,7 @@ fun TvPosterCard(
     width: Dp = 132.dp,
     wide: Boolean = false,
     progress: Float? = null,
+    fillCell: Boolean = false,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -68,8 +70,10 @@ fun TvPosterCard(
     val image = if (wide) (item.backdropUrl ?: item.posterUrl) else (item.posterUrl ?: item.backdropUrl)
     val shape = RoundedCornerShape(14.dp)
 
+    // In a grid the tile fills its cell (the caller supplies fillMaxWidth) and the art keeps the
+    // poster/backdrop aspect ratio; in a row the tile keeps its fixed width/height.
     Column(
-        modifier = modifier.width(cardWidth),
+        modifier = if (fillCell) modifier else modifier.width(cardWidth),
         horizontalAlignment = Alignment.Start,
     ) {
         Surface(
@@ -94,9 +98,11 @@ fun TvPosterCard(
             glow = ClickableSurfaceDefaults.glow(
                 focusedGlow = Glow(elevationColor = Brand.Violet, elevation = 16.dp),
             ),
-            modifier = Modifier
-                .width(cardWidth)
-                .height(cardHeight),
+            modifier = if (fillCell) {
+                Modifier.fillMaxWidth().aspectRatio(if (wide) 16f / 9f else 2f / 3f)
+            } else {
+                Modifier.width(cardWidth).height(cardHeight)
+            },
         ) {
             Box(Modifier.fillMaxSize()) {
                 if (image != null) {
@@ -152,7 +158,7 @@ fun TvPosterCard(
                     RatingBadge(
                         vote = item.voteAverage,
                         modifier = Modifier
-                            .align(Alignment.TopStart)
+                            .align(Alignment.TopEnd)
                             .padding(6.dp),
                     )
                 }
@@ -194,7 +200,7 @@ fun TvPosterCard(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .padding(top = 8.dp)
-                .width(cardWidth),
+                .then(if (fillCell) Modifier.fillMaxWidth() else Modifier.width(cardWidth)),
         )
         item.year?.let { yr ->
             Text(

@@ -76,7 +76,8 @@ fun TvSportsScreen(
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(
-            modifier = Modifier.fillMaxSize().padding(start = 48.dp, end = 48.dp, top = 28.dp),
+            // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+            modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp, vertical = 4.dp),
         ) {
             Text(
                 text = "Live Sports",
@@ -165,13 +166,15 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    // Fixed height so logoed and text-only chips are the SAME height.
-                    modifier = Modifier.height(48.dp).padding(horizontal = 20.dp),
+                    // Standard TV pill: fixed 48.dp height + 22.dp horizontal pad. The fixed height
+                    // keeps logoed and text-only chips the SAME size.
+                    modifier = Modifier.height(48.dp).padding(horizontal = 22.dp),
                 ) {
                     if (c.logoUrl != null) {
                         AsyncImage(
                             model = c.logoUrl,
                             contentDescription = null,
+                            contentScale = ContentScale.Fit,
                             modifier = Modifier.size(26.dp),
                         )
                         Spacer(Modifier.width(8.dp))
@@ -319,13 +322,6 @@ private fun TvStreamPanel(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun TvCenteredMessage(text: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(text, style = MaterialTheme.typography.titleMedium, color = Brand.OnSurfaceDim)
     }
 }
 

@@ -115,16 +115,16 @@ private fun CategoryChips(
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .height(38.dp) // uniform height: logoed == text-only chips
                     .clip(RoundedCornerShape(50))
                     .background(if (selected) Brand.Violet else Brand.SurfaceVariant)
                     .clickable { onSelect(c.id) }
-                    .padding(horizontal = 16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
             ) {
                 if (c.logoUrl != null) {
                     AsyncImage(
                         model = c.logoUrl,
                         contentDescription = null,
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier.size(22.dp),
                     )
                     Spacer(Modifier.width(8.dp))

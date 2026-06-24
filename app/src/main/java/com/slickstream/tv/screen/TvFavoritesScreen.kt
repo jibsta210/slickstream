@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
@@ -74,7 +75,8 @@ fun TvFavoritesScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Brand.Background)
-            .padding(start = 48.dp, end = 48.dp, top = 28.dp),
+            // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+            .padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
         Text(
             text = "Favorites",
@@ -105,6 +107,7 @@ fun TvFavoritesScreen(
                         TvPosterCard(
                             item = item,
                             onClick = onMediaClick,
+                            fillCell = true,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
@@ -149,12 +152,17 @@ private fun TvFavoritesChips(
                 ),
                 scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
             ) {
-                Text(
-                    text = filter.label,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
-                )
+                // Standard TV pill: fixed 48.dp height + 22.dp horizontal pad, titleSmall.
+                Box(
+                    modifier = Modifier.height(48.dp).padding(horizontal = 22.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = filter.label,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
             }
         }
     }

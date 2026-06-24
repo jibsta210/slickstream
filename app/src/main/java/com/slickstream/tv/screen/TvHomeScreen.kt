@@ -76,6 +76,7 @@ fun TvHomeScreen(
         state.isLoading && state.isEmpty -> TvLoading(modifier)
         state.errorMessage != null && state.isEmpty ->
             TvErrorRetry(message = state.errorMessage!!, onRetry = viewModel::refresh, modifier = modifier)
+        state.isEmpty -> TvCenteredMessage("Nothing to show right now.", modifier)
         else -> HomeContent(
             state = state,
             onMediaClick = onMediaClick,
@@ -123,7 +124,8 @@ private fun HomeContent(
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(26.dp),
-        contentPadding = PaddingValues(top = 24.dp, bottom = 48.dp),
+        // Outer top trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+        contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp),
     ) {
         if (carouselItems.isNotEmpty()) {
             item(key = "featured-carousel") {
@@ -173,7 +175,7 @@ internal fun FeaturedCarousel(
         modifier = Modifier
             .fillMaxWidth()
             .height(420.dp)
-            .padding(horizontal = 48.dp)
+            .padding(horizontal = 8.dp)
             .background(Brand.Surface, RoundedCornerShape(20.dp)),
         carouselIndicator = {
             CarouselDefaults.IndicatorRow(

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -38,13 +39,16 @@ fun TvMediaRow(
             text = title,
             style = MaterialTheme.typography.titleMedium,
             color = Brand.OnSurface,
-            modifier = Modifier.padding(start = 48.dp),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(start = 8.dp),
         )
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(18.dp),
             // Generous vertical padding so the focused card's scale + 3dp ring + glow aren't clipped
             // by the LazyRow bounds (a cut-off focus ring reads as "unclear what you're on").
-            contentPadding = PaddingValues(horizontal = 48.dp, vertical = 22.dp),
+            // Horizontal is small — the screen-wide overscan inset in TvApp supplies the safe margin.
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 22.dp),
         ) {
             items(
                 items,

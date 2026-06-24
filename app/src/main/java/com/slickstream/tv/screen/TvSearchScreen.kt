@@ -93,7 +93,8 @@ fun TvSearchScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Brand.Background)
-            .padding(start = 48.dp, end = 48.dp, top = 28.dp, bottom = 24.dp),
+            // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
+            .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         Text(
@@ -161,7 +162,7 @@ fun TvSearchScreen(
                     onRetry = viewModel::submit,
                 )
                 state.isEmpty -> CenteredHint("No results for \"${state.query}\".")
-                state.results.isEmpty() -> Unit // idle prompt already shown above
+                state.results.isEmpty() -> CenteredHint("Search results will appear here.")
                 else -> ResultsGrid(results = state.results, onMediaClick = onMediaClick)
             }
         }
@@ -195,7 +196,7 @@ private fun MicTile(
         ),
         border = ClickableSurfaceDefaults.border(
             focusedBorder = Border(
-                border = androidx.compose.foundation.BorderStroke(4.dp, Brand.Cyan),
+                border = androidx.compose.foundation.BorderStroke(3.dp, Brand.Cyan),
                 shape = CircleShape,
             ),
         ),
@@ -265,7 +266,7 @@ private fun ResultsGrid(
         modifier = Modifier.fillMaxSize(),
     ) {
         items(results, key = { "${it.mediaType.name}-${it.id}" }) { item ->
-            TvPosterCard(item = item, onClick = onMediaClick, modifier = Modifier.fillMaxWidth())
+            TvPosterCard(item = item, onClick = onMediaClick, fillCell = true, modifier = Modifier.fillMaxWidth())
         }
     }
 }

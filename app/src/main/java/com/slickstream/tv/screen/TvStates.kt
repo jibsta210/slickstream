@@ -22,6 +22,22 @@ import androidx.tv.material3.Text
 import com.slickstream.ui.theme.Brand
 import androidx.compose.material3.CircularProgressIndicator
 
+/** Centered short message for TV empty / informational states. */
+@Composable
+fun TvCenteredMessage(text: String, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.titleMedium,
+            color = Brand.OnSurfaceDim,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
 /** Centered indeterminate loader for TV screens. */
 @Composable
 fun TvLoading(modifier: Modifier = Modifier) {
