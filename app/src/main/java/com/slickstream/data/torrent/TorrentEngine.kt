@@ -406,6 +406,13 @@ class TorrentEngine @Inject constructor(
         val relPath = files.filePath(chosen)
         active.filePath = File(savePath, relPath).absolutePath
 
+        Log.i(
+            TAG,
+            "selectFile name='${files.fileName(chosen)}' numFiles=$numFiles idx=$chosen " +
+                "fileLen=${active.fileLength} fileOffset=${active.fileOffset} pieceLen=${active.pieceLength} " +
+                "pieces=${active.firstPiece}..${active.lastPiece} path=${active.filePath}",
+        )
+
         // De-prioritize everything else so bandwidth concentrates on the chosen file.
         val priorities = Array(numFiles) { Priority.IGNORE }
         priorities[chosen] = Priority.DEFAULT

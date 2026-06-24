@@ -1,11 +1,15 @@
 package com.slickstream.data.source
 
+import com.slickstream.core.common.Indexer
 import com.slickstream.core.model.DataResult
 import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.repository.SourceRepository
 import com.slickstream.data.source.dto.StreamDto
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 import java.util.Locale
 import javax.inject.Inject
@@ -42,9 +46,22 @@ class SourceRepositoryImpl @Inject constructor(
         }
 
         return try {
-            val response = api.getStreams(type, id)
-            val sources = response.streams
+            // Query every configured indexer addon in parallel; one being down/slow never blocks the
+            // others. Merge their results and de-dupe by info-hash (keep the row with the most seeders).
+            val responses = coroutineScope {
+                baseUrls.map { base ->
+                    async { runCatching { api.getStreamsAt("${base}stream/$type/$id.json") }.getOrNull() }
+                }.awaitAll()
+            }
+            val ok = responses.filterNotNull()
+            if (ok.isEmpty()) {
+                return DataResult.Error("Failed to resolve sources for \"${details.item.title}\"")
+            }
+            val sources = ok
+                .flatMap { it.streams }
                 .mapNotNull { it.toStreamSource() }
+                .groupBy { it.infoHash }
+                .map { (_, rows) -> rows.maxByOrNull { it.seeders ?: 0 }!! }
                 .sortedByDescending { it.rank }
             DataResult.Success(sources)
         } catch (t: Throwable) {
@@ -55,12 +72,25 @@ class SourceRepositoryImpl @Inject constructor(
         }
     }
 
+    /**
+     * Configured indexer addon base URLs. [Indexer.BASE_URL] may be a COMMA-SEPARATED list so the
+     * user can add more sources (e.g. a debrid-backed Torrentio that returns hundreds of cached
+     * releases) without a code change. Each is normalised to end in '/'.
+     */
+    private val baseUrls: List<String> = Indexer.BASE_URL
+        .split(",")
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .map { if (it.endsWith("/")) it else "$it/" }
+        .ifEmpty { listOf("https://torrentio.strem.fun/") }
+
     /** Map one indexer row to a [StreamSource], or null if it has no usable info-hash. */
     private fun StreamDto.toStreamSource(): StreamSource? {
         val hash = infoHash?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() } ?: return null
 
-        // Pool every text field that may carry quality / seeders / size metadata.
-        val haystack = listOfNotNull(name, title, description, behaviorHints?.bingeGroup)
+        // Pool every text field that may carry quality / seeders / size / codec metadata (the codec
+        // and container often live in the filename, e.g. "…XviD-MAXX.avi", so include it).
+        val haystack = listOfNotNull(name, title, description, behaviorHints?.bingeGroup, behaviorHints?.filename)
             .joinToString("\n")
 
         val displayName = behaviorHints?.filename
@@ -80,6 +110,9 @@ class SourceRepositoryImpl @Inject constructor(
             // Detect language from the FULL text (filename + Torrentio title/description), not just
             // the short label — so a Russian/foreign release is de-prioritized in favour of English.
             englishLikely = StreamPicker.looksEnglish(haystack),
+            // Detect the codec/container so an undecodable XviD/AVI release is never auto-picked over
+            // a playable x264 (the "valid torrent, black screen" bug).
+            playable = StreamPicker.looksPlayable(haystack),
         )
     }
 

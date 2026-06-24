@@ -15,6 +15,8 @@ data class StreamSource(
     val fileIndex: Int? = null,  // which file inside a multi-file torrent, if known
     /** False when the torrent text signals a non-English language (so we can default to English). */
     val englishLikely: Boolean = true,
+    /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */
+    val playable: Boolean = true,
 ) {
     /** Rough sort key — higher is better. */
     val rank: Int

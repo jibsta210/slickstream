@@ -32,8 +32,11 @@ object SourceModule {
     @Singleton
     fun provideIndexerApi(okHttpClient: OkHttpClient, json: Json): IndexerApi {
         val contentType = "application/json".toMediaType()
-        // Indexer.BASE_URL ends with '/'; Retrofit requires a base URL with a trailing slash.
-        val baseUrl = Indexer.BASE_URL.let { if (it.endsWith("/")) it else "$it/" }
+        // Indexer.BASE_URL may be a COMMA-SEPARATED list of addon URLs (so the user can add more
+        // sources, e.g. a debrid-backed Torrentio). Retrofit needs one valid base; per-call @Url
+        // overrides it for each configured addon, so the first entry is just a placeholder base.
+        val baseUrl = Indexer.BASE_URL.split(",").first().trim()
+            .let { if (it.endsWith("/")) it else "$it/" }
         return Retrofit.Builder()
             .baseUrl(baseUrl)
             .client(okHttpClient)

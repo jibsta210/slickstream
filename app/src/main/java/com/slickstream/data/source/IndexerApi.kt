@@ -2,7 +2,7 @@ package com.slickstream.data.source
 
 import com.slickstream.data.source.dto.StreamResponseDto
 import retrofit2.http.GET
-import retrofit2.http.Path
+import retrofit2.http.Url
 
 /**
  * Stremio/Torrentio-compatible stream resolver.
@@ -17,10 +17,12 @@ import retrofit2.http.Path
  */
 interface IndexerApi {
 
-    @GET("stream/{type}/{id}.json")
-    suspend fun getStreams(
-        @Path("type") type: String,
-        // The episode id contains ':' which must NOT be percent-encoded for Stremio routing.
-        @Path(value = "id", encoded = true) id: String,
-    ): StreamResponseDto
+    /**
+     * Fetch streams from an explicit, fully-built addon URL. Using [Url] (instead of a fixed Retrofit
+     * base + path) lets [com.slickstream.data.source.SourceRepositoryImpl] query SEVERAL configured
+     * indexer addons and merge the results — i.e. "add more sources". OkHttp keeps the ':' in a series
+     * id (e.g. .../series/tt123:1:1.json) literal in the path, which Stremio routing requires.
+     */
+    @GET
+    suspend fun getStreamsAt(@Url url: String): StreamResponseDto
 }
