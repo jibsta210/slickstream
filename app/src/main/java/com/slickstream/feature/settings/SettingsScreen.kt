@@ -43,6 +43,9 @@ import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.settings.UiDensity
 import com.slickstream.feature.profile.ConfirmDialog
+import com.slickstream.feature.update.UpdateUiState
+import com.slickstream.feature.update.UpdateViewModel
+import com.slickstream.BuildConfig
 import com.slickstream.ui.theme.Brand
 
 @Composable
@@ -55,6 +58,9 @@ fun SettingsScreen(
     val cacheStats by viewModel.cacheStats.collectAsStateWithLifecycle()
     var showClearCacheDialog by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { viewModel.refreshCacheStats() }
+
+    val updateVm: UpdateViewModel = hiltViewModel()
+    val updateState by updateVm.state.collectAsStateWithLifecycle()
 
     Column(
         modifier = modifier
@@ -209,6 +215,53 @@ fun SettingsScreen(
             Hint("When the cache exceeds this size, the oldest titles are removed automatically. The title you're watching is never removed.")
         }
 
+        SettingsSection("App updates") {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Brand.Surface)
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Version ${BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Brand.OnSurface,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = when (val s = updateState) {
+                            is UpdateUiState.Available -> "Update available: v${s.manifest.versionName}"
+                            is UpdateUiState.Downloading -> "Downloading… ${s.percent}%"
+                            is UpdateUiState.ReadyToInstall -> "Downloaded — ready to install"
+                            UpdateUiState.Checking -> "Checking for updates…"
+                            UpdateUiState.UpToDate -> "You're on the latest version"
+                            is UpdateUiState.Error -> s.message
+                            else -> "Tap below to check for a newer version"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Brand.OnSurfaceDim,
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                when (val s = updateState) {
+                    is UpdateUiState.Available ->
+                        SettingsPill("Update now", primary = true) { updateVm.startDownload(s.manifest) }
+                    is UpdateUiState.ReadyToInstall ->
+                        SettingsPill("Install", primary = true) { updateVm.launchInstall() }
+                    else -> Unit
+                }
+                SettingsPill(
+                    label = if (updateState is UpdateUiState.Checking) "Checking…" else "Check for updates",
+                    primary = false,
+                ) { updateVm.forceCheck() }
+            }
+        }
+
         Spacer(Modifier.height(32.dp))
     }
 
@@ -241,6 +294,21 @@ private fun formatBytes(bytes: Long): String {
 
 private fun pluralizeTitles(count: Int): String =
     if (count == 1) "1 cached title" else "$count cached titles"
+
+@Composable
+private fun SettingsPill(label: String, primary: Boolean, onClick: () -> Unit) {
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.SemiBold,
+        color = if (primary) Brand.Background else Brand.OnSurface,
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(if (primary) Brand.Violet else Brand.SurfaceVariant)
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+    )
+}
 
 @Composable
 private fun SettingsSection(title: String, content: @Composable () -> Unit) {

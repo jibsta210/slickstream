@@ -39,24 +39,28 @@ interface TmdbApi {
     suspend fun popular(
         @Path("media_type") mediaType: String,
         @Query("page") page: Int = 1,
+        @Query("include_adult") includeAdult: Boolean = false,
     ): PagedDto<MediaListItemDto>
 
     @GET("{media_type}/top_rated")
     suspend fun topRated(
         @Path("media_type") mediaType: String,
         @Query("page") page: Int = 1,
+        @Query("include_adult") includeAdult: Boolean = false,
     ): PagedDto<MediaListItemDto>
 
     /** movie/now_playing. */
     @GET("movie/now_playing")
     suspend fun movieNowPlaying(
         @Query("page") page: Int = 1,
+        @Query("include_adult") includeAdult: Boolean = false,
     ): PagedDto<MediaListItemDto>
 
     /** tv/on_the_air. */
     @GET("tv/on_the_air")
     suspend fun tvOnTheAir(
         @Query("page") page: Int = 1,
+        @Query("include_adult") includeAdult: Boolean = false,
     ): PagedDto<MediaListItemDto>
 
     // --- Discover / genres ---
@@ -67,6 +71,7 @@ interface TmdbApi {
         @Query("with_genres") withGenres: String,
         @Query("page") page: Int = 1,
         @Query("sort_by") sortBy: String = "popularity.desc",
+        @Query("include_adult") includeAdult: Boolean = false,
     ): PagedDto<MediaListItemDto>
 
     @GET("genre/{media_type}/list")

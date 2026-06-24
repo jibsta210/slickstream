@@ -14,7 +14,10 @@ import com.slickstream.core.model.WatchHistoryItem
  * Room primary-key columns cannot be null, so the nullable [season]/[episode] are mirrored into
  * non-null [seasonKey]/[episodeKey] sentinels (-1 == "none", i.e. a movie) used only for keying.
  */
-@Entity(tableName = "watch_history", primaryKeys = ["id", "mediaType", "seasonKey", "episodeKey"])
+@Entity(
+    tableName = "watch_history",
+    primaryKeys = ["id", "mediaType", "seasonKey", "episodeKey", "profileId"],
+)
 data class WatchHistoryEntity(
     val id: Int,
     val mediaType: MediaType,
@@ -37,6 +40,7 @@ data class WatchHistoryEntity(
     val durationMs: Long,
     val updatedAt: Long,
     val infoHash: String?,
+    val profileId: String,
 ) {
     fun toMediaItem(): MediaItem = MediaItem(
         id = id,
@@ -70,7 +74,12 @@ data class WatchHistoryEntity(
         /** Composite-key sentinel for "no season / no episode" (movies). */
         const val NO_KEY = -1
 
-        fun from(item: MediaItem, progress: PlaybackProgress, addedAt: Long): WatchHistoryEntity =
+        fun from(
+            item: MediaItem,
+            progress: PlaybackProgress,
+            addedAt: Long,
+            profileId: String,
+        ): WatchHistoryEntity =
             WatchHistoryEntity(
                 id = item.id,
                 mediaType = item.mediaType,
@@ -90,6 +99,7 @@ data class WatchHistoryEntity(
                 durationMs = progress.durationMs,
                 updatedAt = progress.updatedAt,
                 infoHash = progress.infoHash,
+                profileId = profileId,
             )
     }
 }

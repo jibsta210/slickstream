@@ -184,6 +184,10 @@ dependencies {
     implementation(libs.libtorrent4j.x8664)
     implementation(libs.nanohttpd)
 
+    // Universal software decoder (bundles FFmpeg) — plays codecs ExoPlayer can't (XviD/DivX/AVI/
+    // WMV/VC-1…). Used as a fallback player so EVERY release is playable, like desktop VLC.
+    implementation(libs.libvlc)
+
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.datastore.preferences)
 

@@ -11,9 +11,9 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface WatchHistoryDao {
 
-    /** Most recently watched first — every per-episode row. */
-    @Query("SELECT * FROM watch_history ORDER BY updatedAt DESC")
-    fun observeAll(): Flow<List<WatchHistoryEntity>>
+    /** Most recently watched first — every per-episode row for a profile. */
+    @Query("SELECT * FROM watch_history WHERE profileId = :profileId ORDER BY updatedAt DESC")
+    fun observeAll(profileId: String): Flow<List<WatchHistoryEntity>>
 
     /**
      * The exact per-episode row. [seasonKey]/[episodeKey] are the non-null key mirrors
@@ -21,16 +21,22 @@ interface WatchHistoryDao {
      */
     @Query(
         "SELECT * FROM watch_history WHERE id = :id AND mediaType = :type " +
-            "AND seasonKey = :seasonKey AND episodeKey = :episodeKey LIMIT 1",
+            "AND seasonKey = :seasonKey AND episodeKey = :episodeKey AND profileId = :profileId LIMIT 1",
     )
-    suspend fun getByEpisode(id: Int, type: MediaType, seasonKey: Int, episodeKey: Int): WatchHistoryEntity?
+    suspend fun getByEpisode(
+        id: Int,
+        type: MediaType,
+        seasonKey: Int,
+        episodeKey: Int,
+        profileId: String,
+    ): WatchHistoryEntity?
 
     /** Most-recently-touched row for a title — used to resume "this show" from the rail. */
     @Query(
-        "SELECT * FROM watch_history WHERE id = :id AND mediaType = :type " +
+        "SELECT * FROM watch_history WHERE id = :id AND mediaType = :type AND profileId = :profileId " +
             "ORDER BY updatedAt DESC LIMIT 1",
     )
-    suspend fun getLatestForMedia(id: Int, type: MediaType): WatchHistoryEntity?
+    suspend fun getLatestForMedia(id: Int, type: MediaType, profileId: String): WatchHistoryEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: WatchHistoryEntity)
@@ -38,14 +44,21 @@ interface WatchHistoryDao {
     /** Delete a single episode row (or the lone movie row when seasonKey/episodeKey == -1). */
     @Query(
         "DELETE FROM watch_history WHERE id = :id AND mediaType = :type " +
-            "AND seasonKey = :seasonKey AND episodeKey = :episodeKey",
+            "AND seasonKey = :seasonKey AND episodeKey = :episodeKey AND profileId = :profileId",
     )
-    suspend fun deleteEpisode(id: Int, type: MediaType, seasonKey: Int, episodeKey: Int)
+    suspend fun deleteEpisode(
+        id: Int,
+        type: MediaType,
+        seasonKey: Int,
+        episodeKey: Int,
+        profileId: String,
+    )
 
     /** Delete every row for a title (all episodes) — used by "remove from history". */
-    @Query("DELETE FROM watch_history WHERE id = :id AND mediaType = :type")
-    suspend fun deleteAllForMedia(id: Int, type: MediaType)
+    @Query("DELETE FROM watch_history WHERE id = :id AND mediaType = :type AND profileId = :profileId")
+    suspend fun deleteAllForMedia(id: Int, type: MediaType, profileId: String)
 
-    @Query("DELETE FROM watch_history")
-    suspend fun clear()
+    /** Clear only the active profile's history (never the whole table). */
+    @Query("DELETE FROM watch_history WHERE profileId = :profileId")
+    suspend fun clear(profileId: String)
 }

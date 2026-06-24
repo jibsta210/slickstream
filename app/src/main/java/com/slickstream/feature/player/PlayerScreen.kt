@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CastConnected
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.HighQuality
@@ -69,6 +70,7 @@ import androidx.mediarouter.app.MediaRouteControllerDialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
+import com.slickstream.data.vlc.VlcPlayer
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
@@ -179,6 +181,13 @@ fun PlayerScreen(
                     view.useController = !isInPip   // hide all controls inside the PiP window
                     view.setFullscreenButtonState(isFullscreen)
                     view.subtitleView?.applyAppearance(captionPrefs.size, captionPrefs.style)
+                    // The libVLC fallback renders into PlayerView's own surface but never signals
+                    // Media3's first-frame, so the black shutter would stay over the video — make it
+                    // transparent for VLC (normal ExoPlayer keeps the black shutter).
+                    view.setShutterBackgroundColor(
+                        if (activePlayer is VlcPlayer) android.graphics.Color.TRANSPARENT
+                        else android.graphics.Color.BLACK,
+                    )
                 },
             )
         }
@@ -962,7 +971,7 @@ private fun SourceRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .background(if (selected) Brand.Violet.copy(alpha = 0.12f) else Color.Transparent)
+            .background(if (selected) Brand.Violet.copy(alpha = 0.22f) else Color.Transparent)
             .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -979,6 +988,15 @@ private fun SourceRow(
             )
             Spacer(Modifier.height(3.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
+                if (selected) {
+                    Text(
+                        text = "Now playing",
+                        color = Brand.Cyan,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                }
                 Icon(
                     imageVector = Icons.Filled.People,
                     contentDescription = null,
@@ -1006,6 +1024,15 @@ private fun SourceRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+        }
+        if (selected) {
+            Spacer(Modifier.width(12.dp))
+            Icon(
+                imageVector = Icons.Filled.CheckCircle,
+                contentDescription = "Now playing",
+                tint = Brand.Cyan,
+                modifier = Modifier.size(22.dp),
+            )
         }
     }
 }

@@ -63,3 +63,11 @@
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+
+# libVLC (org.videolan) — the universal-codec fallback player. Its classes/fields/event callbacks are
+# reached from the native layer via JNI by name, so R8's shrinker would otherwise strip them as
+# "unused" and the release build would crash the moment VLC starts. Keep the whole package.
+-keep class org.videolan.libvlc.** { *; }
+-keep interface org.videolan.libvlc.** { *; }
+-keep class org.videolan.medialibrary.** { *; }
+-dontwarn org.videolan.**

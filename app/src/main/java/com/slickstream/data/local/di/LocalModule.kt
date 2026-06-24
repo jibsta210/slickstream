@@ -3,9 +3,12 @@ package com.slickstream.data.local.di
 import android.content.Context
 import androidx.room.Room
 import com.slickstream.core.repository.LibraryRepository
+import com.slickstream.core.repository.ProfileRepository
 import com.slickstream.data.local.LibraryRepositoryImpl
+import com.slickstream.data.local.ProfileRepositoryImpl
 import com.slickstream.data.local.SlickDatabase
 import com.slickstream.data.local.dao.FavoriteDao
+import com.slickstream.data.local.dao.ProfileDao
 import com.slickstream.data.local.dao.WatchHistoryDao
 import dagger.Binds
 import dagger.Module
@@ -32,6 +35,9 @@ object LocalModule {
 
     @Provides
     fun provideWatchHistoryDao(db: SlickDatabase): WatchHistoryDao = db.watchHistoryDao()
+
+    @Provides
+    fun provideProfileDao(db: SlickDatabase): ProfileDao = db.profileDao()
 }
 
 /** Binds the [LibraryRepository] contract to its Room implementation. */
@@ -42,4 +48,8 @@ abstract class LocalBindsModule {
     @Binds
     @Singleton
     abstract fun bindLibraryRepository(impl: LibraryRepositoryImpl): LibraryRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindProfileRepository(impl: ProfileRepositoryImpl): ProfileRepository
 }

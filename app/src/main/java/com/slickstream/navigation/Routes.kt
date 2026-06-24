@@ -14,6 +14,7 @@ object Routes {
     const val SEARCH = "search"
     const val FAVORITES = "favorites"
     const val PROFILE = "profile"
+    const val PROFILE_PICKER = "profile_picker"
     const val SETTINGS = "settings"
     const val LOGIN = "login"
 

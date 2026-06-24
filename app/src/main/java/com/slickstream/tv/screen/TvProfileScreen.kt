@@ -24,6 +24,7 @@ import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -98,6 +99,7 @@ private fun Context.findActivity(): Activity? {
 fun TvProfileScreen(
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    onSwitchProfile: () -> Unit = {},
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
@@ -137,6 +139,12 @@ fun TvProfileScreen(
         ProfileHeader(user = user)
 
         Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.width(520.dp)) {
+            ProfileAction(
+                icon = Icons.Rounded.SwitchAccount,
+                label = "Switch profile",
+                onClick = onSwitchProfile,
+            )
+
             if (user == null) {
                 ProfileAction(
                     icon = Icons.Rounded.Login,

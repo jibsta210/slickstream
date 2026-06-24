@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -30,6 +32,7 @@ import com.slickstream.tv.screen.TvDetailsScreen
 import com.slickstream.tv.screen.TvFavoritesScreen
 import com.slickstream.tv.screen.TvHomeScreen
 import com.slickstream.tv.screen.TvPlayerScreen
+import com.slickstream.tv.screen.TvProfilePickerScreen
 import com.slickstream.tv.screen.TvProfileScreen
 import com.slickstream.tv.screen.TvSearchScreen
 import com.slickstream.ui.theme.Brand
@@ -48,6 +51,24 @@ fun TvApp() {
         val navController = rememberNavController()
         val backStack by navController.currentBackStackEntryAsState()
         val currentRoute = backStack?.destination?.route
+
+        // Conservative launch gate (mirrors phone): keep startDestination = HOME. On a single cold
+        // launch, if MORE THAN ONE profile exists, route to the picker once. With just the default
+        // profile, launch straight to Home as before.
+        val profileViewModel: com.slickstream.feature.profile.ProfileViewModel =
+            androidx.hilt.navigation.compose.hiltViewModel()
+        val profiles by profileViewModel.profiles.collectAsStateWithLifecycle()
+        var profileGateShown by androidx.compose.runtime.saveable.rememberSaveable {
+            androidx.compose.runtime.mutableStateOf(false)
+        }
+        androidx.compose.runtime.LaunchedEffect(profiles.size) {
+            if (!profileGateShown && profiles.size > 1) {
+                profileGateShown = true
+                navController.navigate(Routes.PROFILE_PICKER) {
+                    launchSingleTop = true
+                }
+            }
+        }
 
         // The rail is shown for the four top-level sections; details + player are immersive.
         val showRail = currentRoute == null ||
@@ -172,7 +193,21 @@ fun TvApp() {
                         }
 
                         composable(Routes.PROFILE) {
-                            TvProfileScreen(onOpenSettings = { navController.navigate(Routes.SETTINGS) })
+                            TvProfileScreen(
+                                onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                                onSwitchProfile = { navController.navigate(Routes.PROFILE_PICKER) },
+                            )
+                        }
+
+                        composable(Routes.PROFILE_PICKER) {
+                            TvProfilePickerScreen(
+                                onProfileChosen = {
+                                    navController.navigate(Routes.HOME) {
+                                        popUpTo(Routes.HOME) { inclusive = true }
+                                        launchSingleTop = true
+                                    }
+                                },
+                            )
                         }
 
                         composable(Routes.SETTINGS) {

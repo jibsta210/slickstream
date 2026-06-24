@@ -23,6 +23,7 @@ googleid = "1.1.1"
 playServicesAuth = "21.3.0"
 libtorrent4j = "2.1.0-31"
 nanohttpd = "2.3.1"
+vlc = "3.6.5"
 coroutines = "1.9.0"
 datastore = "1.1.1"
 splashscreen = "1.0.1"
@@ -83,6 +84,7 @@ libtorrent4j-arm = { group = "org.libtorrent4j", name = "libtorrent4j-android-ar
 libtorrent4j-x86 = { group = "org.libtorrent4j", name = "libtorrent4j-android-x86", version.ref = "libtorrent4j" }
 libtorrent4j-x8664 = { group = "org.libtorrent4j", name = "libtorrent4j-android-x86_64", version.ref = "libtorrent4j" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
+libvlc = { group = "org.videolan.android", name = "libvlc-all", version.ref = "vlc" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlinx-coroutines-play-services = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-play-services", version.ref = "coroutinesPlayServices" }
 firebase-bom = { group = "com.google.firebase", name = "firebase-bom", version.ref = "firebaseBom" }

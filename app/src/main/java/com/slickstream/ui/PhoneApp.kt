@@ -54,7 +54,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -88,7 +90,6 @@ import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
-import com.slickstream.core.model.UserProfile
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.feature.auth.AuthViewModel
 import com.slickstream.feature.catalog.CatalogScreen
@@ -97,8 +98,12 @@ import com.slickstream.feature.favorites.FavoritesScreen
 import com.slickstream.feature.home.HomeScreen
 import com.slickstream.feature.player.PlayerScreen
 import com.slickstream.feature.catalog.CategoryScreen
+import com.slickstream.core.model.Profile
 import com.slickstream.feature.live.LivePlayerScreen
+import com.slickstream.feature.profile.ProfilePickerScreen
 import com.slickstream.feature.profile.ProfileScreen
+import com.slickstream.feature.profile.ProfileViewModel
+import com.slickstream.ui.components.ProfileAvatar
 import com.slickstream.feature.sports.SportsScreen
 import com.slickstream.feature.settings.SettingsScreen
 import com.slickstream.feature.search.SearchUiState
@@ -128,6 +133,22 @@ fun PhoneApp() {
     val authViewModel: AuthViewModel = hiltViewModel()
     val user by authViewModel.user.collectAsStateWithLifecycle()
     val isSignedIn = user != null
+
+    // Active profile drives the top-bar avatar (colour + initial). The picker is its own route.
+    val profileViewModel: ProfileViewModel = hiltViewModel()
+    val profiles by profileViewModel.profiles.collectAsStateWithLifecycle()
+    val activeProfile by profileViewModel.activeProfile.collectAsStateWithLifecycle()
+
+    // Conservative launch gate: keep startDestination = HOME. On a single cold launch, if MORE
+    // THAN ONE profile exists, route to the picker once. With just the default profile, go straight
+    // to Home exactly as before. rememberSaveable survives config changes so it fires at most once.
+    var profileGateShown by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(profiles.size) {
+        if (!profileGateShown && profiles.size > 1) {
+            profileGateShown = true
+            navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true }
+        }
+    }
 
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -167,9 +188,9 @@ fun PhoneApp() {
                 exit = slideOutVertically { -it },
             ) {
                 TopBar(
-                    user = user,
+                    activeProfile = activeProfile,
                     onSearch = { navController.navigate(Routes.SEARCH) { launchSingleTop = true } },
-                    onProfile = { navController.navigate(Routes.PROFILE) { launchSingleTop = true } },
+                    onProfile = { navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true } },
                 )
             }
         },
@@ -256,6 +277,25 @@ fun PhoneApp() {
                     onBack = {
                         if (!navController.popBackStack()) {
                             navController.navigateToTopLevel(TopLevelDestination.entries.first())
+                        }
+                    },
+                )
+            }
+
+            composable(Routes.PROFILE_PICKER) {
+                ProfilePickerScreen(
+                    onProfileChosen = {
+                        navController.navigate(Routes.HOME) {
+                            popUpTo(Routes.HOME) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    onBack = {
+                        if (!navController.popBackStack()) {
+                            navController.navigate(Routes.HOME) {
+                                popUpTo(Routes.HOME) { inclusive = true }
+                                launchSingleTop = true
+                            }
                         }
                     },
                 )
@@ -353,7 +393,7 @@ private val CHROME_ROUTES = TOP_LEVEL_ROUTES + setOf(Routes.SEARCH, Routes.PROFI
 
 @Composable
 private fun TopBar(
-    user: UserProfile?,
+    activeProfile: Profile?,
     onSearch: () -> Unit,
     onProfile: () -> Unit,
 ) {
@@ -386,35 +426,41 @@ private fun TopBar(
             )
         }
         Spacer(Modifier.size(6.dp))
-        TopBarAvatar(photoUrl = user?.photoUrl, onClick = onProfile)
+        TopBarAvatar(profile = activeProfile, onClick = onProfile)
     }
 }
 
 @Composable
-private fun TopBarAvatar(photoUrl: String?, onClick: () -> Unit) {
+private fun TopBarAvatar(profile: Profile?, onClick: () -> Unit) {
     Box(
         modifier = Modifier
             .size(36.dp)
             .clip(CircleShape)
-            .background(Brand.SurfaceVariant)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        if (photoUrl != null) {
-            AsyncImage(
-                model = photoUrl,
-                contentDescription = "Profile",
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clip(CircleShape),
+        if (profile != null) {
+            ProfileAvatar(
+                name = profile.name,
+                colorIndex = profile.colorIndex,
+                isKids = profile.isKids,
+                size = 36.dp,
             )
         } else {
-            Icon(
-                imageVector = Icons.Rounded.Person,
-                contentDescription = "Profile",
-                tint = Brand.OnSurfaceDim,
-                modifier = Modifier.size(22.dp),
-            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(CircleShape)
+                    .background(Brand.SurfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Person,
+                    contentDescription = "Profile",
+                    tint = Brand.OnSurfaceDim,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
         }
     }
 }

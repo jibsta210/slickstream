@@ -42,6 +42,8 @@ import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.settings.StreamSizePreference
 import com.slickstream.data.source.StreamPicker
+import com.slickstream.data.vlc.VlcEngine
+import com.slickstream.data.vlc.VlcPlayer
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.subtitle.SubtitleRepository
@@ -94,6 +96,7 @@ class PlayerViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val subtitleRepository: SubtitleRepository,
     private val deviceProfile: DeviceProfile,
+    private val vlcEngine: VlcEngine,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
@@ -176,6 +179,15 @@ class PlayerViewModel @Inject constructor(
     private var playerListener: Player.Listener? = null
     private var currentMediaUrl: String? = null
     private var castPlayer: CastPlayer? = null
+
+    /**
+     * libVLC-backed fallback player for codecs ExoPlayer can't decode (XviD/DivX/AVI/WMV…). Built
+     * lazily only when the active source is flagged not-[StreamSource.playable] (or when ExoPlayer
+     * hard-fails to parse it). Plays everything desktop VLC can. The UI attaches its video surface.
+     */
+    private var vlcPlayer: VlcPlayer? = null
+    /** Set once we've fallen back to VLC for the current source, so we don't bounce back to ExoPlayer. */
+    private var usingVlcForSource = false
 
     // --- Automatic source failover ---
     /** infoHashes already attempted for THIS title/episode — failover never re-picks one. */
@@ -347,6 +359,10 @@ class PlayerViewModel @Inject constructor(
         triedInfoHashes.add(source.infoHash)
         failoverInFlight = false
         lastEmittedDownloadedBytes = 0L
+        // Fresh source -> reset the VLC-fallback latch and stop any prior VLC playback so it can't
+        // keep playing audio underneath the new source.
+        usingVlcForSource = false
+        vlcPlayer?.let { runCatching { it.stop() } }
         prefetchTriggeredForEpisode = false
         prefetchJob?.cancel()
         // Fresh source — re-arm the smaller-stream hint and start its buffering clock.
@@ -439,6 +455,7 @@ class PlayerViewModel @Inject constructor(
         playerListener?.let { exo?.removeListener(it) }
         exo?.release()
         _player.value = null
+        vlcPlayer?.let { runCatching { it.stop() } }
         if (!_isCasting.value) _currentPlayer.value = null
         currentMediaUrl = null
         sourceErrorRetries = 0
@@ -452,7 +469,21 @@ class PlayerViewModel @Inject constructor(
             ensurePlayer(url)
             if (status.state == StreamState.ERROR && status.errorMessage != null) {
                 _uiState.value = PlayerUiState.Error(status.errorMessage!!)
+                return
             }
+            // The URL is up and the player is now attaching: fetching the moov/tail and filling its
+            // own buffer. The torrent keeps reporting progress through this phase, so KEEP showing an
+            // ETA-to-playing here instead of dropping to a blank "Buffering…" — that post-download gap
+            // is exactly what made the old estimate feel wrong (it counted only the raw download).
+            // Don't clobber an already-Playing state.
+            if (_uiState.value is PlayerUiState.Playing) return
+            _uiState.value = PlayerUiState.Buffering(
+                percent = (status.progress * 100f).toInt().coerceIn(0, 100),
+                seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
+                downloadRateBytes = status.downloadRateBytes,
+                label = "Almost ready…",
+                etaSeconds = etaToPlaying(status),
+            )
             return
         }
 
@@ -475,24 +506,32 @@ class PlayerViewModel @Inject constructor(
             StreamState.IDLE -> "Connecting to peers…"
             else -> "Buffering…"
         }
-        // Estimate time-to-start from how much of the ready head buffer is left at the current rate
-        // (sequential download => downloadedBytes ≈ the contiguous head). The ×1.6 fudge covers the
-        // moov/tail fetch + ExoPlayer prepare that still happen AFTER the head fills, so the number
-        // isn't wildly optimistic. The UI only shows it while it's still meaningfully large.
-        val eta = if (status.downloadRateBytes > 0 && status.state == StreamState.BUFFERING) {
-            val remaining = (READY_TARGET_BYTES - status.downloadedBytes).coerceAtLeast(0L)
-            ((remaining * 8 / 5) / status.downloadRateBytes).toInt().takeIf { it in 1..900 }
-        } else {
-            null
-        }
         _uiState.value = PlayerUiState.Buffering(
             percent = (status.progress * 100f).toInt().coerceIn(0, 100),
             seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
             downloadRateBytes = status.downloadRateBytes,
             label = label,
-            etaSeconds = eta,
+            etaSeconds = etaToPlaying(status),
         )
         maybeSuggestSmaller(status.downloadRateBytes)
+    }
+
+    /**
+     * Estimated seconds until the video ACTUALLY starts playing — not just until the head download
+     * finishes. = (bytes still needed to be playable ÷ current rate) + a fixed margin for the
+     * moov/tail fetch + ExoPlayer prepare that always happen AFTER the head fills. Once enough is
+     * downloaded the estimate settles to that margin and keeps counting down through the player's own
+     * buffering, so it no longer drops to a blank "Buffering…" right before playback. Null when more
+     * bytes are needed but the rate is too low to estimate.
+     */
+    private fun etaToPlaying(status: StreamStatus): Int? {
+        val needed = (PLAYABLE_TARGET_BYTES - status.downloadedBytes).coerceAtLeast(0L)
+        val downloadSecs = when {
+            needed == 0L -> 0
+            status.downloadRateBytes > 0 -> (needed / status.downloadRateBytes).toInt()
+            else -> return null
+        }
+        return (downloadSecs + PREPARE_MARGIN_SECONDS).takeIf { it in 1..900 }
     }
 
     /**
@@ -533,6 +572,12 @@ class PlayerViewModel @Inject constructor(
 
     @OptIn(UnstableApi::class)
     private fun ensurePlayer(url: String) {
+        // A source ExoPlayer can't decode (XviD/AVI/WMV…) goes straight to the libVLC fallback so it
+        // actually plays instead of black-screening. usingVlcForSource latches once we've switched.
+        if (usingVlcForSource || _currentSource.value?.playable == false) {
+            ensureVlcPlayer(url)
+            return
+        }
         val existing = _player.value
         if (existing != null) {
             // Only reload on a genuine URL change (source switch); steady-state
@@ -667,11 +712,17 @@ class PlayerViewModel @Inject constructor(
                         delay(SOURCE_RETRY_BACKOFF_MS * sourceErrorRetries)
                         runCatching { p.prepare(); p.playWhenReady = true }
                     }
+                } else if (isParse && !usingVlcForSource && !_isCasting.value && currentMediaUrl != null) {
+                    // ExoPlayer can't parse/decode this container/codec even after retries (e.g. an
+                    // XviD/AVI the codec heuristic didn't catch). Hand the SAME source to the libVLC
+                    // fallback (bundles FFmpeg, plays everything) at the current position before giving
+                    // up on it — this is the "every codec works" path.
+                    val pos = _currentPlayer.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    switchToVlc(currentMediaUrl!!, pos)
                 } else {
-                    // Per-source ExoPlayer retries are spent (dead moov / bad container / a codec this
-                    // device can't decode). Before dead-ending, hand off to the next untried source
-                    // automatically; only surface the error (with its code) once every candidate is
-                    // exhausted. Casting can't fail over locally, so it still shows the error.
+                    // Per-source retries are spent and VLC can't help (or already tried). Before
+                    // dead-ending, hand off to the next untried source automatically; only surface the
+                    // error (with its code) once every candidate is exhausted. Casting can't fail over.
                     val msg = error.localizedMessage ?: "Playback error"
                     if (!_isCasting.value) {
                         viewModelScope.launch {
@@ -692,6 +743,98 @@ class PlayerViewModel @Inject constructor(
         if (preferredSubCode != null) applyPreferredSub()
         startProgressTicker()
         ensureCastPlayer()
+    }
+
+    /**
+     * Build (or reuse) the libVLC fallback player and hand it the stream. VlcPlayer is a Media3
+     * [Player], so the existing PlayerView / TV transport / progress logic drive it unchanged — the
+     * screens just attach its video surface. We tear down any ExoPlayer first (a source is played by
+     * exactly one backend at a time).
+     */
+    @OptIn(UnstableApi::class)
+    private fun ensureVlcPlayer(url: String, startPositionMs: Long = 0L) {
+        usingVlcForSource = true
+        val existing = vlcPlayer
+        if (existing != null && currentMediaUrl == url) return  // steady-state READY re-emit -> no-op
+
+        // One backend at a time: drop the ExoPlayer if it was the one showing.
+        _player.value?.let { exo ->
+            playerListener?.let { exo.removeListener(it) }
+            exo.release()
+        }
+        _player.value = null
+        playerListener = null
+
+        val vlc = existing ?: VlcPlayer(vlcEngine, appContext).also { built ->
+            vlcPlayer = built
+            built.addListener(buildVlcListener(built))
+        }
+        vlc.setMediaItem(buildMediaItem(url), startPositionMs)
+        vlc.prepare()
+        vlc.playWhenReady = !_isCasting.value
+        currentMediaUrl = url
+        if (!_isCasting.value) _currentPlayer.value = vlc
+        startProgressTicker()
+    }
+
+    /** Lean transport listener for the VLC backend (READY -> Playing + resume, ENDED -> next). */
+    private fun buildVlcListener(vlc: VlcPlayer): Player.Listener = object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            when (playbackState) {
+                Player.STATE_READY -> {
+                    maybeSeekToResume(vlc)
+                    bufferingSinceMs = 0L
+                    _suggestSmaller.value = false
+                    _uiState.value = PlayerUiState.Playing
+                }
+                Player.STATE_BUFFERING -> {
+                    if (_uiState.value !is PlayerUiState.Playing) {
+                        _uiState.value = PlayerUiState.Buffering(
+                            percent = 100,
+                            seeders = _currentSource.value?.seeders ?: 0,
+                            downloadRateBytes = 0,
+                            label = "Buffering…",
+                        )
+                    }
+                }
+                Player.STATE_ENDED -> {
+                    saveProgressNow()
+                    if (mediaType == MediaType.TV && _hasNext.value) nextEpisode()
+                }
+                else -> Unit
+            }
+        }
+
+        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+            val w = videoSize.width
+            val h = videoSize.height
+            if (w > 0 && h > 0) {
+                val par = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
+                _videoAspect.value = (w * par) / h
+            }
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (!isPlaying) saveProgressNow()
+        }
+    }
+
+    /** Hand the CURRENT source to VLC at [startPositionMs] (ExoPlayer couldn't decode it). */
+    private fun switchToVlc(url: String, startPositionMs: Long) {
+        _uiState.value = PlayerUiState.Buffering(
+            percent = 0,
+            seeders = _currentSource.value?.seeders ?: 0,
+            downloadRateBytes = 0,
+            label = "Switching player…",
+        )
+        currentMediaUrl = null   // force ensureVlcPlayer to (re)load even if the url matches
+        ensureVlcPlayer(url, startPositionMs)
+    }
+
+    /** Release the VLC fallback player, if any. */
+    private fun releaseVlcPlayer() {
+        vlcPlayer?.let { runCatching { it.release() } }
+        vlcPlayer = null
     }
 
     // --- Subtitles ----------------------------------------------------------
@@ -838,13 +981,13 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    private fun maybeSeekToResume(exo: ExoPlayer) {
+    private fun maybeSeekToResume(player: Player) {
         if (hasSeekedToResume) return
         hasSeekedToResume = true
         viewModelScope.launch {
             val saved = libraryRepository.getProgress(mediaId, mediaType, currentSeason, currentEpisode)
             if (saved != null && !saved.isFinished && saved.positionMs > 0) {
-                exo.seekTo(saved.positionMs)
+                player.seekTo(saved.positionMs)
             }
         }
     }
@@ -861,15 +1004,17 @@ class PlayerViewModel @Inject constructor(
     }
 
     private fun saveProgressNow() {
-        val exo = _player.value ?: return
+        // Read from whichever local backend is active — ExoPlayer or the VLC fallback (both Media3
+        // [Player]s). Keep using _player while casting so we persist the local position, not the TV's.
+        val p: Player = _player.value ?: vlcPlayer ?: return
         val d = details ?: return
-        val position = exo.currentPosition
+        val position = p.currentPosition
         if (position <= 0L) return
-        // exo.duration is C.TIME_UNSET (negative) until the container tail (mp4 moov / mkv cues) is
+        // duration is C.TIME_UNSET (negative) until the container tail (mp4 moov / mkv cues) is
         // parsed — common on low-power TV that starts via the tail-grace path. Don't drop the save:
         // persist a 0 "unknown" duration so the resume point survives; the next ticker save fills in
-        // the real duration once ExoPlayer learns it. (This was the TV "forgot my spot" bug.)
-        val rawDuration = exo.duration
+        // the real duration once the player learns it. (This was the TV "forgot my spot" bug.)
+        val rawDuration = p.duration
         val duration = if (rawDuration > 0L) rawDuration else 0L
         val item: MediaItem = d.item
         val progress = PlaybackProgress(
@@ -1112,6 +1257,7 @@ class PlayerViewModel @Inject constructor(
         playerListener?.let { exo?.removeListener(it) }
         exo?.release()
         _player.value = null
+        releaseVlcPlayer()
         castPlayer?.setSessionAvailabilityListener(null)
         castPlayer?.release()
         castPlayer = null
@@ -1148,9 +1294,13 @@ class PlayerViewModel @Inject constructor(
         /** ...or once past this fraction of the runtime, whichever comes first. */
         const val PREFETCH_PCT = 0.85f
 
+        /** Bytes that must download before playback can actually START (head + a moov/tail cushion) —
+         *  the ETA target. Bigger than the bare head so the estimate isn't wildly optimistic. */
+        const val PLAYABLE_TARGET_BYTES = 6L * 1024 * 1024
+        /** Fixed seconds added to the ETA for the moov/tail fetch + ExoPlayer prepare AFTER the head
+         *  fills, so "time to playing" includes the post-download buffering, not just the download. */
+        const val PREPARE_MARGIN_SECONDS = 3
         /** Suggest a smaller stream only after a buffer has dragged on this long (~25 s). */
-        /** ~head (2MB) + moov tail (1MB) the engine needs before playback can start — drives the ETA. */
-        const val READY_TARGET_BYTES = 3L * 1024 * 1024
         const val BUFFERING_NAG_MS = 25_000L
         /** ...and only while the download rate is below this (~150 KB/s) — a genuinely starved swarm. */
         const val BUFFERING_LOW_RATE_BYTES = 150 * 1024

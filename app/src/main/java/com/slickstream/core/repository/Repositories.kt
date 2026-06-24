@@ -9,6 +9,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.PlaybackProgress
+import com.slickstream.core.model.Profile
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.StreamStatus
 import com.slickstream.core.model.UserProfile
@@ -55,6 +56,27 @@ interface LibraryRepository {
 
     /** Clear the watched/in-progress row for a movie or a specific episode. */
     suspend fun markUnwatched(item: MediaItem, season: Int?, episode: Int?)
+}
+
+/**
+ * The active-profile source of truth + CRUD over the named profiles. Implemented by data/local.
+ * The active profile drives which favourites/watch-history rows the [LibraryRepository] reads/writes.
+ */
+interface ProfileRepository {
+    /** All profiles (always contains at least the default). */
+    fun observeProfiles(): Flow<List<Profile>>
+
+    /** The active profile id, persisted across launches. Never empty (defaults to the default profile). */
+    val activeProfileId: StateFlow<String>
+
+    /** The active profile object (kids flag etc.), or null until first load. */
+    val activeProfile: StateFlow<Profile?>
+
+    suspend fun currentProfileId(): String
+    suspend fun setActiveProfile(profileId: String)
+    suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int): Profile
+    suspend fun updateProfile(profile: Profile)
+    suspend fun deleteProfile(profileId: String)
 }
 
 /**

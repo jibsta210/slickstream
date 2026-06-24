@@ -55,7 +55,6 @@ class StreamHttpServer(
 
         val mime = mimeOf(file.name)
         val rangeHeader = session.headers["range"]
-        Log.i(TAG, "REQ ${session.method} range=$rangeHeader total=$totalLength mime=$mime file=${file.name}")
 
         // HEAD request: just advertise capabilities + length.
         if (session.method == Method.HEAD) {
@@ -94,7 +93,6 @@ class StreamHttpServer(
         if (start > end || start < 0) return rangeNotSatisfiable(totalLength)
 
         val contentLength = end - start + 1
-        Log.i(TAG, "PARTIAL start=$start end=$end contentLen=$contentLength total=$totalLength")
         // Make sure the first chunk of the requested window is on disk before we respond.
         blockForRange(infoHash, start, (start + HEAD_SERVE_BYTES - 1).coerceAtMost(end))
 

@@ -65,6 +65,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
+import com.slickstream.data.vlc.VlcPlayer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -210,6 +211,12 @@ fun TvPlayerScreen(
                 update = { view ->
                     view.player = player
                     view.subtitleView?.applyAppearance(captionPrefs.size, captionPrefs.style)
+                    // libVLC renders into PlayerView's surface but never signals Media3's first-frame,
+                    // so make the black shutter transparent for the VLC fallback (else it hides video).
+                    view.setShutterBackgroundColor(
+                        if (player is VlcPlayer) android.graphics.Color.TRANSPARENT
+                        else android.graphics.Color.BLACK,
+                    )
                 },
                 modifier = Modifier.fillMaxSize(),
             )

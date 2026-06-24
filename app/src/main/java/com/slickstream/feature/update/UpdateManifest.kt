@@ -25,4 +25,7 @@ sealed interface UpdateUiState {
     data class ReadyToInstall(val manifest: UpdateManifest) : UpdateUiState
     data class Error(val message: String) : UpdateUiState
     data object Dismissed : UpdateUiState
+
+    /** Result of an explicit Settings "Check for updates" when already on the latest build. */
+    data object UpToDate : UpdateUiState
 }

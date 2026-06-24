@@ -12,15 +12,21 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface FavoriteDao {
 
-    /** Most recently added first. */
-    @Query("SELECT * FROM favorites ORDER BY addedAt DESC")
-    fun observeAll(): Flow<List<FavoriteEntity>>
+    /** Most recently added first, scoped to a profile. */
+    @Query("SELECT * FROM favorites WHERE profileId = :profileId ORDER BY addedAt DESC")
+    fun observeAll(profileId: String): Flow<List<FavoriteEntity>>
 
-    @Query("SELECT EXISTS(SELECT 1 FROM favorites WHERE id = :id AND mediaType = :type)")
-    suspend fun isFavorite(id: Int, type: MediaType): Boolean
+    @Query(
+        "SELECT EXISTS(SELECT 1 FROM favorites " +
+            "WHERE id = :id AND mediaType = :type AND profileId = :profileId)",
+    )
+    suspend fun isFavorite(id: Int, type: MediaType, profileId: String): Boolean
 
-    @Query("SELECT EXISTS(SELECT 1 FROM favorites WHERE id = :id AND mediaType = :type)")
-    fun observeIsFavorite(id: Int, type: MediaType): Flow<Boolean>
+    @Query(
+        "SELECT EXISTS(SELECT 1 FROM favorites " +
+            "WHERE id = :id AND mediaType = :type AND profileId = :profileId)",
+    )
+    fun observeIsFavorite(id: Int, type: MediaType, profileId: String): Flow<Boolean>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: FavoriteEntity)
@@ -28,6 +34,6 @@ interface FavoriteDao {
     @Delete
     suspend fun delete(entity: FavoriteEntity)
 
-    @Query("DELETE FROM favorites WHERE id = :id AND mediaType = :type")
-    suspend fun deleteById(id: Int, type: MediaType)
+    @Query("DELETE FROM favorites WHERE id = :id AND mediaType = :type AND profileId = :profileId")
+    suspend fun deleteById(id: Int, type: MediaType, profileId: String)
 }

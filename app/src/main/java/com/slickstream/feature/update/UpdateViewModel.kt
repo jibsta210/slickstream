@@ -48,6 +48,15 @@ class UpdateViewModel @Inject constructor(
         }
     }
 
+    /** User-initiated check (Settings). Always re-checks and ignores a session dismissal. */
+    fun forceCheck() {
+        viewModelScope.launch {
+            _state.value = UpdateUiState.Checking
+            val manifest = checker.check(ignoreDismiss = true)
+            _state.value = if (manifest != null) UpdateUiState.Available(manifest) else UpdateUiState.UpToDate
+        }
+    }
+
     fun startDownload(manifest: UpdateManifest) {
         viewModelScope.launch {
             _state.value = UpdateUiState.Downloading(0)
@@ -77,7 +86,7 @@ class UpdateViewModel @Inject constructor(
     }
 
     fun dismiss(manifest: UpdateManifest) {
-        viewModelScope.launch { checker.dismiss(manifest.versionCode) }
+        checker.dismiss(manifest.versionCode)
         _state.value = UpdateUiState.Dismissed
     }
 }

@@ -8,6 +8,7 @@ import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.core.repository.CatalogRepository
 import com.slickstream.core.repository.LibraryRepository
+import com.slickstream.core.repository.ProfileRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
@@ -49,6 +51,7 @@ data class HomeUiState(
 class HomeViewModel @Inject constructor(
     private val catalogRepository: CatalogRepository,
     private val libraryRepository: LibraryRepository,
+    private val profileRepository: ProfileRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -70,19 +73,35 @@ class HomeViewModel @Inject constructor(
             }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    /** Whether the active profile is a kids profile — branches Home between default and kid rows. */
+    private var kidsMode: Boolean = false
+
     init {
         // Keep the continue-watching row in sync with the local library at all times.
         history
             .onEach { items -> _uiState.value = _uiState.value.copy(continueWatching = items) }
             .launchIn(viewModelScope)
 
-        load()
+        // Re-load Home whenever the active profile's identity OR kids-ness changes (a switch to a
+        // kids profile swaps in the family rows; switching back restores the defaults unchanged).
+        profileRepository.activeProfile
+            .map { it?.id to (it?.isKids ?: false) }
+            .distinctUntilChanged()
+            .onEach { (_, isKids) ->
+                kidsMode = isKids
+                load()
+            }
+            .launchIn(viewModelScope)
     }
 
     /** Pull-to-refresh / retry entry point. */
     fun refresh() = load(isRefresh = true)
 
     private fun load(isRefresh: Boolean = false) {
+        if (kidsMode) loadKids(isRefresh) else loadDefault(isRefresh)
+    }
+
+    private fun loadDefault(isRefresh: Boolean) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 isLoading = !isRefresh,
@@ -116,22 +135,73 @@ class HomeViewModel @Inject constructor(
                 .firstOrNull { !it.backdropUrl.isNullOrBlank() }
                 ?: trending.itemsOrEmpty().firstOrNull()
 
-            if (rows.isEmpty()) {
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    isRefreshing = false,
-                    errorMessage = firstError(trending, popularMovies, popularTv, topRated, upcoming)
-                        ?: "Couldn't load content. Check your connection and try again.",
-                )
-            } else {
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    isRefreshing = false,
-                    errorMessage = null,
-                    featured = featured,
-                    rows = rows,
-                )
+            publish(rows, featured, firstError(trending, popularMovies, popularTv, topRated, upcoming), isRefresh)
+        }
+    }
+
+    /**
+     * Kid-focused Home: family/animation movie + kids/family TV rows from the genre discover
+     * endpoint (which already sends include_adult=false). The hero comes from the first non-empty
+     * kid row so the banner is also family-safe.
+     */
+    private fun loadKids(isRefresh: Boolean) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isLoading = !isRefresh,
+                isRefreshing = isRefresh,
+                errorMessage = null,
+            )
+
+            val familyMoviesDef = asyncCatalog { catalogRepository.getByGenre(MediaType.MOVIE, GENRE_FAMILY) }
+            val animationDef = asyncCatalog { catalogRepository.getByGenre(MediaType.MOVIE, GENRE_ANIMATION) }
+            val kidsTvDef = asyncCatalog { catalogRepository.getByGenre(MediaType.TV, GENRE_TV_KIDS) }
+            val familyTvDef = asyncCatalog { catalogRepository.getByGenre(MediaType.TV, GENRE_FAMILY) }
+
+            val familyMovies = familyMoviesDef.await()
+            val animation = animationDef.await()
+            val kidsTv = kidsTvDef.await()
+            val familyTv = familyTvDef.await()
+
+            val rows = buildList {
+                familyMovies.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Family Movies", it)) }
+                animation.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Animation", it)) }
+                kidsTv.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Kids TV", it)) }
+                familyTv.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Family Shows", it)) }
             }
+
+            // Hero from a kid row — prefer one with a backdrop, across all kid rows.
+            val featured = rows.asSequence().flatMap { it.items.asSequence() }
+                .firstOrNull { !it.backdropUrl.isNullOrBlank() }
+                ?: rows.firstOrNull()?.items?.firstOrNull()
+
+            publish(rows, featured, firstError(familyMovies, animation, kidsTv, familyTv), isRefresh)
+        }
+    }
+
+    /** Commit a freshly loaded set of rows (or an error when nothing loaded) to the UI state. */
+    private fun publish(
+        rows: List<MediaRowUi>,
+        featured: MediaItem?,
+        error: String?,
+        isRefresh: Boolean,
+    ) {
+        if (rows.isEmpty()) {
+            _uiState.value = _uiState.value.copy(
+                isLoading = false,
+                isRefreshing = false,
+                featured = null,
+                rows = emptyList(),
+                errorMessage = error
+                    ?: "Couldn't load content. Check your connection and try again.",
+            )
+        } else {
+            _uiState.value = _uiState.value.copy(
+                isLoading = false,
+                isRefreshing = false,
+                errorMessage = null,
+                featured = featured,
+                rows = rows,
+            )
         }
     }
 
@@ -144,4 +214,11 @@ class HomeViewModel @Inject constructor(
 
     private fun firstError(vararg results: DataResult<List<MediaItem>>): String? =
         results.filterIsInstance<DataResult.Error>().firstOrNull()?.message
+
+    private companion object {
+        // TMDB genre ids used to build the kids Home.
+        const val GENRE_FAMILY = 10751
+        const val GENRE_ANIMATION = 16
+        const val GENRE_TV_KIDS = 10762
+    }
 }
