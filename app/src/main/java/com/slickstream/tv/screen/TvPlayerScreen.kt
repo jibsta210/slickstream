@@ -110,6 +110,7 @@ fun TvPlayerScreen(
     val currentEpisodeNumber by viewModel.currentEpisodeNumber.collectAsStateWithLifecycle()
     val hasNext by viewModel.hasNext.collectAsStateWithLifecycle()
     val hasPrevious by viewModel.hasPrevious.collectAsStateWithLifecycle()
+    val suggestSmaller by viewModel.suggestSmaller.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -222,6 +223,10 @@ fun TvPlayerScreen(
                 onBack = onBack,
                 canSwitchSource = sources.size > 1,
                 onSwitchSource = { panelOpen = true },
+                // Gentle "taking a while? try a smaller stream" nudge — only after a long, starved buffer.
+                suggestSmaller = suggestSmaller,
+                onSwitchToSmaller = { viewModel.switchToSmaller() },
+                onDismissSuggestSmaller = { viewModel.dismissSuggestSmaller() },
             )
             is PlayerUiState.Error -> ErrorOverlay(
                 message = s.message,
@@ -352,12 +357,19 @@ private fun BufferingOverlay(
     onBack: () -> Unit,
     canSwitchSource: Boolean = false,
     onSwitchSource: () -> Unit = {},
+    suggestSmaller: Boolean = false,
+    onSwitchToSmaller: () -> Unit = {},
+    onDismissSuggestSmaller: () -> Unit = {},
 ) {
     val backFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
+    val smallerFocus = remember { FocusRequester() }
+    // Land focus on the smaller-stream action the moment it appears so it's D-pad operable; otherwise
+    // fall back to the Back button.
+    LaunchedEffect(suggestSmaller) {
+        val target = if (suggestSmaller) smallerFocus else backFocus
         repeat(12) {
             kotlinx.coroutines.delay(40)
-            if (runCatching { backFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            if (runCatching { target.requestFocus() }.isSuccess) return@LaunchedEffect
         }
     }
     Box(
@@ -378,6 +390,14 @@ private fun BufferingOverlay(
             )
             Text(title, style = MaterialTheme.typography.titleLarge, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(state.label, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
+            state.etaSeconds?.let { eta ->
+                Text(
+                    text = if (eta <= 1) "Starting…" else "Starts in ~${eta}s",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Brand.Cyan,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
             val detail = buildString {
                 if (state.percent > 0) append("${state.percent}%")
                 if (state.seeders > 0) {
@@ -392,6 +412,31 @@ private fun BufferingOverlay(
             if (detail.isNotBlank()) {
                 Text(detail, style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
             }
+
+            // Gentle, dismissible "taking a while?" card — only once the VM decides a smaller,
+            // well-seeded source would genuinely help. Non-blocking; the buffer keeps filling behind it.
+            AnimatedVisibility(visible = suggestSmaller, enter = fadeIn(), exit = fadeOut()) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier
+                        .padding(top = 4.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Brand.Surface.copy(alpha = 0.92f))
+                        .padding(horizontal = 28.dp, vertical = 20.dp),
+                ) {
+                    Text(
+                        "Taking a while? Try a smaller stream",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = Color.White,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                        ErrorButton("Smaller stream", onClick = onSwitchToSmaller, focusRequester = smallerFocus)
+                        ErrorButton("Dismiss", onClick = onDismissSuggestSmaller)
+                    }
+                }
+            }
+
             Spacer(Modifier.height(8.dp))
             // Focusable actions so the user is never stranded on the fetch/buffer screen — and can
             // switch to a healthier torrent without waiting for playback to start (parity with phone).
@@ -615,9 +660,15 @@ private fun ScrubBar(
         while (true) {
             val p = player
             if (p != null && !scrubbing) {
-                positionMs = p.currentPosition.coerceAtLeast(0L)
-                bufferedMs = p.bufferedPosition.coerceAtLeast(0L)
-                durationMs = p.duration.takeIf { it > 0 } ?: 0L
+                // Only write when the value actually changed — an unconditional assignment every 500ms
+                // dirties these state objects and forces a recomposition even when nothing moved (e.g.
+                // paused, or while the overlay is hidden off-screen).
+                val pos = p.currentPosition.coerceAtLeast(0L)
+                val buf = p.bufferedPosition.coerceAtLeast(0L)
+                val dur = p.duration.takeIf { it > 0 } ?: 0L
+                if (pos != positionMs) positionMs = pos
+                if (buf != bufferedMs) bufferedMs = buf
+                if (dur != durationMs) durationMs = dur
             }
             kotlinx.coroutines.delay(500)
         }

@@ -182,6 +182,8 @@ private fun HeroImage(
     val painter = rememberAsyncImagePainter(
         model = ImageRequest.Builder(context)
             .data(url)
+            // Cap decode resolution to the hero's on-screen footprint.
+            .size(1080, 675)
             .crossfade(true)
             .build(),
     )

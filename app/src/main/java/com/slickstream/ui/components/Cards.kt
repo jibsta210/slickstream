@@ -90,6 +90,7 @@ fun PosterCard(
                 contentDescription = item.title,
                 fallbackTitle = item.title,
                 mediaType = item.mediaType,
+                wide = false,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -166,6 +167,7 @@ fun BackdropCard(
                 contentDescription = item.title,
                 fallbackTitle = item.title,
                 mediaType = item.mediaType,
+                wide = true,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -223,12 +225,18 @@ private fun MediaImage(
     contentDescription: String,
     fallbackTitle: String,
     mediaType: MediaType,
+    wide: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val painter = rememberAsyncImagePainter(
         model = ImageRequest.Builder(context)
             .data(url)
+            // Cap the decode resolution to roughly the tile's footprint so we don't
+            // decode full-res TMDB bitmaps for small cards (the source of scroll jank).
+            .apply {
+                if (wide) size(480, 270) else size(360, 540)
+            }
             .crossfade(true)
             .build(),
     )

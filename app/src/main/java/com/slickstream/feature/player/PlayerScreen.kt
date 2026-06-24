@@ -122,6 +122,7 @@ fun PlayerScreen(
     val currentEpisodeNumber by viewModel.currentEpisodeNumber.collectAsState()
     val hasNext by viewModel.hasNext.collectAsState()
     val hasPrevious by viewModel.hasPrevious.collectAsState()
+    val suggestSmaller by viewModel.suggestSmaller.collectAsState()
     val context = LocalContext.current
 
     var showSources by remember { mutableStateOf(false) }
@@ -281,7 +282,13 @@ fun PlayerScreen(
         if (!isInPip) {
             when (val state = uiState) {
                 // Only show our buffering bar before the player exists (torrent head-download).
-                is PlayerUiState.Buffering -> if (player == null) BufferingOverlay(state)
+                is PlayerUiState.Buffering -> if (player == null) BufferingOverlay(
+                    state = state,
+                    // Gentle "taking a while? try a smaller stream" nudge — only after a long, starved buffer.
+                    suggestSmaller = suggestSmaller,
+                    onSwitchToSmaller = viewModel::switchToSmaller,
+                    onDismissSuggestSmaller = viewModel::dismissSuggestSmaller,
+                )
                 is PlayerUiState.Error -> ErrorOverlay(
                     message = state.message,
                     onRetry = viewModel::retry,
@@ -492,7 +499,12 @@ private fun SourcesButton(onClick: () -> Unit) {
 }
 
 @Composable
-private fun BufferingOverlay(state: PlayerUiState.Buffering) {
+private fun BufferingOverlay(
+    state: PlayerUiState.Buffering,
+    suggestSmaller: Boolean = false,
+    onSwitchToSmaller: () -> Unit = {},
+    onDismissSuggestSmaller: () -> Unit = {},
+) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -515,6 +527,15 @@ private fun BufferingOverlay(state: PlayerUiState.Buffering) {
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 16.sp,
             )
+            state.etaSeconds?.let { eta ->
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = if (eta <= 1) "Starting…" else "Starts in ~${eta}s",
+                    color = Brand.Cyan,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                )
+            }
             Spacer(Modifier.height(16.dp))
             // Single slick progress bar — determinate once we have download progress, otherwise a
             // smooth indeterminate sweep while connecting / fetching metadata.
@@ -541,6 +562,67 @@ private fun BufferingOverlay(state: PlayerUiState.Buffering) {
                 text = bufferingStats(state),
                 color = Brand.OnSurfaceDim,
                 fontSize = 13.sp,
+            )
+
+            // Gentle, dismissible "taking a while?" card — only once the VM decides a smaller,
+            // well-seeded source would genuinely help. Non-blocking; the buffer keeps filling behind it.
+            AnimatedVisibility(visible = suggestSmaller, enter = fadeIn(), exit = fadeOut()) {
+                SmallerStreamPrompt(
+                    onSwitchToSmaller = onSwitchToSmaller,
+                    onDismiss = onDismissSuggestSmaller,
+                )
+            }
+        }
+    }
+}
+
+/** Brand-styled, non-blocking nudge shown over the buffering bar when a smaller stream may help. */
+@Composable
+private fun SmallerStreamPrompt(
+    onSwitchToSmaller: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .padding(top = 24.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Brand.Surface.copy(alpha = 0.92f))
+            .padding(horizontal = 24.dp, vertical = 18.dp),
+    ) {
+        Text(
+            text = "Taking a while? Try a smaller stream",
+            color = Brand.OnSurface,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
+        )
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(Brand.Violet)
+                    .clickable(onClick = onSwitchToSmaller)
+                    .padding(horizontal = 22.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Smaller stream",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Text(
+                text = "Dismiss",
+                color = Brand.OnSurfaceDim,
+                fontWeight = FontWeight.Medium,
+                fontSize = 14.sp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(onClick = onDismiss)
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
             )
         }
     }

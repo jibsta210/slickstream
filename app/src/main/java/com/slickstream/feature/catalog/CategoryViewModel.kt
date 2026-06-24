@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -48,8 +50,16 @@ class CategoryViewModel @Inject constructor(
      * Items to render: when [query] is non-blank, the loaded items whose title contains the query
      * (case-insensitive); otherwise the full loaded list. Note: this filters loaded results only —
      * paging via [loadMore] still walks the complete genre list, not the filtered subset.
+     *
+     * The query is debounced (~200ms) so the whole grid isn't re-filtered/recomposed on every
+     * keystroke; [setQuery] still updates the text field instantly. [onStart] re-emits the current
+     * query so the first filtered list isn't delayed by the debounce on initial subscription.
      */
-    val visibleItems: StateFlow<List<MediaItem>> = combine(_state, _query) { state, query ->
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    val visibleItems: StateFlow<List<MediaItem>> = combine(
+        _state,
+        _query.debounce(200).onStart { emit(_query.value) },
+    ) { state, query ->
         val q = query.trim()
         if (q.isBlank()) state.items
         else state.items.filter { it.title.contains(q, ignoreCase = true) }

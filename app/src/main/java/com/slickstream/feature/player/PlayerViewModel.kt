@@ -40,6 +40,7 @@ import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
+import com.slickstream.data.settings.StreamSizePreference
 import com.slickstream.data.source.StreamPicker
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
@@ -69,6 +70,8 @@ sealed interface PlayerUiState {
         val seeders: Int,
         val downloadRateBytes: Int,
         val label: String,
+        /** Rough seconds until playback can start (head buffer / rate); null when not estimable. */
+        val etaSeconds: Int? = null,
     ) : PlayerUiState
 
     /** Player has a stream URL and is (or will shortly be) playing. */
@@ -121,6 +124,15 @@ class PlayerViewModel @Inject constructor(
     private val _currentSource = MutableStateFlow<StreamSource?>(null)
     val currentSource: StateFlow<StreamSource?> = _currentSource.asStateFlow()
 
+    /**
+     * One-shot "this is taking a while — try a smaller stream" hint. Set true only when a buffer has
+     * dragged on past [BUFFERING_NAG_MS] with a low download rate AND a smaller, well-seeded source
+     * actually exists below the current one. Reset on Playing / source switch / dismiss. Shown at
+     * most once per source so we never nag.
+     */
+    private val _suggestSmaller = MutableStateFlow(false)
+    val suggestSmaller: StateFlow<Boolean> = _suggestSmaller.asStateFlow()
+
     private val _player = MutableStateFlow<ExoPlayer?>(null)
     val player: StateFlow<ExoPlayer?> = _player.asStateFlow()
 
@@ -164,6 +176,14 @@ class PlayerViewModel @Inject constructor(
     private var playerListener: Player.Listener? = null
     private var currentMediaUrl: String? = null
     private var castPlayer: CastPlayer? = null
+
+    // --- "Stuck buffering -> try a smaller stream" hint ---
+    /** When the current continuous buffer began (uptime ms); 0 while not buffering. */
+    private var bufferingSinceMs: Long = 0L
+    /** Already shown the smaller-stream hint for this source — don't nag again. */
+    private var suggestedSmallerForSource = false
+    /** Effective quality cap from the last auto-pick — reused by the synchronous smaller-source scan. */
+    @Volatile private var currentNetworkMaxTier: Int? = null
 
     // --- Next-episode prefetch ---
     private var prefetchJob: Job? = null
@@ -250,12 +270,29 @@ class PlayerViewModel @Inject constructor(
     /** Switch to a different quality/source, keeping the previous download cached. */
     fun selectSource(source: StreamSource) {
         if (source.infoHash == _currentSource.value?.infoHash) return
+        // A source switch clears any pending hint; startSource() re-arms it for the new source.
+        _suggestSmaller.value = false
         viewModelScope.launch {
             // Persist where we are before tearing the current stream down.
             saveProgressNow()
             stopActiveStream(removeFiles = false)
             startSource(source)
         }
+    }
+
+    /**
+     * Act on the "try a smaller stream" hint: switch to the smallest healthy source below the
+     * current one (via [StreamPicker]). No-op if none qualifies — the hint just clears.
+     */
+    fun switchToSmaller() {
+        val smaller = findSmallerHealthySource()
+        _suggestSmaller.value = false
+        if (smaller != null) selectSource(smaller)
+    }
+
+    /** Dismiss the smaller-stream hint without switching. Won't reappear for this source. */
+    fun dismissSuggestSmaller() {
+        _suggestSmaller.value = false
     }
 
     private suspend fun networkQualityPreference(): QualityPreference {
@@ -271,6 +308,7 @@ class PlayerViewModel @Inject constructor(
      */
     private suspend fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
         val sizePref = settingsRepository.current().streamSize
+        currentNetworkMaxTier = pref.maxTier   // cache for the synchronous smaller-source scan
         return StreamPicker.pick(list, pref.maxTier, sizePref, deviceProfile.isLowPower) ?: list.first()
     }
 
@@ -290,6 +328,10 @@ class PlayerViewModel @Inject constructor(
         activeInfoHash = source.infoHash
         prefetchTriggeredForEpisode = false
         prefetchJob?.cancel()
+        // Fresh source — re-arm the smaller-stream hint and start its buffering clock.
+        suggestedSmallerForSource = false
+        _suggestSmaller.value = false
+        bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
             seeders = source.seeders ?: 0,
@@ -329,12 +371,58 @@ class PlayerViewModel @Inject constructor(
             StreamState.IDLE -> "Connecting to peers…"
             else -> "Buffering…"
         }
+        // Estimate time-to-start from how much of the ~ready head buffer is left at the current
+        // rate (sequential download => downloadedBytes ≈ the contiguous head). Honest, not a file-%.
+        val eta = if (status.downloadRateBytes > 0 && status.state == StreamState.BUFFERING) {
+            val remaining = (READY_TARGET_BYTES - status.downloadedBytes).coerceAtLeast(0L)
+            (remaining / status.downloadRateBytes).toInt().takeIf { it in 1..600 }
+        } else {
+            null
+        }
         _uiState.value = PlayerUiState.Buffering(
             percent = (status.progress * 100f).toInt().coerceIn(0, 100),
             seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
             downloadRateBytes = status.downloadRateBytes,
             label = label,
+            etaSeconds = eta,
         )
+        maybeSuggestSmaller(status.downloadRateBytes)
+    }
+
+    /**
+     * Gentle nudge: if the head-buffer has dragged on past [BUFFERING_NAG_MS] with a low download
+     * rate AND a smaller, well-seeded source exists below the current one, raise the one-shot
+     * [suggestSmaller] hint. Fires at most once per source ([suggestedSmallerForSource]).
+     */
+    private fun maybeSuggestSmaller(downloadRateBytes: Int) {
+        if (suggestedSmallerForSource) return
+        if (bufferingSinceMs == 0L) return
+        val elapsed = android.os.SystemClock.elapsedRealtime() - bufferingSinceMs
+        if (elapsed < BUFFERING_NAG_MS) return
+        if (downloadRateBytes >= BUFFERING_LOW_RATE_BYTES) return
+        if (findSmallerHealthySource() == null) return
+        suggestedSmallerForSource = true
+        _suggestSmaller.value = true
+    }
+
+    /**
+     * The smallest healthy source strictly smaller than the current one — reuses [StreamPicker] over
+     * a SMALLEST size preference, then verifies it is genuinely below the current size. Null when no
+     * such source exists (so we never suggest a switch that wouldn't help).
+     */
+    private fun findSmallerHealthySource(): StreamSource? {
+        val current = _currentSource.value ?: return null
+        val currentSize = current.sizeBytes ?: return null
+        val pref = currentNetworkMaxTier ?: return null
+        val candidate = StreamPicker.pick(
+            list = _sources.value,
+            maxTier = pref,
+            sizePref = StreamSizePreference.SMALLEST,
+            lowPower = deviceProfile.isLowPower,
+        ) ?: return null
+        if (candidate.infoHash == current.infoHash) return null
+        val candidateSize = candidate.sizeBytes ?: return null
+        return if (candidateSize < currentSize) candidate else null
     }
 
     @OptIn(UnstableApi::class)
@@ -401,17 +489,25 @@ class PlayerViewModel @Inject constructor(
                     Player.STATE_READY -> {
                         sourceErrorRetries = 0 // recovered / playing — forget transient stalls
                         maybeSeekToResume(exo)
+                        // Playing — clear the buffering clock and any pending smaller-stream hint.
+                        bufferingSinceMs = 0L
+                        _suggestSmaller.value = false
                         _uiState.value = PlayerUiState.Playing
                     }
                     Player.STATE_BUFFERING -> {
                         if (_uiState.value !is PlayerUiState.Playing) {
                             val s = _currentSource.value
+                            // (Re)start the buffering clock if it was cleared by a prior READY.
+                            if (bufferingSinceMs == 0L) {
+                                bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
+                            }
                             _uiState.value = PlayerUiState.Buffering(
                                 percent = 100,
                                 seeders = s?.seeders ?: 0,
                                 downloadRateBytes = 0,
                                 label = "Buffering…",
                             )
+                            maybeSuggestSmaller(downloadRateBytes = 0)
                         }
                     }
                     Player.STATE_ENDED -> {
@@ -438,11 +534,15 @@ class PlayerViewModel @Inject constructor(
 
             override fun onPlayerError(error: PlaybackException) {
                 val p = _player.value
-                // ERROR_CODE_IO_* (2000-2999) on a torrent = pieces aren't downloaded YET, NOT a dead
-                // stream. Back off to let them arrive, then re-prepare (ExoPlayer keeps the position)
-                // and keep playing. Only show the error screen once retries are genuinely exhausted
-                // (e.g. a 0-seeder torrent that will never fill).
-                val transient = error.errorCode in 2000..2999
+                // Transient on a torrent, NOT a dead stream:
+                //  - IO (2000-2999): pieces aren't downloaded YET.
+                //  - PARSING (3000-3999): ExoPlayer started via tail-grace before the mp4 moov/mkv
+                //    cues fully arrived, so it couldn't parse — re-preparing once they land fixes it.
+                //    (This is the "buffered fast, started, then playback error" case.)
+                // Back off to let bytes arrive, then re-prepare (position retained) and keep playing.
+                // Only show the error screen once retries are genuinely exhausted (truly dead / a codec
+                // the device can't decode, which won't recover and is what "Other streams" is for).
+                val transient = error.errorCode in 2000..3999
                 if (transient && !_isCasting.value && p != null && sourceErrorRetries < MAX_SOURCE_RETRIES) {
                     sourceErrorRetries++
                     _uiState.value = PlayerUiState.Buffering(
@@ -456,7 +556,10 @@ class PlayerViewModel @Inject constructor(
                         runCatching { p.prepare(); p.playWhenReady = true }
                     }
                 } else {
-                    _uiState.value = PlayerUiState.Error(error.localizedMessage ?: "Playback error.")
+                    // Surface the specific code so a recurring failure is diagnosable (e.g. a codec
+                    // this device can't decode vs a bad container).
+                    val msg = error.localizedMessage ?: "Playback error"
+                    _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
                 }
             }
         }
@@ -908,5 +1011,12 @@ class PlayerViewModel @Inject constructor(
         const val PREFETCH_LEAD_MS = 3 * 60_000L
         /** ...or once past this fraction of the runtime, whichever comes first. */
         const val PREFETCH_PCT = 0.85f
+
+        /** Suggest a smaller stream only after a buffer has dragged on this long (~25 s). */
+        /** ~head (2MB) + moov tail (1MB) the engine needs before playback can start — drives the ETA. */
+        const val READY_TARGET_BYTES = 3L * 1024 * 1024
+        const val BUFFERING_NAG_MS = 25_000L
+        /** ...and only while the download rate is below this (~150 KB/s) — a genuinely starved swarm. */
+        const val BUFFERING_LOW_RATE_BYTES = 150 * 1024
     }
 }

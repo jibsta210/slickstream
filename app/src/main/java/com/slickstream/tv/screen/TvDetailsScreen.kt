@@ -427,8 +427,18 @@ private fun EpisodeCard(
                     .fillMaxWidth()
                     .height(168.dp),
             ) {
+                val context = LocalContext.current
+                // Hard decode ceiling — a 640x360 still is plenty for this 300dp/168dp card, so
+                // Coil doesn't decode full-res stills during D-pad scroll on a weak TV SoC.
+                val stillRequest = androidx.compose.runtime.remember(episode.stillUrl) {
+                    ImageRequest.Builder(context)
+                        .data(episode.stillUrl)
+                        .size(640, 360)
+                        .crossfade(true)
+                        .build()
+                }
                 AsyncImage(
-                    model = episode.stillUrl,
+                    model = stillRequest,
                     contentDescription = episode.name,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize().background(Brand.SurfaceVariant),

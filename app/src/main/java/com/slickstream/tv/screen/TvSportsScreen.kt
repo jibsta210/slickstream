@@ -163,12 +163,24 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
                     .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier)
                     .onFocusChanged { if (it.isFocused) focusedId = c.id },
             ) {
-                Text(
-                    text = c.name,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                    modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                ) {
+                    if (c.logoUrl != null) {
+                        AsyncImage(
+                            model = c.logoUrl,
+                            contentDescription = null,
+                            modifier = Modifier.size(26.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        text = c.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
             }
         }
     }

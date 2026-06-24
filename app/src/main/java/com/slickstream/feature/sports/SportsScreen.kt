@@ -112,17 +112,29 @@ private fun CategoryChips(
     ) {
         items(categories, key = { it.id }) { c ->
             val selected = c.id == selectedId
-            Text(
-                text = c.name,
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = if (selected) Color.White else Brand.OnSurface,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
                     .background(if (selected) Brand.Violet else Brand.SurfaceVariant)
                     .clickable { onSelect(c.id) }
-                    .padding(horizontal = 18.dp, vertical = 10.dp),
-            )
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                if (c.logoUrl != null) {
+                    AsyncImage(
+                        model = c.logoUrl,
+                        contentDescription = null,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(
+                    text = c.name,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (selected) Color.White else Brand.OnSurface,
+                )
+            }
         }
     }
 }

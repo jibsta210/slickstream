@@ -49,6 +49,12 @@ jobs:
           echo "vn=$VN" >> "$GITHUB_OUTPUT"
           echo "tag=v${VN}" >> "$GITHUB_OUTPUT"
           echo "Building versionCode=$VC versionName=$VN"
+          # Plain-English release notes come from the annotated tag's message; fallback if absent.
+          NOTES=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' 2>/dev/null | sed '/^-----BEGIN/,$d')
+          if [ -z "${NOTES//[[:space:]]/}" ]; then NOTES="What's new:
+          - Improvements and fixes"; fi
+          printf '%s\n' "$NOTES" > notes.txt
+          echo "----- release notes -----"; cat notes.txt
 
       - name: Build signed release
         env:
@@ -70,17 +76,15 @@ jobs:
         run: |
           cp app/build/outputs/apk/release/app-release.apk slickstream.apk
           SHA=$(sha256sum slickstream.apk | awk '{print $1}')
-          cat > update.json <<EOF
-          {
-            "versionCode": ${{ steps.ver.outputs.vc }},
-            "versionName": "${{ steps.ver.outputs.vn }}",
-            "apkUrl": "https://github.com/${{ github.repository }}/releases/latest/download/slickstream.apk",
-            "notes": "SlickStream ${{ steps.ver.outputs.vn }}",
-            "mandatory": false,
-            "sha256": "$SHA"
-          }
-          EOF
-          echo "sha256=$SHA"
+          # jq --rawfile JSON-escapes the multi-line plain-English notes safely.
+          jq -n \
+            --argjson vc ${{ steps.ver.outputs.vc }} \
+            --arg vn "${{ steps.ver.outputs.vn }}" \
+            --arg url "https://github.com/${{ github.repository }}/releases/latest/download/slickstream.apk" \
+            --rawfile notes notes.txt \
+            --arg sha "$SHA" \
+            '{versionCode:$vc, versionName:$vn, apkUrl:$url, notes:$notes, mandatory:false, sha256:$sha}' > update.json
+          echo "sha256=$SHA"; cat update.json
 
       - name: Publish release
         env:
@@ -90,5 +94,5 @@ jobs:
           gh release create "$TAG" slickstream.apk update.json \
             --repo "${{ github.repository }}" \
             --title "SlickStream ${{ steps.ver.outputs.vn }}" \
-            --notes "Automated signed release (versionCode ${{ steps.ver.outputs.vc }})." \
+            --notes-file notes.txt \
           || gh release upload "$TAG" slickstream.apk update.json --clobber --repo "${{ github.repository }}"

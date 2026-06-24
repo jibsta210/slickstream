@@ -101,15 +101,20 @@ fun TvPosterCard(
             Box(Modifier.fillMaxSize()) {
                 if (image != null) {
                     var loaded by remember(image) { mutableStateOf(false) }
-                    AsyncImage(
-                        // Hard decode ceiling — a ~360px poster is plenty for this tile, so Coil
-                        // doesn't decode full-res TMDB bitmaps during D-pad scroll (frame drops + GC
-                        // on a weak TV SoC).
-                        model = coil.request.ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
+                    val context = androidx.compose.ui.platform.LocalContext.current
+                    // Hard decode ceiling — a ~360px poster is plenty for this tile, so Coil
+                    // doesn't decode full-res TMDB bitmaps during D-pad scroll (frame drops + GC
+                    // on a weak TV SoC). Hoisted behind remember so the request isn't rebuilt on
+                    // every focus-driven recomposition.
+                    val request = remember(image, wide) {
+                        coil.request.ImageRequest.Builder(context)
                             .data(image)
                             .size(if (wide) 480 else 360, if (wide) 270 else 540)
                             .crossfade(true)
-                            .build(),
+                            .build()
+                    }
+                    AsyncImage(
+                        model = request,
                         contentDescription = item.title,
                         contentScale = ContentScale.Crop,
                         onState = { st -> loaded = st is coil.compose.AsyncImagePainter.State.Success },

@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -71,13 +72,25 @@ private fun HomeContent(
     onResumeClick: (WatchHistoryItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Fast lookup of resume progress for the "Continue Watching" row.
-    val progressByMediaId: Map<Int, Float> = state.continueWatching.associate {
-        it.media.id to it.progress.percent
+    // Fast lookup of resume progress for the "Continue Watching" row. Derived once per
+    // continueWatching change (mirrors TvHomeScreen) so scrolling doesn't rebuild these maps.
+    val progressByMediaId: Map<Int, Float> = remember(state.continueWatching) {
+        state.continueWatching.associate { it.media.id to it.progress.percent }
     }
-    val historyByMediaId: Map<Int, WatchHistoryItem> =
+    val historyByMediaId: Map<Int, WatchHistoryItem> = remember(state.continueWatching) {
         state.continueWatching.associateBy { it.media.id }
-    val continueItems: List<MediaItem> = state.continueWatching.map { it.media }
+    }
+    val continueItems: List<MediaItem> = remember(state.continueWatching) {
+        state.continueWatching.map { it.media }
+    }
+
+    // Stable lambdas so MediaRow stays skippable across recompositions (e.g. while scrolling).
+    val onContinueClick: (MediaItem) -> Unit = remember(historyByMediaId, onResumeClick) {
+        { item -> historyByMediaId[item.id]?.let(onResumeClick) }
+    }
+    val continueProgressFor: (MediaItem) -> Float? = remember(progressByMediaId) {
+        { item -> progressByMediaId[item.id] }
+    }
 
     LazyColumn(
         modifier = modifier,
@@ -99,9 +112,9 @@ private fun HomeContent(
                 MediaRow(
                     title = "Continue Watching",
                     items = continueItems,
-                    onItemClick = { item -> historyByMediaId[item.id]?.let(onResumeClick) },
+                    onItemClick = onContinueClick,
                     wide = true,
-                    progressFor = { item -> progressByMediaId[item.id] },
+                    progressFor = continueProgressFor,
                 )
             }
         }

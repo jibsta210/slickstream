@@ -1,9 +1,10 @@
 package com.slickstream.feature.sports
 
-/** A sport / league category, e.g. "Baseball" (MLB), "Hockey" (NHL). */
+/** A sport / league category, e.g. "MLB" (baseball), "NHL" (hockey). [logoUrl] is a league badge. */
 data class SportCategory(
     val id: String,
     val name: String,
+    val logoUrl: String? = null,
 )
 
 /** A scheduled or live game. */

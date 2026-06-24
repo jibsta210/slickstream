@@ -42,6 +42,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -49,6 +50,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.slickstream.core.model.CastMember
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.Genre
@@ -286,13 +288,18 @@ private fun DetailsContent(
 @Composable
 private fun BackdropHeader(details: MediaDetails) {
     val item = details.item
+    val context = LocalContext.current
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(16f / 10f),
     ) {
         AsyncImage(
-            model = item.backdropUrl ?: item.posterUrl,
+            model = ImageRequest.Builder(context)
+                .data(item.backdropUrl ?: item.posterUrl)
+                .size(1080, 675)
+                .crossfade(true)
+                .build(),
             contentDescription = item.title,
             contentScale = ContentScale.Crop,
             modifier = Modifier
@@ -435,6 +442,7 @@ private fun GenreChips(
 
 @Composable
 private fun CastRow(cast: List<CastMember>) {
+    val context = LocalContext.current
     LazyRow(
         modifier = Modifier.fillMaxWidth(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
@@ -446,7 +454,11 @@ private fun CastRow(cast: List<CastMember>) {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 AsyncImage(
-                    model = member.profileUrl,
+                    model = ImageRequest.Builder(context)
+                        .data(member.profileUrl)
+                        .size(160, 160)
+                        .crossfade(true)
+                        .build(),
                     contentDescription = member.name,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
@@ -511,6 +523,7 @@ private fun EpisodeRow(
     episode: Episode,
     onPlay: () -> Unit,
 ) {
+    val context = LocalContext.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -520,7 +533,11 @@ private fun EpisodeRow(
     ) {
         Box {
             AsyncImage(
-                model = episode.stillUrl,
+                model = ImageRequest.Builder(context)
+                    .data(episode.stillUrl)
+                    .size(360, 202)
+                    .crossfade(true)
+                    .build(),
                 contentDescription = episode.name,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier

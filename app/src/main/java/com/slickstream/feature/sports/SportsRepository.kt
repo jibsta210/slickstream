@@ -48,9 +48,18 @@ class SportsRepositoryImpl(
                 .onFailure { android.util.Log.w("SportsRepository", "streamed.pk categories failed", it) }
                 .getOrDefault(emptyList())
                 .filter { it.id.isNotBlank() }
-                .map { SportCategory(it.id, it.name.ifBlank { it.id.replaceFirstChar(Char::uppercase) }) }
-        // Foreground the streamed SPORT categories (football/basketball/…) — that's where the full
-        // multi-stream pickers live; FanCode (live-only, often geo-blocked) goes last.
+                .map { dto ->
+                    val league = LEAGUE_META[dto.id.lowercase()]
+                    SportCategory(
+                        id = dto.id,
+                        name = league?.name ?: dto.name.ifBlank { dto.id.replaceFirstChar(Char::uppercase) },
+                        logoUrl = league?.logo,
+                    )
+                }
+                // MLB / NBA / NHL / NFL first (in that order), then the rest alphabetically.
+                .sortedWith(compareBy({ LEAGUE_META[it.id.lowercase()]?.order ?: 99 }, { it.name }))
+        // Live now first (the cross-sport live aggregate), then the leagues, then FanCode (live-only,
+        // often geo-blocked) last.
         (listOf(live) + streamedCats + fanCats).distinctBy { it.id }
     }
 
@@ -146,9 +155,22 @@ class SportsRepositoryImpl(
             }
         }
 
+    private data class LeagueMeta(val name: String, val logo: String?, val order: Int)
+
     private companion object {
         const val LIVE_WINDOW_MS = 3L * 60 * 60 * 1000 // treat first 3h after kickoff as "live"
         const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"
+
+        /** Map streamed.pk sport ids -> league display name + badge (ESPN CDN) + sort order. */
+        val LEAGUE_META = mapOf(
+            "baseball" to LeagueMeta("MLB", "https://a.espncdn.com/i/teamlogos/leagues/500/mlb.png", 1),
+            "basketball" to LeagueMeta("NBA", "https://a.espncdn.com/i/teamlogos/leagues/500/nba.png", 2),
+            "hockey" to LeagueMeta("NHL", "https://a.espncdn.com/i/teamlogos/leagues/500/nhl.png", 3),
+            "american-football" to LeagueMeta("NFL", "https://a.espncdn.com/i/teamlogos/leagues/500/nfl.png", 4),
+            "football" to LeagueMeta("Soccer", "https://a.espncdn.com/i/teamlogos/leagues/500/uefa.champions.png", 5),
+            "fight" to LeagueMeta("UFC / Boxing", "https://a.espncdn.com/i/teamlogos/leagues/500/ufc.png", 6),
+            "tennis" to LeagueMeta("Tennis", "https://a.espncdn.com/i/teamlogos/leagues/500/atp.png", 7),
+        )
     }
 }
