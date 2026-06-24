@@ -22,6 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-java@v4
         with:
@@ -49,8 +52,11 @@ jobs:
           echo "vn=$VN" >> "$GITHUB_OUTPUT"
           echo "tag=v${VN}" >> "$GITHUB_OUTPUT"
           echo "Building versionCode=$VC versionName=$VN"
-          # Plain-English release notes come from the annotated tag's message; fallback if absent.
-          NOTES=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)' 2>/dev/null | sed '/^-----BEGIN/,$d')
+          # Plain-English release notes = the ANNOTATED tag's own message (NOT the commit message).
+          # Force-fetch the tag object first (checkout can leave a peeled/lightweight ref), then read
+          # the annotation body via `git tag -l --format`.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" 2>/dev/null || true
+          NOTES=$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" 2>/dev/null | sed '/^-----BEGIN/,$d')
           if [ -z "${NOTES//[[:space:]]/}" ]; then NOTES="What's new:
           - Improvements and fixes"; fi
           printf '%s\n' "$NOTES" > notes.txt
