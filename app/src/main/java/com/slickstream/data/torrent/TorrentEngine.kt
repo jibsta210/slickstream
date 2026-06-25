@@ -105,18 +105,19 @@ class TorrentEngine @Inject constructor(
         val lowPower = deviceProfile.isLowPower
         readaheadBytes = if (lowPower) LOW_POWER_READAHEAD_BYTES else READAHEAD_BYTES
         val sp = SettingsPack().apply {
-            // --- Peer load (the freeze comes from too many sockets + per-peer crypto on a weak SoC) ---
-            // 20 peers still saturates any single video bitrate; 400 stays for capable devices.
-            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 60 else 800)
-            setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 4 else 8)
-            setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 4 else 8)
-            setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 8 else 16)
-            // Peer-acquisition ramp. TV was throttled hard (8/12) to avoid a buffering-time freeze, but
-            // that starved pickup — only ~8 peers after 45 s, so the head crawled in. The freeze ceiling
-            // is the 8 MB/s download cap below (bounds hashing/eMMC), NOT the socket count, so a faster
-            // connect ramp safely finds head-bearing peers sooner. 40/40 on TV; capable stays 200/500.
-            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 40 else 200)
-            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 40 else 500)
+            // --- Peer / socket load -----------------------------------------------------------------
+            // A high connection count doesn't just stress a weak SoC — it exhausts a consumer router's
+            // NAT/conntrack table, which tanks the WHOLE home connection (new web requests can't open)
+            // even when bandwidth is fine. 800 was wildly more than streaming needs. ~50-100 peers
+            // already saturate any video bitrate, so cap modestly: 100 capable, 40 TV. Same logic for the
+            // connect ramp — a 500/sec connection churn hammers the router; 60/40 still finds head-bearing
+            // peers in a couple seconds.
+            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 40 else 100)
+            setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 2 else 4)
+            setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 1 else 2)
+            setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 4 else 8)
+            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 24 else 40)
+            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 24 else 60)
             // Announce to only the first working tier on low-power (less inbound peer flood to crypt).
             setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), !lowPower)
@@ -140,13 +141,15 @@ class TorrentEngine @Inject constructor(
             // connection while a cached torrent keeps seeding after you've watched. 100 KB/s is plenty
             // for tit-for-tat peer reciprocity without choking the link.
             setInteger(settings_pack.int_types.upload_rate_limit.swigValue(), UPLOAD_RATE_LIMIT)
-            // THE biggest freeze lever: an 8 MB/s download cap on low-power bounds SHA-1 hashing
-            // throughput + eMMC write pressure + ExoPlayer buffer-fill rate all at once. 8 (not 4)
-            // MB/s keeps the 6 MB head + 1 MB moov startup fuel arriving in <1s (preserves the
-            // sequential-download latency fix). Capable devices stay uncapped.
+            // Cap the DOWNLOAD on EVERY device. Under sequential streaming the engine pulls the WHOLE
+            // file ahead at line rate in the background while you only play at the bitrate — uncapped on
+            // a gigabit link that saturates the pipe and bufferbloats every other device in the house
+            // (the "my whole internet tanks while it streams" report). 12 MB/s (~96 Mbps) still fills the
+            // head + moov in ~1s and stays way ahead of even 4K playback, while leaving the bulk of a
+            // gigabit link free. TV stays 8 MB/s (also bounds SHA-1 hashing / eMMC write pressure).
             setInteger(
                 settings_pack.int_types.download_rate_limit.swigValue(),
-                if (lowPower) 8 * 1024 * 1024 else 0,
+                if (lowPower) 8 * 1024 * 1024 else 12 * 1024 * 1024,
             )
 
             // Pin the disk/hash worker pools to 1 on low-power — libtorrent otherwise scales them to
