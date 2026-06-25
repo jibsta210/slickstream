@@ -58,9 +58,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -131,6 +134,7 @@ fun PlayerScreen(
     val hasPrevious by viewModel.hasPrevious.collectAsState()
     val suggestSmaller by viewModel.suggestSmaller.collectAsState()
     val thumbnailVersion by viewModel.thumbnailVersion.collectAsState()
+    val rebuffering by viewModel.rebuffering.collectAsState()
     val context = LocalContext.current
 
     // Scrub-preview: the ms position the user is dragging the built-in time bar to (null = not
@@ -369,6 +373,13 @@ fun PlayerScreen(
                     version = thumbnailVersion,
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
+            }
+
+            // Mid-playback stall: small "buffering ~Xs" badge over the frozen frame so it never looks
+            // permanently frozen. The video (Playing) stays underneath; this is NOT the startup overlay.
+            val rebuf = rebuffering
+            if (rebuf != null && !isCasting && scrubPreviewMs == null) {
+                RebufferBadge(rebuf, modifier = Modifier.align(Alignment.Center))
             }
         }
     }
@@ -727,11 +738,12 @@ private fun bufferingStats(state: PlayerUiState.Buffering): String = buildString
 }
 
 /**
- * Film-strip preview shown while the user drags the seek bar: a row of frames around the scrub
- * position. The centre frame (highlighted) is the target; neighbours show earlier (left) and later
- * (right) moments [FILMSTRIP_STEP_MS] apart, so the strip appears to scroll as you drag. Slots whose
- * slice hasn't been sampled yet show a dim placeholder, so the strip keeps its shape. Sits just above
- * the system controls.
+ * Film-strip preview shown while the user drags the seek bar. A horizontally-scrolling ribbon of
+ * frames pinned to whole-minute timeline anchors: it slides continuously as you drag (each frame's
+ * translationX tracks the sub-minute offset) and the frame nearest the scrub point swells to full
+ * size with a cyan border, its neighbours shrinking toward the edges — so the strip glides toward
+ * the next/previous frame instead of popping. Slots whose slice isn't decoded yet show a dim
+ * placeholder, keeping the ribbon's shape. Sits just above the system controls.
  */
 @Composable
 private fun ScrubFilmstrip(
@@ -741,28 +753,39 @@ private fun ScrubFilmstrip(
     version: Int,
     modifier: Modifier = Modifier,
 ) {
-    @Suppress("UNUSED_EXPRESSION") version  // touch so new frames recompose the strip
+    @Suppress("UNUSED_EXPRESSION") version  // touch so newly-decoded frames recompose the strip
+    val pitchPx = with(LocalDensity.current) { FILM_PITCH.toPx() }
     Column(
-        modifier = modifier.padding(bottom = 86.dp, start = 12.dp, end = 12.dp),
+        modifier = modifier.padding(bottom = 86.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Row(
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        Box(
+            modifier = Modifier.width(FILM_VIEWPORT_W).height(FILM_FRAME_H).clipToBounds(),
+            contentAlignment = Alignment.Center,
         ) {
-            val half = FILMSTRIP_COUNT / 2
-            for (i in -half..half) {
-                val pos = (centerMs + i * FILMSTRIP_STEP_MS)
-                val center = i == 0
-                // Only render slots that map to a real point on the timeline (drop those off either end).
-                if (durationMs <= 0L || pos in 0L..durationMs) {
-                    FilmstripFrame(thumbnail = thumbnailAt(pos.coerceAtLeast(0L)), center = center)
-                } else {
-                    Spacer(Modifier.width(if (center) FILM_CENTER_W else FILM_SIDE_W))
-                }
+            val step = FILMSTRIP_STEP_MS
+            val centerK = Math.round(centerMs.toDouble() / step).toInt()
+            // Draw far → near so the swollen centre frame lands on top of its shrunk neighbours.
+            for (k in (centerK - FILM_SPAN..centerK + FILM_SPAN)
+                    .sortedByDescending { kotlin.math.abs(it.toLong() * step - centerMs) }) {
+                val posMs = k.toLong() * step
+                if (durationMs > 0L && posMs !in 0L..durationMs) continue
+                val distSteps = (posMs - centerMs).toFloat() / step
+                val prox = (1f - kotlin.math.abs(distSteps)).coerceIn(0f, 1f)
+                val scale = FILM_SIDE_SCALE + (1f - FILM_SIDE_SCALE) * prox
+                FilmstripFrame(
+                    thumbnail = thumbnailAt(posMs.coerceAtLeast(0L)),
+                    center = kotlin.math.abs(distSteps) < 0.5f,
+                    modifier = Modifier.graphicsLayer {
+                        translationX = distSteps * pitchPx
+                        scaleX = scale
+                        scaleY = scale
+                        alpha = 0.4f + 0.6f * prox
+                    },
+                )
             }
         }
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(8.dp))
         Text(
             text = formatTimecode(centerMs),
             color = Color.White,
@@ -776,22 +799,25 @@ private fun ScrubFilmstrip(
     }
 }
 
-private val FILM_CENTER_W = 150.dp
-private val FILM_SIDE_W = 104.dp
-private val FILM_CENTER_H = 86.dp
-private val FILM_SIDE_H = 60.dp
-private const val FILMSTRIP_COUNT = 5
+private val FILM_FRAME_W = 150.dp
+private val FILM_FRAME_H = 86.dp
+private val FILM_VIEWPORT_W = 360.dp
+private val FILM_PITCH = 122.dp
+private const val FILM_SIDE_SCALE = 0.62f
+private const val FILM_SPAN = 3
 private const val FILMSTRIP_STEP_MS = 60_000L
 
 @Composable
-private fun FilmstripFrame(thumbnail: android.graphics.Bitmap?, center: Boolean) {
-    val w = if (center) FILM_CENTER_W else FILM_SIDE_W
-    val h = if (center) FILM_CENTER_H else FILM_SIDE_H
+private fun FilmstripFrame(
+    thumbnail: android.graphics.Bitmap?,
+    center: Boolean,
+    modifier: Modifier = Modifier,
+) {
     val shape = RoundedCornerShape(8.dp)
-    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.5f)
+    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.45f)
     Box(
-        modifier = Modifier
-            .size(w, h)
+        modifier = modifier
+            .size(FILM_FRAME_W, FILM_FRAME_H)
             .clip(shape)
             .background(Color.Black.copy(alpha = 0.55f))
             .border(if (center) 2.dp else 1.dp, borderColor, shape),
@@ -803,8 +829,57 @@ private fun FilmstripFrame(thumbnail: android.graphics.Bitmap?, center: Boolean)
                 contentDescription = null,
                 contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                 modifier = Modifier.fillMaxSize().clip(shape),
-                alpha = if (center) 1f else 0.7f,
             )
+        }
+    }
+}
+
+/**
+ * Compact "still working" badge shown over a frozen frame during a mid-playback re-buffer. A short
+ * reveal delay keeps a quick in-buffer seek from flashing it. Shows a live ETA when the rate makes
+ * one estimable, otherwise a climbing elapsed counter, plus the current download rate — so a stall
+ * never reads as a permanent freeze.
+ */
+@Composable
+private fun RebufferBadge(state: RebufferState, modifier: Modifier = Modifier) {
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { delay(450); visible = true }
+    var elapsed by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { delay(1_000); elapsed++ } }
+    AnimatedVisibility(visible = visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(28.dp))
+                .background(Color.Black.copy(alpha = 0.72f))
+                .padding(horizontal = 18.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                color = Brand.Cyan,
+                strokeWidth = 2.5.dp,
+                modifier = Modifier.size(22.dp),
+            )
+            Spacer(Modifier.width(14.dp))
+            Column {
+                Text(
+                    text = "Buffering…",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = buildString {
+                        append(state.etaSeconds?.let { "about ${it}s left" } ?: "waiting ${elapsed}s")
+                        if (state.downloadRateBytes > 0) {
+                            append("  ·  ")
+                            append(formatRate(state.downloadRateBytes))
+                        }
+                    },
+                    color = Brand.Cyan,
+                    fontSize = 13.sp,
+                )
+            }
         }
     }
 }

@@ -3,6 +3,9 @@ package com.slickstream.tv.screen
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -54,6 +57,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -120,6 +126,7 @@ fun TvPlayerScreen(
     val hasPrevious by viewModel.hasPrevious.collectAsStateWithLifecycle()
     val suggestSmaller by viewModel.suggestSmaller.collectAsStateWithLifecycle()
     val thumbnailVersion by viewModel.thumbnailVersion.collectAsStateWithLifecycle()
+    val rebuffering by viewModel.rebuffering.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -258,6 +265,19 @@ fun TvPlayerScreen(
                 onSwitchSource = { panelOpen = true },
             )
             PlayerUiState.Playing -> Unit
+        }
+
+        // Mid-playback stall: small "buffering ~Xs" badge over the (still-Playing) frozen frame, shown
+        // independently of the transport so it's visible even when the controls are hidden.
+        rebuffering?.let { rebuf ->
+            if (uiState is PlayerUiState.Playing) {
+                TvRebufferBadge(
+                    state = rebuf,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 40.dp),
+                )
+            }
         }
 
         // Any D-pad press while playing should surface the controls.
@@ -725,26 +745,46 @@ private fun ScrubBar(
 
     Column(modifier = modifier.fillMaxWidth(0.72f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (scrubbing) {
-            // Film strip around the scrub target: the centre (highlighted) frame is where you'll land,
-            // neighbours show earlier (left) / later (right) moments, so it scrolls as you seek. Empty
-            // slots placeholder for slices not sampled yet. thumbnailVersion is touched so newly-decoded
-            // frames recompose the strip.
+            // Film strip around the scrub target: a ribbon pinned to whole-minute timeline anchors that
+            // glides toward the next/previous frame as you seek (the D-pad steps the target, an eased
+            // animation slides the ribbon there), with the frame nearest the target swelling to full
+            // size + cyan border. Off-timeline slots are dropped. thumbnailVersion is touched so newly-
+            // decoded frames recompose the strip.
             @Suppress("UNUSED_EXPRESSION") thumbnailVersion
             val dur = durationMs.takeIf { it > 0 } ?: 0L
-            Row(
-                modifier = Modifier.align(Alignment.CenterHorizontally),
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            val animatedCenter by animateFloatAsState(
+                targetValue = scrubTargetMs.toFloat(),
+                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+                label = "filmstrip-slide",
+            )
+            val pitchPx = with(LocalDensity.current) { TV_FILM_PITCH.toPx() }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(TV_FILM_FRAME_H)
+                    .clipToBounds(),
+                contentAlignment = Alignment.Center,
             ) {
-                val half = TV_FILMSTRIP_COUNT / 2
-                for (i in -half..half) {
-                    val pos = scrubTargetMs + i * TV_FILMSTRIP_STEP_MS
-                    val center = i == 0
-                    if (dur <= 0L || pos in 0L..dur) {
-                        TvFilmstripFrame(thumbnail = thumbnailAt(pos.coerceAtLeast(0L)), center = center)
-                    } else {
-                        Spacer(Modifier.width(if (center) 248.dp else 168.dp))
-                    }
+                val step = TV_FILMSTRIP_STEP_MS
+                val centerK = Math.round(animatedCenter / step).toInt()
+                // Draw far → near so the swollen centre frame lands on top of its shrunk neighbours.
+                for (k in (centerK - TV_FILM_SPAN..centerK + TV_FILM_SPAN)
+                        .sortedByDescending { kotlin.math.abs(it.toLong() * step - animatedCenter.toLong()) }) {
+                    val posMs = k.toLong() * step
+                    if (dur > 0L && posMs !in 0L..dur) continue
+                    val distSteps = (posMs - animatedCenter) / step
+                    val prox = (1f - kotlin.math.abs(distSteps)).coerceIn(0f, 1f)
+                    val scale = TV_FILM_SIDE_SCALE + (1f - TV_FILM_SIDE_SCALE) * prox
+                    TvFilmstripFrame(
+                        thumbnail = thumbnailAt(posMs.coerceAtLeast(0L)),
+                        center = kotlin.math.abs(distSteps) < 0.5f,
+                        modifier = Modifier.graphicsLayer {
+                            translationX = distSteps * pitchPx
+                            scaleX = scale
+                            scaleY = scale
+                            alpha = 0.4f + 0.6f * prox
+                        },
+                    )
                 }
             }
             Text(
@@ -821,18 +861,24 @@ private fun fmtTime(ms: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }
 
-private const val TV_FILMSTRIP_COUNT = 5
+private val TV_FILM_FRAME_W = 248.dp
+private val TV_FILM_FRAME_H = 140.dp
+private val TV_FILM_PITCH = 200.dp
+private const val TV_FILM_SIDE_SCALE = 0.6f
+private const val TV_FILM_SPAN = 3
 private const val TV_FILMSTRIP_STEP_MS = 60_000L
 
 @Composable
-private fun TvFilmstripFrame(thumbnail: android.graphics.Bitmap?, center: Boolean) {
-    val w = if (center) 248.dp else 168.dp
-    val h = if (center) 140.dp else 96.dp
+private fun TvFilmstripFrame(
+    thumbnail: android.graphics.Bitmap?,
+    center: Boolean,
+    modifier: Modifier = Modifier,
+) {
     val shape = RoundedCornerShape(10.dp)
-    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.5f)
+    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.45f)
     Box(
-        modifier = Modifier
-            .size(w, h)
+        modifier = modifier
+            .size(TV_FILM_FRAME_W, TV_FILM_FRAME_H)
             .clip(shape)
             .background(Color.Black.copy(alpha = 0.55f))
             .border(if (center) 3.dp else 1.dp, borderColor, shape),
@@ -844,8 +890,56 @@ private fun TvFilmstripFrame(thumbnail: android.graphics.Bitmap?, center: Boolea
                 contentDescription = null,
                 contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                 modifier = Modifier.fillMaxSize().clip(shape),
-                alpha = if (center) 1f else 0.7f,
             )
+        }
+    }
+}
+
+/**
+ * 10-foot version of the mid-playback re-buffer badge. Same idea as the phone's: a short reveal
+ * delay so a quick seek doesn't flash it, a live ETA when estimable (else a climbing elapsed
+ * counter) and the current rate — so a stall never reads as a permanent freeze.
+ */
+@Composable
+private fun TvRebufferBadge(state: com.slickstream.feature.player.RebufferState, modifier: Modifier = Modifier) {
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { kotlinx.coroutines.delay(450); visible = true }
+    var elapsed by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(1_000); elapsed++ } }
+    AnimatedVisibility(visible = visible, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(40.dp))
+                .background(Color.Black.copy(alpha = 0.72f))
+                .padding(horizontal = 26.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = Brand.Cyan,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(30.dp),
+            )
+            Spacer(Modifier.width(18.dp))
+            Column {
+                Text(
+                    text = "Buffering…",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = buildString {
+                        append(state.etaSeconds?.let { "about ${it}s left" } ?: "waiting ${elapsed}s")
+                        if (state.downloadRateBytes > 0) {
+                            append("  ·  ")
+                            val kb = state.downloadRateBytes / 1024
+                            append(if (kb >= 1024) "%.1f MB/s".format(kb / 1024f) else "$kb KB/s")
+                        }
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Brand.Cyan,
+                )
+            }
         }
     }
 }

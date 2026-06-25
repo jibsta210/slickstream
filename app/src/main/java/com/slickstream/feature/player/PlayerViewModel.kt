@@ -82,6 +82,18 @@ sealed interface PlayerUiState {
     data class Error(val message: String) : PlayerUiState
 }
 
+/**
+ * A mid-playback stall: the player drained its buffer faster than the torrent could refill it, so
+ * playback paused itself to re-buffer. The (frozen) video frame stays on screen underneath — this
+ * just drives a small "buffering ~Xs" badge so it never looks permanently frozen. Distinct from the
+ * full-screen startup [PlayerUiState.Buffering]; the UI stays in [PlayerUiState.Playing] throughout.
+ */
+data class RebufferState(
+    /** Best-effort seconds until enough is buffered to resume, or null when not estimable. */
+    val etaSeconds: Int?,
+    val downloadRateBytes: Int,
+)
+
 /** Subtitle appearance the players apply to their Media3 SubtitleView. */
 data class CaptionPrefs(val size: SubtitleSize, val style: SubtitleStyle)
 
@@ -135,6 +147,17 @@ class PlayerViewModel @Inject constructor(
      */
     private val _suggestSmaller = MutableStateFlow(false)
     val suggestSmaller: StateFlow<Boolean> = _suggestSmaller.asStateFlow()
+
+    /**
+     * Non-null while playback is stalled mid-stream and re-buffering. Drives the small "buffering ~Xs"
+     * badge over the (still-Playing) video. Set by the player listener on STATE_BUFFERING-while-Playing,
+     * refreshed live from the torrent feed, cleared on STATE_READY / source switch.
+     */
+    private val _rebuffering = MutableStateFlow<RebufferState?>(null)
+    val rebuffering: StateFlow<RebufferState?> = _rebuffering.asStateFlow()
+
+    /** Latest torrent status, kept fresh even while Playing so the rebuffer ETA can be recomputed. */
+    private var latestStatus: StreamStatus? = null
 
     private val _player = MutableStateFlow<ExoPlayer?>(null)
     val player: StateFlow<ExoPlayer?> = _player.asStateFlow()
@@ -383,6 +406,8 @@ class PlayerViewModel @Inject constructor(
         // Fresh source — re-arm the smaller-stream hint and start its buffering clock.
         suggestedSmallerForSource = false
         _suggestSmaller.value = false
+        _rebuffering.value = null
+        latestStatus = null
         bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
@@ -479,6 +504,16 @@ class PlayerViewModel @Inject constructor(
     private fun handleStatus(status: StreamStatus, source: StreamSource) {
         // Feed the buffering watchdog's head-progress signal on every emission.
         lastEmittedDownloadedBytes = status.downloadedBytes
+        // Keep the latest status around even once we're Playing (the early-returns below skip the rest
+        // of this function then) so a mid-playback stall has a live rate to estimate the wait from. If
+        // a rebuffer is currently showing, refresh its ETA on every emission so the badge counts down.
+        latestStatus = status
+        if (_rebuffering.value != null) {
+            _rebuffering.value = RebufferState(
+                etaSeconds = etaToResume(status),
+                downloadRateBytes = status.downloadRateBytes,
+            )
+        }
         val url = status.streamUrl
         if (url != null) {
             ensurePlayer(url)
@@ -549,6 +584,24 @@ class PlayerViewModel @Inject constructor(
             else -> return null
         }
         return (downloadSecs + PREPARE_MARGIN_SECONDS).takeIf { it in 1..900 }
+    }
+
+    /**
+     * Estimated seconds until a mid-playback stall can resume = time to download a small forward
+     * cushion ([REBUFFER_CUSHION_SECONDS] of video) at the current rate. The cushion's byte size is
+     * derived from the file's average bitrate (fileLength ÷ duration). When the rate is at/above the
+     * bitrate this lands near the cushion length (a quick blip); when it's below, the estimate grows,
+     * honestly signalling "slow connection — this'll be a bit". Null when the rate/size is unknown.
+     */
+    private fun etaToResume(status: StreamStatus): Int? {
+        val rate = status.downloadRateBytes
+        if (rate <= 0) return null
+        val durMs = _currentPlayer.value?.duration?.takeIf { it > 0 } ?: return null
+        val infoHash = _currentSource.value?.infoHash ?: return null
+        val fileLen = torrentStreamer.fileLength(infoHash).takeIf { it > 0 } ?: return null
+        val bytesPerSec = fileLen.toDouble() / (durMs / 1000.0)
+        val neededBytes = bytesPerSec * REBUFFER_CUSHION_SECONDS
+        return (neededBytes / rate).toInt().plus(1).takeIf { it in 1..900 }
     }
 
     /**
@@ -667,9 +720,11 @@ class PlayerViewModel @Inject constructor(
                     Player.STATE_READY -> {
                         sourceErrorRetries = 0 // recovered / playing — forget transient stalls
                         maybeSeekToResume(exo)
-                        // Playing — clear the buffering clock and any pending smaller-stream hint.
+                        // Playing — clear the buffering clock, any pending smaller-stream hint, and any
+                        // mid-playback rebuffer badge (we just recovered).
                         bufferingSinceMs = 0L
                         _suggestSmaller.value = false
+                        _rebuffering.value = null
                         _uiState.value = PlayerUiState.Playing
                         maybeStartThumbnails(exo)
                     }
@@ -694,6 +749,14 @@ class PlayerViewModel @Inject constructor(
                                 etaSeconds = prev?.etaSeconds,
                             )
                             maybeSuggestSmaller(downloadRateBytes = 0)
+                        } else if (_rebuffering.value == null) {
+                            // Mid-playback stall: keep the frozen frame + Playing state, but raise the
+                            // small "buffering ~Xs" badge so it never looks permanently frozen. ETA is
+                            // refreshed live from the torrent feed in handleStatus.
+                            _rebuffering.value = RebufferState(
+                                etaSeconds = latestStatus?.let { etaToResume(it) },
+                                downloadRateBytes = latestStatus?.downloadRateBytes ?: 0,
+                            )
                         }
                     }
                     Player.STATE_ENDED -> {
@@ -820,6 +883,7 @@ class PlayerViewModel @Inject constructor(
                     maybeSeekToResume(vlc)
                     bufferingSinceMs = 0L
                     _suggestSmaller.value = false
+                    _rebuffering.value = null
                     _uiState.value = PlayerUiState.Playing
                 }
                 Player.STATE_BUFFERING -> {
@@ -833,6 +897,12 @@ class PlayerViewModel @Inject constructor(
                             downloadRateBytes = prev?.downloadRateBytes ?: 0,
                             label = "Almost ready…",
                             etaSeconds = prev?.etaSeconds,
+                        )
+                    } else if (_rebuffering.value == null) {
+                        // Mid-playback stall on the VLC backend — same small badge as the ExoPlayer path.
+                        _rebuffering.value = RebufferState(
+                            etaSeconds = latestStatus?.let { etaToResume(it) },
+                            downloadRateBytes = latestStatus?.downloadRateBytes ?: 0,
                         )
                     }
                 }
@@ -1354,6 +1424,9 @@ class PlayerViewModel @Inject constructor(
         /** Fixed seconds added to the ETA for the moov/tail fetch + ExoPlayer prepare AFTER the head
          *  fills, so "time to playing" includes the post-download buffering, not just the download. */
         const val PREPARE_MARGIN_SECONDS = 3
+        /** Forward cushion (seconds of video) a mid-playback stall must re-buffer before resuming —
+         *  the target the rebuffer-badge ETA counts down to. */
+        const val REBUFFER_CUSHION_SECONDS = 5
         /** Suggest a smaller stream only after a buffer has dragged on this long (~25 s). */
         const val BUFFERING_NAG_MS = 25_000L
         /** ...and only while the download rate is below this (~150 KB/s) — a genuinely starved swarm. */
