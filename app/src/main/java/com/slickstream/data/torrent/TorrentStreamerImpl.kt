@@ -126,10 +126,18 @@ class TorrentStreamerImpl @Inject constructor(
                 // failover can take over instead of looping forever. mkv keeps the snappy 8s grace.
                 val ext = engine.selectedFileExt(infoHash)
                 val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
-                val graceMs = if (moovCritical) MP4_TAIL_HARD_CAP_MS else TAIL_GRACE_MS
-                val tailGraceElapsed =
-                    headReadySince > 0L && System.currentTimeMillis() - headReadySince > graceMs
-                val canStart = headReady && (tailReady || tailGraceElapsed)
+                // mp4/m4v/mov carry the moov atom at EOF and CANNOT render a frame without it, so wait
+                // for the real tail (hard-capped, then start anyway and let player retries/failover
+                // handle a truly-absent moov). mkv/webm carry only seek cues at EOF — not needed to
+                // START — so they begin the instant the head is ready (the engine no longer fetches
+                // their tail up front, so waiting on it would just stall the start for nothing).
+                val tailGraceElapsed = headReadySince > 0L &&
+                    System.currentTimeMillis() - headReadySince > MP4_TAIL_HARD_CAP_MS
+                val canStart =
+                    if (moovCritical) headReady && (tailReady || tailGraceElapsed) else headReady
+
+                // ETA to first frame, against the real gate (head + mp4 moov tail), refreshed each poll.
+                val eta = estimateEta(snap, headBytes, tailReady, moovCritical)
 
                 if (pollCount++ % DIAG_EVERY == 0) {
                     Log.d(
@@ -155,7 +163,7 @@ class TorrentStreamerImpl @Inject constructor(
                         trySend(
                             buildStatus(
                                 source, infoHash, StreamState.READY,
-                                streamUrl = streamUrl, snap = snap,
+                                streamUrl = streamUrl, snap = snap, etaSeconds = eta,
                             ),
                         )
                     }
@@ -163,7 +171,7 @@ class TorrentStreamerImpl @Inject constructor(
                         trySend(
                             buildStatus(
                                 source, infoHash, StreamState.READY,
-                                streamUrl = streamUrl, snap = snap,
+                                streamUrl = streamUrl, snap = snap, etaSeconds = eta,
                             ),
                         )
                     }
@@ -171,7 +179,7 @@ class TorrentStreamerImpl @Inject constructor(
                         trySend(
                             buildStatus(
                                 source, infoHash, StreamState.BUFFERING,
-                                streamUrl = null, snap = snap,
+                                streamUrl = null, snap = snap, etaSeconds = eta,
                             ),
                         )
                     }
@@ -334,6 +342,7 @@ class TorrentStreamerImpl @Inject constructor(
         state: StreamState,
         streamUrl: String?,
         snap: EngineStatus? = engine.snapshot(infoHash),
+        etaSeconds: Int? = null,
     ): StreamStatus {
         if (snap == null) return baseStatus(source, state, 0f, streamUrl).copy(infoHash = infoHash)
         return StreamStatus(
@@ -347,7 +356,26 @@ class TorrentStreamerImpl @Inject constructor(
             downloadedBytes = snap.downloadedBytes,
             totalBytes = snap.totalBytes.takeIf { it > 0 } ?: (source.sizeBytes ?: 0L),
             streamUrl = streamUrl,
+            etaSeconds = etaSeconds,
         )
+    }
+
+    /**
+     * Seconds until first frame, measured against the SAME gate that flips to READY: the contiguous
+     * head reaching [READY_HEAD_BYTES] plus, for moov-critical mp4/m4v/mov, the ~moov-sized tail band.
+     * Using whole-file downloaded bytes (which counts the head AND the deadline-fetched tail pieces)
+     * as the credit means the countdown keeps falling as the moov arrives, instead of hitting zero on
+     * the head and then "buffering more" for the moov — the regression the unified estimate introduced.
+     * Null while there's no download rate yet (still finding peers / fetching metadata).
+     */
+    private fun estimateEta(snap: EngineStatus, headBytes: Long, tailReady: Boolean, moovCritical: Boolean): Int? {
+        val rate = snap.downloadRate
+        if (rate <= 0) return null
+        val tailNeeded = if (moovCritical && !tailReady) MOOV_TAIL_BYTES else 0L
+        val target = READY_HEAD_BYTES + tailNeeded
+        val headRemaining = (READY_HEAD_BYTES - headBytes).coerceAtLeast(0L)
+        val remaining = (target - snap.downloadedBytes).coerceAtLeast(headRemaining)
+        return ((remaining / rate) + PREPARE_MARGIN_SECONDS).toInt().takeIf { it in 1..900 }
     }
 
     private fun errorStatus(source: StreamSource, message: String) = StreamStatus(
@@ -370,10 +398,16 @@ class TorrentStreamerImpl @Inject constructor(
         /** Contiguous head bytes required before we declare READY (~2 MB — enough to start). */
         private const val READY_HEAD_BYTES = 2L * 1024L * 1024L
 
-        /** Max wait for the tail (mkv cues) after the head is ready before starting anyway. */
-        private const val TAIL_GRACE_MS = 8_000L
+        /** Approx moov/tail bytes an mp4/m4v/mov must also have before its first frame — folded into
+         *  the ETA so the countdown reflects the moov wait, not just the head. Matches the engine's
+         *  TAIL_PRIORITY_BYTES (8 MB). */
+        private const val MOOV_TAIL_BYTES = 8L * 1024L * 1024L
 
-        /** Longer hard cap for moov-critical mp4/m4v/mov: wait this long for the EOF moov before
+        /** Fixed seconds added to the byte ETA for the player's own prepare/first-frame after the
+         *  bytes are present. */
+        private const val PREPARE_MARGIN_SECONDS = 2L
+
+        /** Hard cap for moov-critical mp4/m4v/mov: wait this long for the EOF moov before
          *  starting head-only (then the player's retries + source failover handle a truly-absent moov). */
         private const val MP4_TAIL_HARD_CAP_MS = 30_000L
 

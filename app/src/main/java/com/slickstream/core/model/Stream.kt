@@ -47,6 +47,10 @@ data class StreamStatus(
     val totalBytes: Long,
     val streamUrl: String?,         // local http URL once playable, else null
     val errorMessage: String? = null,
+    /** Best-effort seconds until first frame (head + mp4 moov tail ÷ rate), or null when not estimable
+     *  (e.g. still discovering peers / no download rate yet). Computed by the streamer against the same
+     *  readiness gate that flips to READY, so the countdown matches when playback actually starts. */
+    val etaSeconds: Int? = null,
 )
 
 /** Persisted resume point for a movie or a specific episode. */

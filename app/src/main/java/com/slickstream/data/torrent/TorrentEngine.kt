@@ -107,14 +107,16 @@ class TorrentEngine @Inject constructor(
         val sp = SettingsPack().apply {
             // --- Peer load (the freeze comes from too many sockets + per-peer crypto on a weak SoC) ---
             // 20 peers still saturates any single video bitrate; 400 stays for capable devices.
-            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 20 else 800)
+            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 60 else 800)
             setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 4 else 8)
             setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 4 else 8)
             setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 8 else 16)
-            // Flatten the connection burst/ramp on TV — the 30-conn boost spike landed right at the
-            // buffering moment the device froze. 8/12 still gives the sequential head ample peers.
-            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 8 else 200)
-            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 12 else 500)
+            // Peer-acquisition ramp. TV was throttled hard (8/12) to avoid a buffering-time freeze, but
+            // that starved pickup — only ~8 peers after 45 s, so the head crawled in. The freeze ceiling
+            // is the 8 MB/s download cap below (bounds hashing/eMMC), NOT the socket count, so a faster
+            // connect ramp safely finds head-bearing peers sooner. 40/40 on TV; capable stays 200/500.
+            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 40 else 200)
+            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 40 else 500)
             // Announce to only the first working tier on low-power (less inbound peer flood to crypt).
             setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), !lowPower)
@@ -253,94 +255,123 @@ class TorrentEngine @Inject constructor(
     }
 
     /**
-     * Add (or re-attach to) a magnet. Resolves metadata if needed, selects the playable
-     * video file, switches the torrent to sequential download and high-priority head/tail.
-     * Returns the lowercase info-hash once the file has been chosen.
+     * Add (or re-attach to) a magnet, select the playable video file, switch the torrent to
+     * sequential download with a high-priority head/tail, and return the lowercase info-hash.
+     *
+     * Pickup is the latency-critical path. We add the magnet EXACTLY ONCE and keep every peer it
+     * finds: a live add (download(magnet, …)) fetches the metadata on the same torrent that then
+     * downloads, so the swarm discovered during the metadata phase carries straight into streaming.
+     * The previous fetchMagnet → re-download flow discovered peers, REMOVED the torrent (throwing
+     * them away), then re-discovered from scratch — roughly doubling the time-to-first-byte and the
+     * cause of the "desktop streams in seconds, we take a minute" gap. The magnet is also tracker-
+     * boosted so discovery isn't DHT-only.
      */
     suspend fun addMagnet(magnetUri: String, preferredFileIndex: Int?): String {
         ensureStarted()
+        val parsedHash = parseInfoHash(magnetUri)
 
-        // Fast path: the Details prewarm may already have this torrent live. Re-attach instead of
-        // re-resolving metadata — a second metadata fetch on an already-added torrent dead-latches
-        // for the full 60s timeout (the "stuck fetching metadata, 2000 seeders" bug).
-        parseInfoHash(magnetUri)?.let { h ->
-            val existing = torrents[h]
-            if (existing?.handle?.isValid == true) {
+        // Fast path: a Details prewarm (or a prior open) already has this torrent live — re-attach
+        // instead of re-resolving (a second metadata fetch on an added torrent dead-latches 60s).
+        parsedHash?.let { h ->
+            torrents[h]?.takeIf { it.handle?.isValid == true }?.let { existing ->
                 existing.handle?.let { applySequentialAndPriority(it, existing) }
                 return h
             }
         }
 
-        val info = loadOrFetchMetadata(magnetUri)
-        val infoHash = info.infoHash().toHex().lowercase()
-
-        val existing = torrents[infoHash]
-        if (existing?.handle?.isValid == true) {
-            existing.handle?.let { applySequentialAndPriority(it, existing) }
-            return infoHash
+        // Metadata cache hit (a torrent opened before this build cached its .torrent): add ONCE with
+        // full info — peers are discovered a single time, straight into the download, no network
+        // metadata fetch at all.
+        parsedHash?.let { loadCachedMetadata(it) }?.let { cachedInfo ->
+            Log.i(TAG, "metadata cache hit for $parsedHash")
+            return addWithInfo(cachedInfo, preferredFileIndex)
         }
 
-        val active = ActiveTorrent(infoHash)
-        torrents[infoHash] = active
+        // Cache miss (first watch): add the magnet LIVE, FORCE it active so its metadata fetch runs at
+        // full tilt, read metadata off the handle, then stream — keeping every discovered peer (no
+        // fetchMagnet discard-and-rediscover).
+        val boosted = withTrackers(magnetUri)
+        // Resolve the info-hash up front (handles v1-hex AND base32/v2 magnets) and register it in the
+        // map BEFORE adding, so a metadata timeout or VM failover can always find + remove the torrent —
+        // a non-40-hex magnet used to be added to the session then orphaned with no removable key.
+        val infoHash = parsedHash
+            ?: runCatching { AddTorrentParams.parseMagnetUri(boosted).infoHashes.best.toHex().lowercase() }.getOrNull()
+            ?: error("Unparseable magnet (no info-hash)")
+        val active = torrents.getOrPut(infoHash) { ActiveTorrent(infoHash) }
 
-        val resumeFile = resumeFileFor(infoHash).takeIf { it.exists() }
-
-        // Download via the resolved TorrentInfo so we can pick the file immediately.
-        // 6-arg form: (info, saveDir, resumeFile, filePriorities, peers, flags).
-        // NB: flags must be non-null — libtorrent4j does params.flags().or_(flags) with no null
-        // guard, so passing null dereferences a null torrent_flags_t in native code. AUTO_MANAGED
-        // is already part of the default flags, so this is a behaviourally-neutral non-null value.
-        // applySequentialAndPriority() (below, once the handle exists) flips on SEQUENTIAL_DOWNLOAD
-        // and the head/tail deadlines that actually drive streaming order.
-        session.download(info, savePath, resumeFile, null, null, TorrentFlags.AUTO_MANAGED)
-
-        val handle = awaitHandle(infoHash)
-            ?: error("Failed to obtain torrent handle for $infoHash")
+        val handle = findHandle(infoHash)?.takeIf { it.isValid }
+            ?: run {
+                // 3-arg live add: (magnet, saveDir, flags). flags must be non-null (libtorrent4j ORs them
+                // with no null guard). AUTO_MANAGED here is immediately overridden below.
+                session.download(boosted, savePath, TorrentFlags.AUTO_MANAGED)
+                awaitHandle(infoHash) ?: run {
+                    torrents.remove(infoHash)
+                    error("Failed to obtain torrent handle")
+                }
+            }
         active.handle = handle
 
+        // Take manual control NOW — DON'T wait on the queue auto-manager. A freshly-added AUTO_MANAGED
+        // torrent can sit queued/paused while other torrents (a Details prewarm, cached seeders) hold the
+        // active-download slots, so its ut_metadata fetch never starts: the "spins 45 s on N seeders,
+        // never buffers, fails over" stall. Unmanaging + resuming makes metadata fetch immediately, just
+        // as the old fetchMagnet did implicitly.
+        runCatching {
+            handle.unsetFlags(
+                TorrentFlags.AUTO_MANAGED.or_(TorrentFlags.PAUSED).or_(TorrentFlags.UPLOAD_MODE),
+            )
+            handle.resume()
+        }.onFailure { Log.w(TAG, "force-active failed for $infoHash", it) }
+
+        val info = awaitMetadataFromHandle(handle) ?: run {
+            // Cold/dead magnet: free the session slot + map entry instead of stranding a live torrent.
+            runCatching { stop(infoHash, removeFiles = true) }
+            error("Timed out fetching torrent metadata")
+        }
         selectFile(handle, info, active, preferredFileIndex)
         applySequentialAndPriority(handle, active)
         handle.resume()
         return infoHash
     }
 
-    /**
-     * Resolve the magnet's [TorrentInfo]. The bencoded metadata is cached per info-hash, so a
-     * torrent you've opened before resolves from disk instantly — skipping the network metadata
-     * fetch (DHT/peer round-trips), which is the slow part of "first load", not your bandwidth.
-     */
-    private suspend fun loadOrFetchMetadata(magnetUri: String): TorrentInfo {
-        parseInfoHash(magnetUri)?.let { hash ->
-            val cached = metadataFileFor(hash)
-            if (cached.exists()) {
-                runCatching { TorrentInfo.bdecode(cached.readBytes()) }.getOrNull()?.let {
-                    Log.i(TAG, "metadata cache hit for $hash")
-                    return it
-                }
-            }
-            // If the torrent is ALREADY in the session (a concurrent prewarm added it but hasn't
-            // written the .meta cache yet), DON'T call fetchMagnet again — libtorrent4j's fetchMagnet
-            // on an already-added torrent blocks on a latch that never fires and drains the full 60s
-            // timeout. Read the metadata off the live handle instead (waiting briefly if the prewarm's
-            // fetch is still in flight).
-            val existing = findHandle(hash)
-            if (existing != null && existing.isValid) {
-                val ti = awaitMetadataFromHandle(existing)
-                    ?: error("Timed out fetching torrent metadata")
-                // (No .meta cache write here — the prewarm's own fetch path persists it; this path
-                // just needs to hand the live metadata back without re-fetching.)
-                Log.i(TAG, "metadata from existing session handle for $hash")
-                return ti
-            }
+    /** Add a torrent we already have full [TorrentInfo] for (metadata cache hit / re-open), select the
+     *  file and start sequential streaming. One add, peers discovered once. */
+    private suspend fun addWithInfo(info: TorrentInfo, preferredFileIndex: Int?): String {
+        val infoHash = info.infoHash().toHex().lowercase()
+        torrents[infoHash]?.takeIf { it.handle?.isValid == true }?.let { existing ->
+            existing.handle?.let { applySequentialAndPriority(it, existing) }
+            return infoHash
         }
-        // Cache miss + not in session — fetch over the network (60s covers DHT bootstrap), then persist.
-        val data = session.fetchMagnet(magnetUri, METADATA_TIMEOUT_SECONDS, savePath)
-            ?: error("Timed out fetching torrent metadata")
-        val info = TorrentInfo.bdecode(data)
-        runCatching {
-            metadataFileFor(info.infoHash().toHex().lowercase()).writeBytes(data)
-        }.onFailure { Log.w(TAG, "metadata cache write failed", it) }
-        return info
+        val active = torrents.getOrPut(infoHash) { ActiveTorrent(infoHash) }
+        val resumeFile = resumeFileFor(infoHash).takeIf { it.exists() }
+        // 6-arg form: (info, saveDir, resumeFile, filePriorities, peers, flags). flags non-null (see
+        // addMagnet). resumeFile re-checks the partial already on disk instead of re-downloading it.
+        session.download(info, savePath, resumeFile, null, null, TorrentFlags.AUTO_MANAGED)
+        val handle = awaitHandle(infoHash) ?: error("Failed to obtain torrent handle for $infoHash")
+        active.handle = handle
+        selectFile(handle, info, active, preferredFileIndex)
+        applySequentialAndPriority(handle, active)
+        handle.resume()
+        return infoHash
+    }
+
+    /** Read previously-cached bencoded metadata for [hash] (written by an older build), or null. */
+    private fun loadCachedMetadata(hash: String): TorrentInfo? {
+        val cached = metadataFileFor(hash).takeIf { it.exists() } ?: return null
+        return runCatching { TorrentInfo.bdecode(cached.readBytes()) }.getOrNull()
+    }
+
+    /**
+     * Append a curated set of high-availability public trackers to a magnet so peer discovery (and
+     * the ut_metadata fetch) isn't limited to DHT, which is the slow, flaky part of cold pickup.
+     * libtorrent dedups against any trackers already in the magnet, so re-appending is harmless.
+     */
+    private fun withTrackers(magnetUri: String): String = buildString {
+        append(magnetUri)
+        for (tr in BOOST_TRACKERS) {
+            append("&tr=")
+            append(java.net.URLEncoder.encode(tr, "UTF-8"))
+        }
     }
 
     /** Poll an already-added torrent's handle for its metadata (avoids the dead-latch fetchMagnet). */
@@ -446,30 +477,47 @@ class TorrentEngine @Inject constructor(
         runCatching { handle.resume() }
     }
 
-    /** Push the first and last pieces of the file to the front of the download queue. */
+    /**
+     * Drive the swarm to fill the START of the file IN ORDER so the readiness gate (contiguous head)
+     * is reached fast. SEQUENTIAL_DOWNLOAD alone is only best-effort — when the connected peers are
+     * leechers that lack the next piece, libtorrent grabs whatever they DO have, scattering bandwidth
+     * across the file while the contiguous head dribbles in (observed: ~210 MB downloaded, only ~58 MB
+     * of contiguous head — "downloads fast but never starts buffering"). Deadlining a BAND of head
+     * pieces with staggered deadlines makes those pieces time-critical and pulled in order.
+     *
+     * The tail (EOF) is only fetched up front for moov-critical mp4/m4v/mov, whose moov atom is
+     * MANDATORY before the first frame. mkv/webm carry only seek cues at EOF — not needed to START —
+     * so for them the tail is left to download naturally (or on-demand when the user seeks, via
+     * [ensureRange]); fetching it at top priority at startup just steals bandwidth from the head and
+     * was a big part of the slow time-to-first-frame.
+     */
     private fun prioritizeHeadAndTail(active: ActiveTorrent) {
         val handle = active.handle?.takeIf { it.isValid } ?: return
         if (active.pieceLength <= 0) return
-        val headPieces = (HEAD_PRIORITY_BYTES / active.pieceLength + 1)
-        val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
+        val headPieces = maxOf(HEAD_PRIORITY_BYTES / active.pieceLength + 1, MIN_HEAD_PIECES)
+        val ext = active.filePath?.substringAfterLast('.', "")?.lowercase()
+        val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
+        val tailPieces = if (moovCritical) (TAIL_PRIORITY_BYTES / active.pieceLength + 1) else 0
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
         // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
         synchronized(nativeLock) { runCatching {
+            var deadline = 0
             for (i in 0 until headPieces) {
                 val p = active.firstPiece + i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, (i + 1) * 50)
+                    handle.setPieceDeadline(p, deadline)
+                    deadline += 25
                 }
             }
-            // Tail = the mp4 moov atom / mkv cues the player needs BEFORE the first frame, so
-            // fetch it as aggressively as the head (top priority + tight deadlines), concurrently.
+            // Tail (moov-critical only) — deadlined AFTER the whole head band so the head always wins
+            // the bandwidth, but still well ahead of the sequential cursor that would never reach EOF.
             for (i in 0 until tailPieces) {
                 val p = active.lastPiece - i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, (i + 1) * 50)
+                    handle.setPieceDeadline(p, TAIL_DEADLINE_BASE_MS + i * 25)
                 }
             }
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
@@ -825,6 +873,14 @@ class TorrentEngine @Inject constructor(
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
         const val TAIL_PRIORITY_BYTES = 8 * 1024 * 1024
 
+        /** Always deadline at least this many head pieces in order, even when a torrent's piece size is
+         *  large (8 MB pieces -> HEAD_PRIORITY_BYTES alone is 1 piece). Deadlining a band forces the
+         *  swarm to fill the start contiguously instead of scattering, so the readiness gate hits fast. */
+        const val MIN_HEAD_PIECES = 5
+
+        /** mp4 moov tail deadline base (ms) — after the whole head band so the head wins bandwidth. */
+        const val TAIL_DEADLINE_BASE_MS = 800
+
         /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
          *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
         const val PREVIEW_PREFETCH_DEADLINE_MS = 4000
@@ -839,6 +895,21 @@ class TorrentEngine @Inject constructor(
 
         /** Smaller look-ahead on Android TV / low-RAM devices to ease CPU/memory pressure. */
         const val LOW_POWER_READAHEAD_BYTES = 6 * 1024 * 1024
+
+        /** High-uptime public trackers appended to every magnet so cold pickup finds peers fast
+         *  instead of waiting on DHT. Curated from the well-known best-uptime lists (udp-first). */
+        private val BOOST_TRACKERS = listOf(
+            "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.tracker.cl:1337/announce",
+            "udp://open.demonii.com:1337/announce",
+            "udp://tracker.openbittorrent.com:6969/announce",
+            "udp://exodus.desync.com:6969/announce",
+            "udp://tracker.torrent.eu.org:451/announce",
+            "udp://explodie.org:6969/announce",
+            "udp://open.stealth.si:80/announce",
+            "udp://tracker.dler.org:6969/announce",
+            "udp://opentracker.i2p.rocks:6969/announce",
+        )
 
         private val VIDEO_EXTS = setOf("mp4", "mkv", "avi", "webm", "mov", "m4v", "flv", "ts")
 

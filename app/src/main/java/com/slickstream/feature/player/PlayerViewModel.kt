@@ -534,7 +534,9 @@ class PlayerViewModel @Inject constructor(
                 seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
                 downloadRateBytes = status.downloadRateBytes,
                 label = "Almost ready…",
-                etaSeconds = etaToPlaying(status),
+                // Prefer the streamer's gate-accurate ETA (head + mp4 moov tail); fall back to the
+                // local head-only estimate only when the streamer can't estimate yet.
+                etaSeconds = status.etaSeconds ?: etaToPlaying(status),
             )
             return
         }
@@ -563,7 +565,7 @@ class PlayerViewModel @Inject constructor(
             seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
             downloadRateBytes = status.downloadRateBytes,
             label = label,
-            etaSeconds = etaToPlaying(status),
+            etaSeconds = status.etaSeconds ?: etaToPlaying(status),
         )
         maybeSuggestSmaller(status.downloadRateBytes)
     }

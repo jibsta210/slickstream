@@ -9,6 +9,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.Season
+import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.core.common.DeviceProfile
 import com.slickstream.core.repository.CatalogRepository
 import com.slickstream.core.repository.LibraryRepository
@@ -23,6 +24,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -83,6 +86,34 @@ class DetailsViewModel @Inject constructor(
 
     init {
         load()
+        // Reactively mirror watch progress into the episode bars / movie-watched flag. This VM survives
+        // the player round-trip (it's the back-stack entry's VM), so load()/selectSeason() never re-run
+        // on return — without this, a just-watched episode's progress/checkmark stayed stale until a
+        // manual refresh. observeHistory() re-emits on every saveProgress upsert, so returning from the
+        // player updates the bars immediately.
+        libraryRepository.observeHistory()
+            .onEach { rows -> applyWatchHistory(rows) }
+            .launchIn(viewModelScope)
+    }
+
+    /** Fold the live history feed into [DetailsUiState.episodeProgress] / [DetailsUiState.isMovieWatched]
+     *  for THIS title and the currently-selected season. Cheap and idempotent — only writes on change. */
+    private fun applyWatchHistory(rows: List<WatchHistoryItem>) {
+        val mine = rows.filter { it.media.id == mediaId && it.media.mediaType == mediaType }
+        if (mediaType == MediaType.MOVIE) {
+            val watched = mine.any { it.progress.isFinished }
+            if (watched != _uiState.value.isMovieWatched) {
+                _uiState.value = _uiState.value.copy(isMovieWatched = watched)
+            }
+        } else {
+            val season = _uiState.value.selectedSeasonNumber ?: return
+            val progress = mine.asSequence()
+                .filter { it.progress.season == season && it.progress.episode != null && it.progress.percent > 0f }
+                .associate { it.progress.episode!! to it.progress.percent }
+            if (progress != _uiState.value.episodeProgress) {
+                _uiState.value = _uiState.value.copy(episodeProgress = progress)
+            }
+        }
     }
 
     fun load() {
