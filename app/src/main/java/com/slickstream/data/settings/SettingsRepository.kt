@@ -70,10 +70,14 @@ enum class SubtitleLanguage(val label: String, val code: String) {
 
 /** Subtitle text size, as a fraction of the view height (Media3 SubtitleView.setFractionalTextSize). */
 enum class SubtitleSize(val label: String, val fraction: Float) {
-    SMALL("Small", 0.045f),
-    MEDIUM("Medium", 0.0533f), // Media3 default
-    LARGE("Large", 0.072f),
-    XLARGE("Extra large", 0.095f),
+    // Fraction of the VIEW HEIGHT, so it scales with the panel — which is why the old values looked
+    // huge on 4K (0.045 x 2160 ≈ 97 px even for "Small"). The whole scale is shifted down: Small is now
+    // genuinely tiny, and the default (Medium) sits below the Media3 default of 0.0533, which read as
+    // oversized on a TV.
+    SMALL("Small", 0.028f),
+    MEDIUM("Medium", 0.040f),
+    LARGE("Large", 0.056f),
+    XLARGE("Extra large", 0.075f),
     ;
 
     companion object {
