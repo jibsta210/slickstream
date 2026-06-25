@@ -4,8 +4,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
@@ -116,20 +114,16 @@ fun TvApp() {
                     )
                 }
 
-                // The PLAYER fills the panel edge-to-edge (no inset) — insetting it framed the video in
-                // dark blue-grey Brand.Background (#0B0B0F), the "blue-grey box around the black render".
-                // Menus keep a SMALL 10-foot safe-area so titles aren't at the very panel edge on a TV
-                // that overscans; it's invisible (the menu background is the same #0B0B0F that fills the
-                // shell) and far smaller than the old 32/27 inset that made the whole app look scaled.
-                val playerFullBleed = currentRoute == Routes.PLAYER
+                // ZERO shell inset on EVERY route. Any inset here framed the content (player video,
+                // detail/home backdrops, all of it) in dark blue-grey Brand.Background (#0B0B0F) — the
+                // UI-wide "blue-grey box / whole app scaled" bug. Backgrounds, backdrops and video now
+                // bleed to the physical edge; 10-foot safe-area is the responsibility of each screen's
+                // own foreground padding (rows/text), which is invisible because the menu background is
+                // the same colour that fills the shell.
                 Box(
                     Modifier
                         .weight(1f)
-                        .fillMaxSize()
-                        .then(
-                            if (playerFullBleed) Modifier
-                            else Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
-                        ),
+                        .fillMaxSize(),
                 ) {
                     NavHost(
                         navController = navController,
