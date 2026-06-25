@@ -100,7 +100,13 @@ private fun HomeContent(
         state.continueWatching.associateBy { it.media.id }
     }
     val continueItems: List<MediaItem> = remember(state.continueWatching) {
-        state.continueWatching.map { it.media }
+        // Show the specific episode on the tile (e.g. "Game of Thrones · S1E3"), not just the show
+        // name. id is unchanged so the progress + resume lookups still match.
+        state.continueWatching.map { h ->
+            val s = h.progress.season
+            val e = h.progress.episode
+            if (s != null && e != null) h.media.copy(title = "${h.media.title} · S${s}E$e") else h.media
+        }
     }
 
     // Stable lambdas so MediaRow stays skippable across recompositions (e.g. while scrolling).

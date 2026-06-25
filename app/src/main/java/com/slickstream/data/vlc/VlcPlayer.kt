@@ -350,11 +350,40 @@ class VlcPlayer(
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {}
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            currentSurfaceView?.let { doAttach(it, width, height) }
+            // Already attached to this surface → just re-tell VLC the window size (cheap, no flicker);
+            // attach for real only the first time the surface goes valid.
+            if (voutAttached) applyWindowSize(width, height)
+            else currentSurfaceView?.let { doAttach(it, width, height) }
         }
         override fun surfaceDestroyed(holder: SurfaceHolder) {
+            voutAttached = false
             runCatching { mediaPlayer.vlcVout.detachViews() }
         }
+    }
+
+    /** True once VLC's vout is attached to the current surface (so surfaceChanged can just resize). */
+    private var voutAttached = false
+
+    /**
+     * libVLC reports the decoded video layout here. We re-assert the FULL surface as the window so VLC
+     * scales the picture to fill it — without this, libVLC draws the frame 1:1 in a corner and the rest
+     * of the surface shows through as an uninitialised buffer (the Android-TV "blue box"). Also the most
+     * reliable place to learn the real video size (incl. pixel aspect) to publish up to Media3.
+     */
+    private val videoLayoutListener =
+        org.videolan.libvlc.interfaces.IVLCVout.OnNewVideoLayoutListener { _, width, height, _, _, sarNum, sarDen ->
+            currentSurfaceView?.let { sv ->
+                if (sv.width > 0 && sv.height > 0) applyWindowSize(sv.width, sv.height)
+            }
+            if (width > 0 && height > 0) {
+                val par = if (sarNum > 0 && sarDen > 0) sarNum.toFloat() / sarDen.toFloat() else 1f
+                videoSize = VideoSize(width, height, par)
+                mainHandler.post { invalidateState() }
+            }
+        }
+
+    private fun applyWindowSize(width: Int, height: Int) {
+        runCatching { mediaPlayer.vlcVout.setWindowSize(width.coerceAtLeast(1), height.coerceAtLeast(1)) }
     }
 
     private fun doAttach(surfaceView: SurfaceView, width: Int, height: Int) {
@@ -362,14 +391,23 @@ class VlcPlayer(
             val vout = mediaPlayer.vlcVout
             vout.detachViews()
             vout.setVideoView(surfaceView)
+            // Order matters: attachViews FIRST, THEN setWindowSize. libVLC ignores a window size set
+            // before its vout window exists, which left the picture unscaled in a corner with the blue
+            // surface showing around it. The layout listener re-asserts the size once VLC reports the
+            // real video dimensions.
+            vout.attachViews(videoLayoutListener)
             vout.setWindowSize(width.coerceAtLeast(1), height.coerceAtLeast(1))
-            vout.attachViews()
-        }.onFailure { Log.e(TAG, "doAttach failed", it) }
+            voutAttached = true
+        }.onFailure {
+            voutAttached = false
+            Log.e(TAG, "doAttach failed", it)
+        }
     }
 
     fun detachSurface() {
         currentSurfaceView?.holder?.removeCallback(surfaceCallback)
         currentSurfaceView = null
+        voutAttached = false
         runCatching { mediaPlayer.vlcVout.detachViews() }
     }
 

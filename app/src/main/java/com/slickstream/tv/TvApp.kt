@@ -134,6 +134,11 @@ fun TvApp() {
                             TvHomeScreen(
                                 onMediaClick = ::openDetails,
                                 onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
+                                // Resume carries the saved season/episode so TV shows find episode
+                                // sources (plain onPlayClick would play the show with no episode).
+                                onResume = { h ->
+                                    openPlayer(h.media.mediaType, h.media.id, h.progress.season, h.progress.episode)
+                                },
                             )
                         }
 

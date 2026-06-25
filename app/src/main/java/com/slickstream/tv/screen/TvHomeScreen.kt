@@ -50,6 +50,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Scale
 import com.slickstream.core.model.MediaItem
+import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.feature.home.HomeUiState
 import com.slickstream.feature.home.HomeViewModel
 import com.slickstream.feature.home.MediaRowUi
@@ -67,6 +68,7 @@ import com.slickstream.ui.theme.Brand
 fun TvHomeScreen(
     onMediaClick: (MediaItem) -> Unit,
     onPlayClick: (MediaItem) -> Unit,
+    onResume: (WatchHistoryItem) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
@@ -81,6 +83,7 @@ fun TvHomeScreen(
             state = state,
             onMediaClick = onMediaClick,
             onPlayClick = onPlayClick,
+            onResume = onResume,
             modifier = modifier,
         )
     }
@@ -92,6 +95,7 @@ private fun HomeContent(
     state: HomeUiState,
     onMediaClick: (MediaItem) -> Unit,
     onPlayClick: (MediaItem) -> Unit,
+    onResume: (WatchHistoryItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // Memoize derived collections so they aren't rebuilt (new List/Map allocations) on every
@@ -106,7 +110,24 @@ private fun HomeContent(
         state.continueWatching.associate { it.media.id to it.progress.percent }
     }
     val continueItems: List<MediaItem> = remember(state.continueWatching) {
-        state.continueWatching.map { it.media }
+        // Surface the specific episode on the tile (e.g. "Game of Thrones · S1E3") instead of just the
+        // show name, so a resumed series tile tells you what's actually queued. id is unchanged, so the
+        // progress + resume lookups below still match.
+        state.continueWatching.map { h ->
+            val s = h.progress.season
+            val e = h.progress.episode
+            if (s != null && e != null) h.media.copy(title = "${h.media.title} · S${s}E$e") else h.media
+        }
+    }
+    // Resume a continue-watching tile at its SAVED episode. Tapping a TV-show tile must carry the
+    // season/episode (history is one row per show), or the player resolves the show with no episode
+    // and finds no sources — the "Continue Watching breaks for TV shows" bug. The list is deduped to
+    // one row per show, so a media.id lookup is unambiguous.
+    val historyByMediaId: Map<Int, WatchHistoryItem> = remember(state.continueWatching) {
+        state.continueWatching.associateBy { it.media.id }
+    }
+    val onContinueClick: (MediaItem) -> Unit = remember(historyByMediaId, onResume) {
+        { item -> historyByMediaId[item.id]?.let(onResume) }
     }
 
     // Land focus on the hero Play button on entry (it was unfocused, so Play looked inert until you
@@ -143,7 +164,7 @@ private fun HomeContent(
                 TvMediaRow(
                     title = "Continue Watching",
                     items = continueItems,
-                    onItemClick = onPlayClick,
+                    onItemClick = onContinueClick,
                     wide = true,
                     progressFor = { progressByMediaId[it.id] },
                 )

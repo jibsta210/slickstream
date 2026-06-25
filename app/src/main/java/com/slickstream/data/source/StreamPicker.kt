@@ -14,6 +14,15 @@ import com.slickstream.data.settings.StreamSizePreference
 object StreamPicker {
     const val MIN_SEEDERS = 8
 
+    /**
+     * A candidate must have at least this fraction of the BEST available swarm's seeders to be
+     * eligible, on top of [MIN_SEEDERS]. This is what stops the picker taking a 1-seed 800 MB over a
+     * 66-seed 1.1 GB: 1 < max(8, 66·0.2 = 13), so the near-dead release is dropped while a healthy one
+     * exists. Relative (not a fixed number) so it scales — a 1000-seed title demands ~200, a thinly
+     * seeded one still works off the absolute floor.
+     */
+    private const val RELATIVE_HEALTH_FRACTION = 0.2
+
     fun pick(
         list: List<StreamSource>,
         maxTier: Int,
@@ -23,17 +32,21 @@ object StreamPicker {
         if (list.isEmpty()) return null
         val effectiveTier = if (lowPower) minOf(maxTier, QualityPreference.FHD_1080.maxTier) else maxTier
         val capped = list.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }.ifEmpty { list }
-        val seeded = capped.filter { (it.seeders ?: 0) >= MIN_SEEDERS }.ifEmpty { capped }
-        // Drop releases in a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…) BEFORE the
-        // size/seeder ranking. This is the #1 cause of "healthy torrent, black screen": a brand-new
-        // movie often has a high-seeded XviD CAM sitting next to a playable x264 CAM, and ranking by
-        // seeders alone would take the XviD (which ExoPlayer can't decode -> instant parse crash).
-        // Fall back to the whole set only if NOTHING looks playable, so we never strand the user.
-        val decodable = seeded.filter { it.playable }.ifEmpty { seeded }
+        // Drop releases in a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…) and non-English
+        // ones BEFORE ranking, AND before the health floor — so the floor is computed over genuinely
+        // usable candidates (otherwise a high-seeded XviD CAM would inflate the floor and knock out the
+        // real x264 we want). Fall back to the whole set if a stage empties, so we never strand the user.
+        val decodable = capped.filter { it.playable }.ifEmpty { capped }
         // Default to English: torrent names usually flag the language (Cyrillic/CJK script, a country
         // flag emoji, or tags like RUS/VOSTFR/PLSUB). Prefer the English-looking ones; only fall back
-        // to the rest if there are none (don't leave the user with no playable option).
-        val healthy = decodable.filter { it.englishLikely }.ifEmpty { decodable }
+        // to the rest if there are none.
+        val english = decodable.filter { it.englishLikely }.ifEmpty { decodable }
+        // Health floor RELATIVE to the best swarm available: never pick a near-dead torrent when a
+        // well-seeded one exists, even if the dead one is a little smaller (the old bug). The size
+        // preference below then only ever chooses among genuinely healthy options.
+        val bestSeeders = english.maxOfOrNull { it.seeders ?: 0 } ?: 0
+        val floor = maxOf(MIN_SEEDERS, (bestSeeders * RELATIVE_HEALTH_FRACTION).toInt())
+        val healthy = english.filter { (it.seeders ?: 0) >= floor }.ifEmpty { english }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
                 healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
