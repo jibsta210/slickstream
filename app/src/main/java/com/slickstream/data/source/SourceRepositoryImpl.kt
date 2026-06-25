@@ -107,6 +107,8 @@ class SourceRepositoryImpl @Inject constructor(
             seeders = parseSeeders(haystack),
             provider = parseProvider(name),
             fileIndex = fileIdx,
+            // Flag season/multi-episode packs so the picker prefers a single-file episode (faster start).
+            isPack = StreamPicker.looksLikePack(haystack, fileIdx),
             // Detect language from the FULL text (filename + Torrentio title/description), not just
             // the short label — so a Russian/foreign release is de-prioritized in favour of English.
             englishLikely = StreamPicker.looksEnglish(haystack),

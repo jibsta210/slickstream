@@ -13,6 +13,10 @@ data class StreamSource(
     val seeders: Int?,
     val provider: String,        // indexer / tracker label
     val fileIndex: Int? = null,  // which file inside a multi-file torrent, if known
+    /** True when this source is a season/multi-episode PACK rather than a single-file release. Packs
+     *  stream slower to start (large pieces, the wanted episode sits mid-file behind a shared boundary
+     *  piece), so the picker prefers a single-file episode when one exists. */
+    val isPack: Boolean = false,
     /** False when the torrent text signals a non-English language (so we can default to English). */
     val englishLikely: Boolean = true,
     /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */

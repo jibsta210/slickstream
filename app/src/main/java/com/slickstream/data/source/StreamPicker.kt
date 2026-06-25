@@ -41,12 +41,18 @@ object StreamPicker {
         // flag emoji, or tags like RUS/VOSTFR/PLSUB). Prefer the English-looking ones; only fall back
         // to the rest if there are none.
         val english = decodable.filter { it.englishLikely }.ifEmpty { decodable }
+        // Prefer a SINGLE-FILE episode over a season PACK when one exists. A pack streams slower to
+        // start — big pieces (often 32 MB), and the wanted episode sits mid-torrent behind a shared
+        // boundary piece that must download in full before the head unlocks. We still IGNORE the other
+        // files, but the piece geometry makes packs sluggish, so skip them while a single-file release
+        // is available. Soft: fall back to packs if that's all there is.
+        val singleFile = english.filter { !it.isPack }.ifEmpty { english }
         // Health floor RELATIVE to the best swarm available: never pick a near-dead torrent when a
         // well-seeded one exists, even if the dead one is a little smaller (the old bug). The size
         // preference below then only ever chooses among genuinely healthy options.
-        val bestSeeders = english.maxOfOrNull { it.seeders ?: 0 } ?: 0
+        val bestSeeders = singleFile.maxOfOrNull { it.seeders ?: 0 } ?: 0
         val floor = maxOf(MIN_SEEDERS, (bestSeeders * RELATIVE_HEALTH_FRACTION).toInt())
-        val healthy = english.filter { (it.seeders ?: 0) >= floor }.ifEmpty { english }
+        val healthy = singleFile.filter { (it.seeders ?: 0) >= floor }.ifEmpty { singleFile }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
                 healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
@@ -104,4 +110,22 @@ object StreamPicker {
 
     /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */
     fun looksPlayable(text: String): Boolean = !BAD_CODEC.containsMatchIn(text)
+
+    // Season / multi-episode PACK markers, usually carried in the pack's FOLDER name (which Torrentio
+    // includes alongside the chosen file name): "Season 1", "Complete", a season range "S01-S03", an
+    // episode range "E01-E10", "Pack"/"Collection"/"Batch". A single-episode filename ("…S01E01…")
+    // matches none of these. Used together with a multi-file fileIndex to flag packs.
+    private val PACK_MARKERS = Regex(
+        "(?i)(\\bcomplete\\b|\\bseasons?\\b|\\bpack\\b|\\bcollection\\b|\\bbatch\\b|" +
+            "\\bs\\d{1,2}[\\s._-]*-[\\s._-]*s?\\d{1,2}\\b|" +
+            "\\be\\d{1,3}[\\s._-]*-[\\s._-]*e?\\d{1,3}\\b)",
+    )
+
+    /**
+     * True when the release text looks like a season/multi-episode pack. [fileIndex] is the chosen
+     * file's index within the torrent: anything past the first file is a multi-file torrent, a strong
+     * structural pack signal on its own; the text markers catch packs where the episode is file 0.
+     */
+    fun looksLikePack(text: String, fileIndex: Int?): Boolean =
+        (fileIndex != null && fileIndex > 0) || PACK_MARKERS.containsMatchIn(text)
 }
