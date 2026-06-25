@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.CheckCircle
@@ -69,6 +70,7 @@ import androidx.mediarouter.app.MediaRouteChooserDialog
 import androidx.mediarouter.app.MediaRouteControllerDialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.slickstream.data.vlc.VlcPlayer
 import android.app.Activity
@@ -136,6 +138,10 @@ fun PlayerScreen(
     val episodeSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
 
+    // Fit (letterbox) vs Zoom (crop-to-fill) — survives rotation so entering fullscreen keeps the
+    // user's choice. Applied to PlayerView.resizeMode in the AndroidView update block.
+    var zoomFill by rememberSaveable { mutableStateOf(false) }
+
     // Fullscreen + Picture-in-Picture
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
     val activity = context.findActivity()
@@ -181,6 +187,19 @@ fun PlayerScreen(
                     view.useController = !isInPip   // hide all controls inside the PiP window
                     view.setFullscreenButtonState(isFullscreen)
                     view.subtitleView?.applyAppearance(captionPrefs.size, captionPrefs.style)
+                    // Fit (letterbox, preserve aspect) vs Zoom (crop to fill the screen). Lets the user
+                    // banish the black bars on scope (2.39:1) movies. Applies to ExoPlayer AND the VLC
+                    // fallback, since both render into this PlayerView's surface.
+                    view.resizeMode =
+                        if (zoomFill) AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    // While our unified buffering overlay is up, suppress ExoPlayer's own spinner so
+                    // there's exactly ONE start-up indicator; restore it once playing so a mid-stream
+                    // rebuffer still shows feedback (the overlay stays hidden then, since state==Playing).
+                    view.setShowBuffering(
+                        if (uiState is PlayerUiState.Buffering) PlayerView.SHOW_BUFFERING_NEVER
+                        else PlayerView.SHOW_BUFFERING_WHEN_PLAYING,
+                    )
                     // The libVLC fallback renders into PlayerView's own surface but never signals
                     // Media3's first-frame, so the black shutter would stay over the video — make it
                     // transparent for VLC (normal ExoPlayer keeps the black shutter).
@@ -259,6 +278,8 @@ fun PlayerScreen(
                 showSourcesButton = sources.isNotEmpty(),
                 onSubtitles = { showSubtitles = true },
                 subtitlesActive = currentSubtitle != null,
+                zoomFill = zoomFill,
+                onToggleZoom = { zoomFill = !zoomFill },
                 // Episode navigation — only present for TV shows (episode list resolved).
                 hasEpisodes = episodes.isNotEmpty(),
                 hasPrevious = hasPrevious,
@@ -290,8 +311,11 @@ fun PlayerScreen(
         // --- State overlays (hidden inside the PiP window) ------------------
         if (!isInPip) {
             when (val state = uiState) {
-                // Only show our buffering bar before the player exists (torrent head-download).
-                is PlayerUiState.Buffering -> if (player == null) BufferingOverlay(
+                // ONE continuous overlay from tap → first frame. The torrent head-download AND the
+                // player's own prepare/buffer both live under PlayerUiState.Buffering, so we keep it up
+                // until Playing (not just until the player object exists). This removes the old jarring
+                // second step where the branded ETA vanished and ExoPlayer's bare spinner took over.
+                is PlayerUiState.Buffering -> BufferingOverlay(
                     state = state,
                     // Gentle "taking a while? try a smaller stream" nudge — only after a long, starved buffer.
                     suggestSmaller = suggestSmaller,
@@ -383,6 +407,8 @@ private fun TopOverlay(
     showSourcesButton: Boolean,
     onSubtitles: () -> Unit,
     subtitlesActive: Boolean,
+    zoomFill: Boolean,
+    onToggleZoom: () -> Unit,
     hasEpisodes: Boolean,
     hasPrevious: Boolean,
     hasNext: Boolean,
@@ -453,6 +479,13 @@ private fun TopOverlay(
                 imageVector = Icons.Filled.ClosedCaption,
                 contentDescription = "Subtitles",
                 tint = if (subtitlesActive) Brand.Cyan else Brand.OnSurface,
+            )
+        }
+        IconButton(onClick = onToggleZoom) {
+            Icon(
+                imageVector = Icons.Filled.AspectRatio,
+                contentDescription = if (zoomFill) "Fit to screen" else "Fill screen",
+                tint = if (zoomFill) Brand.Cyan else Brand.OnSurface,
             )
         }
         if (pipSupported) {
@@ -536,10 +569,13 @@ private fun BufferingOverlay(
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 16.sp,
             )
-            state.etaSeconds?.let { eta ->
+            // Cyan line is the live countdown ONLY. Below ~5s the unpredictable tail/prepare steps
+            // dominate, so we drop the number and let the white label ("Almost ready…") carry it —
+            // otherwise both lines would read "Almost ready…".
+            state.etaSeconds?.takeIf { it > 5 }?.let { eta ->
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = if (eta > 5) "Starts in ~${eta}s" else "Almost ready…",
+                    text = "Starts in ~${eta}s",
                     color = Brand.Cyan,
                     fontWeight = FontWeight.Bold,
                     fontSize = 15.sp,

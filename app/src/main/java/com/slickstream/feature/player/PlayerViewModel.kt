@@ -478,7 +478,9 @@ class PlayerViewModel @Inject constructor(
             // Don't clobber an already-Playing state.
             if (_uiState.value is PlayerUiState.Playing) return
             _uiState.value = PlayerUiState.Buffering(
-                percent = (status.progress * 100f).toInt().coerceIn(0, 100),
+                // Progress toward PLAYABLE (not toward the whole multi-GB file) so the bar fills to
+                // ~100% exactly as we become ready — instead of sitting near 0% during "Almost ready…".
+                percent = bufferFillPercent(status),
                 seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
                 downloadRateBytes = status.downloadRateBytes,
                 label = "Almost ready…",
@@ -507,7 +509,7 @@ class PlayerViewModel @Inject constructor(
             else -> "Buffering…"
         }
         _uiState.value = PlayerUiState.Buffering(
-            percent = (status.progress * 100f).toInt().coerceIn(0, 100),
+            percent = bufferFillPercent(status),
             seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
             downloadRateBytes = status.downloadRateBytes,
             label = label,
@@ -533,6 +535,16 @@ class PlayerViewModel @Inject constructor(
         }
         return (downloadSecs + PREPARE_MARGIN_SECONDS).takeIf { it in 1..900 }
     }
+
+    /**
+     * The single progress bar shown while starting up represents "how close are we to PLAYABLE",
+     * not "how much of the whole file is downloaded". Streaming only needs a small head to start, so
+     * whole-file progress would crawl near 0% the entire time and feel broken; this fills 0→100% as
+     * the head buffer reaches [PLAYABLE_TARGET_BYTES] and then sits full through the player's own
+     * prepare/buffer, giving one continuous bar from tap to first frame.
+     */
+    private fun bufferFillPercent(status: StreamStatus): Int =
+        ((status.downloadedBytes.toFloat() / PLAYABLE_TARGET_BYTES) * 100f).toInt().coerceIn(0, 100)
 
     /**
      * Gentle nudge: if the head-buffer has dragged on past [BUFFERING_NAG_MS] with a low download
@@ -652,11 +664,18 @@ class PlayerViewModel @Inject constructor(
                             if (bufferingSinceMs == 0L) {
                                 bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
                             }
+                            // Carry forward the head-download overlay (same label, same ETA, same
+                            // filled bar) instead of resetting to a bare "Buffering…" — the torrent
+                            // flow keeps the ETA live, this just stops the player's own buffer phase
+                            // from blanking it. That blanking was the visible "done, now buffering
+                            // again" second step the user saw.
+                            val prev = _uiState.value as? PlayerUiState.Buffering
                             _uiState.value = PlayerUiState.Buffering(
-                                percent = 100,
-                                seeders = s?.seeders ?: 0,
-                                downloadRateBytes = 0,
-                                label = "Buffering…",
+                                percent = prev?.percent ?: 100,
+                                seeders = prev?.seeders ?: (s?.seeders ?: 0),
+                                downloadRateBytes = prev?.downloadRateBytes ?: 0,
+                                label = "Almost ready…",
+                                etaSeconds = prev?.etaSeconds,
                             )
                             maybeSuggestSmaller(downloadRateBytes = 0)
                         }
@@ -789,11 +808,15 @@ class PlayerViewModel @Inject constructor(
                 }
                 Player.STATE_BUFFERING -> {
                     if (_uiState.value !is PlayerUiState.Playing) {
+                        // Carry the head-download overlay through VLC's own buffer (see the ExoPlayer
+                        // path above) so the unified "Almost ready…" + ETA + filled bar stays put.
+                        val prev = _uiState.value as? PlayerUiState.Buffering
                         _uiState.value = PlayerUiState.Buffering(
-                            percent = 100,
-                            seeders = _currentSource.value?.seeders ?: 0,
-                            downloadRateBytes = 0,
-                            label = "Buffering…",
+                            percent = prev?.percent ?: 100,
+                            seeders = prev?.seeders ?: (_currentSource.value?.seeders ?: 0),
+                            downloadRateBytes = prev?.downloadRateBytes ?: 0,
+                            label = "Almost ready…",
+                            etaSeconds = prev?.etaSeconds,
                         )
                     }
                 }

@@ -147,7 +147,16 @@ class VlcPlayer(
         runCatching {
             val track = mediaPlayer.currentVideoTrack
             if (track != null && track.width > 0 && track.height > 0) {
-                videoSize = VideoSize(track.width, track.height)
+                // Report the sample/pixel aspect ratio (SAR) too, so PlayerView letterbox-fits
+                // non-square-pixel sources (PAL/anamorphic DVD rips etc.) correctly instead of
+                // rendering them stretched. ExoPlayer derives PAR from codec metadata; libVLC
+                // exposes it as sarNum/sarDen on the video track. Square pixels → 1.0 (a no-op).
+                val par = if (track.sarNum > 0 && track.sarDen > 0) {
+                    track.sarNum.toFloat() / track.sarDen.toFloat()
+                } else {
+                    1f
+                }
+                videoSize = VideoSize(track.width, track.height, par)
             }
         }
     }

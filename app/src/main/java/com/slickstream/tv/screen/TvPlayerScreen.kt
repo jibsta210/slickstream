@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AspectRatio
 import androidx.compose.material.icons.rounded.ClosedCaption
 import androidx.compose.material.icons.rounded.Forward10
 import androidx.compose.material.icons.rounded.Pause
@@ -64,6 +65,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.slickstream.data.vlc.VlcPlayer
 import androidx.compose.foundation.lazy.LazyColumn
@@ -119,6 +121,8 @@ fun TvPlayerScreen(
     var episodesPanelOpen by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
     var scrubbing by remember { mutableStateOf(false) }
+    // Fit (letterbox) vs Zoom (crop-to-fill) — toggled from the transport row.
+    var zoomFill by remember { mutableStateOf(false) }
 
     val rootFocus = remember { FocusRequester() }
     val playPauseFocus = remember { FocusRequester() }
@@ -211,6 +215,11 @@ fun TvPlayerScreen(
                 update = { view ->
                     view.player = player
                     view.subtitleView?.applyAppearance(captionPrefs.size, captionPrefs.style)
+                    // Fit (letterbox) vs Zoom (crop to fill) — applies to ExoPlayer and the VLC
+                    // fallback alike, both render into this PlayerView surface.
+                    view.resizeMode =
+                        if (zoomFill) AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        else AspectRatioFrameLayout.RESIZE_MODE_FIT
                     // libVLC renders into PlayerView's surface but never signals Media3's first-frame,
                     // so make the black shutter transparent for the VLC fallback (else it hides video).
                     view.setShutterBackgroundColor(
@@ -282,6 +291,8 @@ fun TvPlayerScreen(
                         controlsVisible = true
                     },
                     onOpenSources = { panelOpen = true; controlsVisible = true },
+                    zoomFill = zoomFill,
+                    onToggleZoom = { zoomFill = !zoomFill; controlsVisible = true },
                     subtitlesActive = currentSubtitle != null,
                     onOpenSubtitles = {
                         subsPanelOpen = true
@@ -397,11 +408,11 @@ private fun BufferingOverlay(
             )
             Text(title, style = MaterialTheme.typography.titleLarge, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(state.label, style = MaterialTheme.typography.bodyLarge, color = Brand.OnSurfaceDim)
-            // Only while we're actually downloading the head (etaSeconds set). Above ~5s show the
-            // number; below that the unpredictable tail/prepare steps dominate, so "Almost ready…".
-            state.etaSeconds?.let { eta ->
+            // Cyan line is the live countdown ONLY. Below ~5s the tail/prepare steps dominate, so we
+            // drop the number and let the label ("Almost ready…") carry it — no duplicated text.
+            state.etaSeconds?.takeIf { it > 5 }?.let { eta ->
                 Text(
-                    text = if (eta > 5) "Starts in ~${eta}s" else "Almost ready…",
+                    text = "Starts in ~${eta}s",
                     style = MaterialTheme.typography.titleMedium,
                     color = Brand.Cyan,
                     fontWeight = FontWeight.Bold,
@@ -536,6 +547,8 @@ private fun TransportOverlay(
     onSeekBack: () -> Unit,
     onSeekForward: () -> Unit,
     onOpenSources: () -> Unit,
+    zoomFill: Boolean,
+    onToggleZoom: () -> Unit,
     subtitlesActive: Boolean,
     onOpenSubtitles: () -> Unit,
     hasEpisodes: Boolean,
@@ -637,6 +650,12 @@ private fun TransportOverlay(
                     "Subtitles",
                     onOpenSubtitles,
                     tint = if (subtitlesActive) Brand.Cyan else Color.White,
+                )
+                TransportButton(
+                    Icons.Rounded.AspectRatio,
+                    if (zoomFill) "Fit to screen" else "Fill screen",
+                    onToggleZoom,
+                    tint = if (zoomFill) Brand.Cyan else Color.White,
                 )
                 TransportButton(Icons.Rounded.Tune, "Sources & quality", onOpenSources)
             }
