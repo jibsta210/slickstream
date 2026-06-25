@@ -493,35 +493,43 @@ class TorrentEngine @Inject constructor(
      */
     private fun prioritizeHeadAndTail(active: ActiveTorrent) {
         val handle = active.handle?.takeIf { it.isValid } ?: return
-        if (active.pieceLength <= 0) return
-        val headPieces = maxOf(HEAD_PRIORITY_BYTES / active.pieceLength + 1, MIN_HEAD_PIECES)
+        val pieceLen = active.pieceLength
+        if (pieceLen <= 0) return
+        // BYTE-bounded head band, NOT a fixed piece count. The readiness gate only needs ~READY_HEAD
+        // (2 MB), so deadline just the pieces covering ~HEAD_PRIORITY_BYTES of head: 1 piece when the
+        // torrent has big pieces (8-32 MB), a few when pieces are small. A fixed 5-piece band was the
+        // killer on big-piece torrents — 5 x 32 MB = 160 MB fetched in PARALLEL, so piece 0 (and thus
+        // "head ready") didn't land for ~a minute even at 3 MB/s.
+        val headPieces = maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
         val ext = active.filePath?.substringAfterLast('.', "")?.lowercase()
         val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
-        val tailPieces = if (moovCritical) (TAIL_PRIORITY_BYTES / active.pieceLength + 1) else 0
+        // mkv/webm have no startup tail. mp4/mov MUST have the EOF moov before the first frame, so fetch
+        // it IN PARALLEL with the head (interleaved deadlines), never behind the head band — putting it
+        // behind a big-piece head band delayed the moov by ~a minute.
+        val tailPieces = if (moovCritical) maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen)) else 0
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
         // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
         synchronized(nativeLock) { runCatching {
-            var deadline = 0
             for (i in 0 until headPieces) {
                 val p = active.firstPiece + i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, deadline)
-                    deadline += 25
+                    handle.setPieceDeadline(p, i * 20)
                 }
             }
-            // Tail (moov-critical only) — deadlined AFTER the whole head band so the head always wins
-            // the bandwidth, but still well ahead of the sequential cursor that would never reach EOF.
             for (i in 0 until tailPieces) {
                 val p = active.lastPiece - i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, TAIL_DEADLINE_BASE_MS + i * 25)
+                    handle.setPieceDeadline(p, i * 20)  // parallel with the head, not after it
                 }
             }
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
     }
+
+    /** Ceiling of [a]/[b] for positive ints. */
+    private fun ceilDiv(a: Int, b: Int): Int = (a + b - 1) / b
 
     /**
      * Ensure the byte range [start, endInclusive] of the selected file is downloaded,
@@ -872,14 +880,6 @@ class TorrentEngine @Inject constructor(
          * 8 MB comfortably spans a feature-length moov so the whole atom is deadline-fetched up front. */
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
         const val TAIL_PRIORITY_BYTES = 8 * 1024 * 1024
-
-        /** Always deadline at least this many head pieces in order, even when a torrent's piece size is
-         *  large (8 MB pieces -> HEAD_PRIORITY_BYTES alone is 1 piece). Deadlining a band forces the
-         *  swarm to fill the start contiguously instead of scattering, so the readiness gate hits fast. */
-        const val MIN_HEAD_PIECES = 5
-
-        /** mp4 moov tail deadline base (ms) — after the whole head band so the head wins bandwidth. */
-        const val TAIL_DEADLINE_BASE_MS = 800
 
         /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
          *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
