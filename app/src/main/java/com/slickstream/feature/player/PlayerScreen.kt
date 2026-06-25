@@ -8,6 +8,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,6 +60,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -127,7 +129,12 @@ fun PlayerScreen(
     val hasNext by viewModel.hasNext.collectAsState()
     val hasPrevious by viewModel.hasPrevious.collectAsState()
     val suggestSmaller by viewModel.suggestSmaller.collectAsState()
+    val thumbnailVersion by viewModel.thumbnailVersion.collectAsState()
     val context = LocalContext.current
+
+    // Scrub-preview: the ms position the user is dragging the built-in time bar to (null = not
+    // scrubbing). Fed by a TimeBar.OnScrubListener attached to ExoPlayer's DefaultTimeBar below.
+    var scrubPreviewMs by remember { mutableStateOf<Long?>(null) }
 
     var showSources by remember { mutableStateOf(false) }
     var showSubtitles by remember { mutableStateOf(false) }
@@ -180,6 +187,20 @@ fun PlayerScreen(
                         setFullscreenButtonClickListener { enter -> isFullscreen = enter }
                         this.player = activePlayer
                         playerViewRef = this
+                        // Tap into the built-in time bar's scrub events to drive the frame-preview
+                        // bubble (the controls are ExoPlayer's, so we listen rather than draw our own).
+                        findViewById<androidx.media3.ui.DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+                            ?.addListener(object : androidx.media3.ui.TimeBar.OnScrubListener {
+                                override fun onScrubStart(timeBar: androidx.media3.ui.TimeBar, position: Long) {
+                                    scrubPreviewMs = position
+                                }
+                                override fun onScrubMove(timeBar: androidx.media3.ui.TimeBar, position: Long) {
+                                    scrubPreviewMs = position
+                                }
+                                override fun onScrubStop(timeBar: androidx.media3.ui.TimeBar, position: Long, canceled: Boolean) {
+                                    scrubPreviewMs = null
+                                }
+                            })
                     }
                 },
                 update = { view ->
@@ -333,6 +354,20 @@ fun PlayerScreen(
                 controlsVisible = overlayVisible,
                 onPlayOnDevice = viewModel::stopCasting,
             )
+
+            // Frame preview while dragging the seek bar: nearest sampled frame above the timecode, or
+            // just the timecode for a part of the timeline we haven't fetched a sample for yet.
+            val previewMs = scrubPreviewMs
+            if (previewMs != null && !isCasting) {
+                val frame = remember(previewMs / 5_000L, thumbnailVersion) {
+                    viewModel.thumbnailAt(previewMs)
+                }
+                ScrubPreviewBubble(
+                    positionMs = previewMs,
+                    thumbnail = frame,
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                )
+            }
         }
     }
 
@@ -685,6 +720,54 @@ private fun bufferingStats(state: PlayerUiState.Buffering): String = buildString
         append(formatRate(state.downloadRateBytes))
     }
     if (isEmpty()) append("Connecting…")
+}
+
+/**
+ * Floating preview shown while the user drags the seek bar: the nearest sparsely-sampled frame (when
+ * that slice has been fetched + decoded) above a timecode pill. Sits just above the system controls.
+ * The frame is null for parts of the timeline not yet sampled — then only the timecode shows.
+ */
+@Composable
+private fun ScrubPreviewBubble(
+    positionMs: Long,
+    thumbnail: android.graphics.Bitmap?,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.padding(bottom = 92.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        if (thumbnail != null) {
+            androidx.compose.foundation.Image(
+                bitmap = thumbnail.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .height(108.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .border(2.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(10.dp)),
+            )
+            Spacer(Modifier.height(6.dp))
+        }
+        Text(
+            text = formatTimecode(positionMs),
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            fontSize = 14.sp,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(Color.Black.copy(alpha = 0.6f))
+                .padding(horizontal = 12.dp, vertical = 5.dp),
+        )
+    }
+}
+
+private fun formatTimecode(ms: Long): String {
+    if (ms <= 0) return "0:00"
+    val s = ms / 1000
+    val h = s / 3600
+    val m = (s % 3600) / 60
+    val sec = s % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }
 
 @Composable

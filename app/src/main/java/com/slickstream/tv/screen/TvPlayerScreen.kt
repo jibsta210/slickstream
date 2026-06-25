@@ -7,7 +7,9 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -47,6 +49,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.ui.draw.clip
@@ -114,6 +117,7 @@ fun TvPlayerScreen(
     val hasNext by viewModel.hasNext.collectAsStateWithLifecycle()
     val hasPrevious by viewModel.hasPrevious.collectAsStateWithLifecycle()
     val suggestSmaller by viewModel.suggestSmaller.collectAsStateWithLifecycle()
+    val thumbnailVersion by viewModel.thumbnailVersion.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -293,6 +297,8 @@ fun TvPlayerScreen(
                     onOpenSources = { panelOpen = true; controlsVisible = true },
                     zoomFill = zoomFill,
                     onToggleZoom = { zoomFill = !zoomFill; controlsVisible = true },
+                    thumbnailAt = viewModel::thumbnailAt,
+                    thumbnailVersion = thumbnailVersion,
                     subtitlesActive = currentSubtitle != null,
                     onOpenSubtitles = {
                         subsPanelOpen = true
@@ -549,6 +555,8 @@ private fun TransportOverlay(
     onOpenSources: () -> Unit,
     zoomFill: Boolean,
     onToggleZoom: () -> Unit,
+    thumbnailAt: (Long) -> android.graphics.Bitmap?,
+    thumbnailVersion: Int,
     subtitlesActive: Boolean,
     onOpenSubtitles: () -> Unit,
     hasEpisodes: Boolean,
@@ -609,6 +617,8 @@ private fun TransportOverlay(
                 focusRequester = scrubFocus,
                 onScrubbingChange = onScrubbingChange,
                 onTogglePlayPause = onPlayPause,
+                thumbnailAt = thumbnailAt,
+                thumbnailVersion = thumbnailVersion,
             )
             Row(
                 horizontalArrangement = Arrangement.spacedBy(20.dp),
@@ -675,6 +685,8 @@ private fun ScrubBar(
     focusRequester: FocusRequester,
     onScrubbingChange: (Boolean) -> Unit,
     onTogglePlayPause: () -> Unit,
+    thumbnailAt: (Long) -> android.graphics.Bitmap?,
+    thumbnailVersion: Int,
     modifier: Modifier = Modifier,
 ) {
     var scrubbing by remember { mutableStateOf(false) }
@@ -707,6 +719,21 @@ private fun ScrubBar(
 
     Column(modifier = modifier.fillMaxWidth(0.72f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (scrubbing) {
+            // Preview frame for the scrub target, when that slice has been sampled (null otherwise —
+            // we only ever sample sparsely across the buffered timeline). thumbnailVersion is read so a
+            // newly-decoded frame recomposes this.
+            val previewFrame = remember(scrubTargetMs / 5_000L, thumbnailVersion) { thumbnailAt(scrubTargetMs) }
+            previewFrame?.let { bmp ->
+                Image(
+                    bitmap = bmp.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier
+                        .align(Alignment.CenterHorizontally)
+                        .height(150.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .border(2.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(10.dp)),
+                )
+            }
             Text(
                 text = fmtTime(scrubTargetMs),
                 style = MaterialTheme.typography.headlineSmall,

@@ -252,6 +252,14 @@ class TorrentStreamerImpl @Inject constructor(
 
     override fun cacheSizeBytes(): Long = cache.cacheSizeBytes()
 
+    override fun fileLength(infoHash: String): Long = engine.fileLength(infoHash)
+
+    override fun prefetchPreviewOffsets(infoHash: String, offsets: List<Long>) =
+        engine.prefetchByteOffsets(infoHash, offsets)
+
+    override fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean =
+        engine.isByteAvailable(infoHash, byteOffset)
+
     // --- internals -------------------------------------------------------------------------
 
     @Synchronized

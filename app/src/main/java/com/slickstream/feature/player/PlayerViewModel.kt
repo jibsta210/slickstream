@@ -218,6 +218,13 @@ class PlayerViewModel @Inject constructor(
     private val _videoAspect = MutableStateFlow(16f / 9f)
     val videoAspect: StateFlow<Float> = _videoAspect.asStateFlow()
 
+    // --- Scrub-bar frame previews (sparse thumbnails sampled across the timeline) ---
+    private val thumbnails = FrameThumbnailExtractor(torrentStreamer)
+    /** Bumps when a new preview thumbnail lands, so the scrub UI recomposes. */
+    val thumbnailVersion: StateFlow<Int> = thumbnails.version
+    /** Nearest decoded preview frame to [positionMs], or null when that slice isn't sampled yet. */
+    fun thumbnailAt(positionMs: Long): android.graphics.Bitmap? = thumbnails.thumbnailAt(positionMs)
+
     // --- Subtitles ---
     private val _subtitles = MutableStateFlow<List<SubtitleTrack>>(emptyList())
     val subtitles: StateFlow<List<SubtitleTrack>> = _subtitles.asStateFlow()
@@ -354,6 +361,8 @@ class PlayerViewModel @Inject constructor(
         _currentSource.value = source
         hasSeekedToResume = false
         activeInfoHash = source.infoHash
+        // Drop any previous source's preview frames; the new one re-samples once it's playing.
+        thumbnails.clear()
         // Record this attempt so failover never loops back to a source we've already tried, and clear
         // the in-flight guard now that a new attempt is actually underway.
         triedInfoHashes.add(source.infoHash)
@@ -656,6 +665,7 @@ class PlayerViewModel @Inject constructor(
                         bufferingSinceMs = 0L
                         _suggestSmaller.value = false
                         _uiState.value = PlayerUiState.Playing
+                        maybeStartThumbnails(exo)
                     }
                     Player.STATE_BUFFERING -> {
                         if (_uiState.value !is PlayerUiState.Playing) {
@@ -1015,6 +1025,20 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Kick off sparse scrub-preview sampling once we're actually playing with a known duration. The
+     * extractor is idempotent for the same URL, so calling it on every READY re-emit is fine. Skipped
+     * for the libVLC fallback — MediaMetadataRetriever can't decode the codecs VLC is there for, so it
+     * would only waste prefetch bandwidth.
+     */
+    private fun maybeStartThumbnails(player: Player) {
+        if (usingVlcForSource) return
+        val hash = activeInfoHash ?: return
+        val url = currentMediaUrl ?: return
+        val dur = player.duration.takeIf { it > 0 } ?: return
+        thumbnails.start(url, hash, dur, torrentStreamer.fileLength(hash))
+    }
+
     private fun startProgressTicker() {
         progressTickJob?.cancel()
         progressTickJob = viewModelScope.launch {
@@ -1281,6 +1305,7 @@ class PlayerViewModel @Inject constructor(
         exo?.release()
         _player.value = null
         releaseVlcPlayer()
+        thumbnails.release()
         castPlayer?.setSessionAvailabilityListener(null)
         castPlayer?.release()
         castPlayer = null

@@ -586,6 +586,47 @@ class TorrentEngine @Inject constructor(
         true
     }
 
+    /**
+     * Best-effort, NON-BLOCKING: nudge libtorrent to fetch the pieces covering these file byte-offsets
+     * ahead of the sequential cursor, but at RELAXED deadlines so the head buffer + read-ahead (which
+     * carry 50 ms-class deadlines) always win the swarm. Used to sparsely sample frames across the
+     * timeline for scrub-bar previews once playback is healthy. Each offset pulls its piece + the next
+     * one (a keyframe can straddle the boundary). Cheap to call repeatedly — libtorrent dedups.
+     */
+    fun prefetchByteOffsets(infoHash: String, offsets: List<Long>) {
+        val active = torrents[infoHash] ?: return
+        val handle = active.handle?.takeIf { it.isValid } ?: return
+        if (active.pieceLength <= 0) return
+        synchronized(nativeLock) {
+            runCatching {
+                offsets.forEachIndexed { i, off ->
+                    if (off < 0L) return@forEachIndexed
+                    val base = ((active.fileOffset + off) / active.pieceLength).toInt()
+                    for (p in base..base + 1) {
+                        if (p in active.firstPiece..active.lastPiece) {
+                            handle.setPieceDeadline(p, PREVIEW_PREFETCH_DEADLINE_MS + i * 200)
+                        }
+                    }
+                }
+            }.onFailure { Log.w(TAG, "prefetchByteOffsets failed", it) }
+        }
+    }
+
+    /** Non-blocking: is the piece covering this file byte-offset present on disk yet? */
+    fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean = synchronized(nativeLock) {
+        val active = torrents[infoHash] ?: return@synchronized false
+        val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized false
+        if (active.pieceLength <= 0 || byteOffset < 0L) return@synchronized false
+        val piece = ((active.fileOffset + byteOffset) / active.pieceLength).toInt()
+        if (piece !in active.firstPiece..active.lastPiece) return@synchronized false
+        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
+            ?: return@synchronized false
+        val pieces = status.pieces()
+        val pieceCount = pieces.size()
+        if (pieceCount == 0 || piece >= pieceCount) return@synchronized false
+        runCatching { pieces.getBit(piece) }.getOrDefault(false)
+    }
+
     /** Absolute path of the selected file, once chosen. */
     fun filePath(infoHash: String): String? = torrents[infoHash]?.filePath
 
@@ -779,6 +820,10 @@ class TorrentEngine @Inject constructor(
          * 8 MB comfortably spans a feature-length moov so the whole atom is deadline-fetched up front. */
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
         const val TAIL_PRIORITY_BYTES = 8 * 1024 * 1024
+
+        /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
+         *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
+        const val PREVIEW_PREFETCH_DEADLINE_MS = 4000
 
         /** Seed/upload cap (bytes/s) — keep a streaming client from saturating the home upstream. */
         const val UPLOAD_RATE_LIMIT = 100 * 1024

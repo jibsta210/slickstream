@@ -116,6 +116,18 @@ interface TorrentStreamer {
     fun cachedTorrents(): List<String>
     suspend fun clearCache()
     fun cacheSizeBytes(): Long
+
+    /** Length (bytes) of the selected file for a stream, or 0 until known. */
+    fun fileLength(infoHash: String): Long
+
+    /**
+     * Best-effort, NON-BLOCKING: nudge the engine to fetch the slices covering these file byte-offsets
+     * for scrub-preview thumbnails, at a relaxed priority so playback's head/read-ahead always wins.
+     */
+    fun prefetchPreviewOffsets(infoHash: String, offsets: List<Long>)
+
+    /** Non-blocking: is the slice covering this file byte-offset on disk yet? */
+    fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean
 }
 
 /** Google OAuth via Credential Manager. Implemented by feature/auth. */
