@@ -14,17 +14,29 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
 /**
- * Sparse scrub-bar thumbnails for a torrent stream.
+ * Scrub-bar thumbnails for a torrent stream, sampled in two bandwidth-aware tiers.
  *
- * A torrent downloads sequentially, so only the already-buffered head can be decoded without
- * blocking. To give a preview across the WHOLE timeline anyway, once playback is healthy we ask the
- * engine to sparsely pre-fetch ~[SAMPLE_COUNT] evenly-spaced slices (at a relaxed deadline that never
- * competes with playback), then decode ONE keyframe at each as its bytes land and cache a small
- * bitmap. Scrubbing shows the nearest cached frame, or nothing (timecode only) for a slice that
- * hasn't arrived yet.
+ * A torrent downloads sequentially, so only the already-buffered region can be decoded without
+ * blocking. To give a useful film-strip scrub experience we sample at two densities:
+ *
+ *  - COARSE tier: ~[COARSE_COUNT] evenly-spaced points across the WHOLE timeline that we actively
+ *    PREFETCH (at a relaxed deadline that never competes with playback). Bounded whole-timeline
+ *    coverage — this is roughly the old fixed-24 behaviour and caps how much we ever download for
+ *    previews.
+ *
+ *  - DENSE tier: ~1 frame per MINUTE of content. These are NEVER prefetched — they're decoded
+ *    free-of-charge ONLY where the covering bytes are ALREADY on disk
+ *    ([TorrentStreamer.isByteAvailable] == true). As the user watches (the contiguous downloaded
+ *    head grows) and as the coarse prefetches land, more and more dense samples become decodable for
+ *    free; the poll loop re-scans and fills them in. Net effect: the already-downloaded region of the
+ *    timeline ends up ~1 frame/min (free), the rest stays at coarse density until its bytes arrive.
+ *
+ * CRITICAL bandwidth note: torrent prefetch is piece-granular (pieceLength is commonly 8–33 MB and
+ * pulls WHOLE pieces). Prefetching ~1 sample/min across a feature would download essentially the
+ * whole file, defeating the point of a cheap preview — hence the dense tier is strictly free-only.
  *
  * Safety: every frame decode runs on a background thread and is GATED on the covering piece being on
  * disk (so [MediaMetadataRetriever] won't trigger the HTTP server's blocking range-fetch). Even if a
@@ -41,10 +53,16 @@ class FrameThumbnailExtractor(
     @Volatile private var infoHash: String? = null
     @Volatile private var durationMs: Long = 0L
     @Volatile private var fileLength: Long = 0L
-    @Volatile private var intervalMs: Long = 0L
 
-    /** sample index -> decoded thumbnail (nulls until decoded). Guarded by [lock]. */
-    private val frames = HashMap<Int, Bitmap>()
+    /** Spacing of the dense tier (≈ one decoded frame per minute). Drives [thumbnailAt]'s grid. */
+    @Volatile private var denseIntervalMs: Long = 0L
+
+    /** Last position the UI asked a thumbnail for — used as the anchor when evicting a full cache. */
+    @Volatile private var lastScrubMs: Long = 0L
+
+    /** timestamp(ms at frame centre) -> decoded thumbnail. Guarded by [lock]. Keyed by time (not
+     *  sample index) because the two tiers sit on different grids and the dense grid is sparse. */
+    private val frames = HashMap<Long, Bitmap>()
     private val lock = Any()
 
     /** Bumped whenever a new thumbnail lands, so the UI can recompose. */
@@ -63,32 +81,55 @@ class FrameThumbnailExtractor(
         infoHash = hash
         this.durationMs = durationMs
         this.fileLength = fileLength
-        val count = SAMPLE_COUNT
-        intervalMs = (durationMs / count).coerceAtLeast(1L)
-        job = scope.launch { run(streamUrl, hash, count) }
+
+        // Coarse tier: bounded whole-timeline coverage that we actively prefetch.
+        val coarseCount = COARSE_COUNT
+        // Dense tier: ~1 frame/min, clamped so very short clips don't go below the coarse density and
+        // very long ones don't blow past the cache cap.
+        val durationMinutes = (durationMs / 60_000L).toInt()
+        val denseCount = durationMinutes.coerceIn(coarseCount, MAX_DENSE_COUNT)
+        denseIntervalMs = (durationMs / denseCount).coerceAtLeast(1L)
+
+        job = scope.launch { run(streamUrl, hash, coarseCount, denseCount) }
     }
 
-    /** Nearest decoded thumbnail to [positionMs], or null if that part of the timeline isn't sampled
-     *  yet. Searches a couple of neighbouring buckets so a scrub always shows the closest frame. */
+    /** Nearest decoded thumbnail to [positionMs], or null if nothing near it is decoded yet. Scans a
+     *  window of dense-interval buckets on either side so a scrub between samples still finds the
+     *  closest frame on the (possibly sparse) grid. */
     fun thumbnailAt(positionMs: Long): Bitmap? {
-        val iv = intervalMs
+        lastScrubMs = positionMs
+        val iv = denseIntervalMs
         if (iv <= 0L) return null
-        val center = (positionMs / iv).toInt()
         synchronized(lock) {
             if (frames.isEmpty()) return null
-            for (d in 0..NEIGHBOUR_SEARCH) {
-                frames[center + d]?.let { return it }
-                if (d > 0) frames[center - d]?.let { return it }
+            var best: Bitmap? = null
+            var bestDist = Long.MAX_VALUE
+            // Bound the search window so an arbitrary scrub doesn't walk the whole map; NEIGHBOUR_SPAN
+            // dense intervals on either side comfortably covers the gap between any two decoded frames
+            // (dense where bytes are present, coarse elsewhere).
+            val window = iv * NEIGHBOUR_SPAN
+            for ((ts, bmp) in frames) {
+                val dist = abs(ts - positionMs)
+                if (dist <= window && dist < bestDist) {
+                    bestDist = dist
+                    best = bmp
+                }
             }
+            return best
         }
-        return null
     }
 
-    private suspend fun run(streamUrl: String, hash: String, count: Int) {
-        // Approximate byte offset of each sample's keyframe (linear time→byte; refined by the
-        // container's own index inside getFrameAtTime). Prefetch them all up front, relaxed.
-        val offsets = (0 until count).map { i -> sampleByteOffset(i) }
-        runCatching { streamer.prefetchPreviewOffsets(hash, offsets) }
+    private suspend fun run(streamUrl: String, hash: String, coarseCount: Int, denseCount: Int) {
+        // Coarse sample centres (time + byte offset). These get actively prefetched.
+        val coarseInterval = (durationMs / coarseCount).coerceAtLeast(1L)
+        val coarseTimes = (0 until coarseCount).map { i -> i * coarseInterval + coarseInterval / 2 }
+        val coarseOffsets = coarseTimes.map { byteOffsetForTime(it) }
+
+        // Dense sample centres (time only — never prefetched, decoded only where bytes already exist).
+        val denseTimes = (0 until denseCount).map { i -> i * denseIntervalMs + denseIntervalMs / 2 }
+
+        // Kick off the coarse prefetch up front (relaxed deadline; never competes with playback).
+        runCatching { streamer.prefetchPreviewOffsets(hash, coarseOffsets) }
 
         val retriever = runCatching {
             MediaMetadataRetriever().apply { setDataSource(streamUrl, HashMap<String, String>()) }
@@ -98,34 +139,55 @@ class FrameThumbnailExtractor(
         }
 
         try {
-            val done = HashSet<Int>()
+            // Frame centres we've already attempted (decoded or proven-empty) — keyed by time, so we
+            // never re-decode a slice and the coarse/dense tiers share one done-set.
+            val done = HashSet<Long>()
+            // Coarse points still missing get their deadlines re-armed each round so libtorrent keeps
+            // sipping them; dense points are free-only and never re-armed.
             var idleRounds = 0
-            while (scope.isActive && done.size < count) {
+            // The coarse tier defines "complete enough to back off"; the dense tier is opportunistic
+            // and may keep filling for the whole session as the download head grows, so we don't
+            // require denseCount to finish before idling.
+            while (scope.isActive) {
                 var progressed = false
-                for (i in 0 until count) {
-                    if (i in done) continue
+
+                // Coarse tier — prefetched, so its bytes will arrive; decode each as it lands.
+                for (i in coarseTimes.indices) {
                     if (!scope.isActive) break
-                    val offset = offsets[i]
-                    if (!streamer.isByteAvailable(hash, offset)) continue
-                    val bmp = decodeFrame(retriever, i)
-                    if (bmp != null) {
-                        synchronized(lock) { frames[i] = bmp }
-                        done += i
-                        progressed = true
-                        _version.value = _version.value + 1
-                    } else {
-                        // Decoded null despite bytes present (rare) — don't hammer it; mark done.
-                        done += i
-                    }
+                    val t = coarseTimes[i]
+                    if (t in done) continue
+                    if (!streamer.isByteAvailable(hash, coarseOffsets[i])) continue
+                    if (decodeAndStore(retriever, t)) progressed = true
+                    done += t
                 }
-                // Re-arm deadlines for the slices still missing so libtorrent keeps sipping them.
-                if (done.size < count) {
-                    val missing = (0 until count).filter { it !in done }.map { offsets[it] }
-                    runCatching { streamer.prefetchPreviewOffsets(hash, missing) }
+
+                // Dense tier — FREE only: decode a sample solely when its bytes are already on disk.
+                // Never prefetch these. Re-scanned every round so newly-downloaded regions fill in.
+                for (t in denseTimes) {
+                    if (!scope.isActive) break
+                    if (t in done) continue
+                    if (!streamer.isByteAvailable(hash, byteOffsetForTime(t))) continue
+                    if (decodeAndStore(retriever, t)) progressed = true
+                    done += t
                 }
+
+                // Re-arm deadlines on coarse points still missing so libtorrent keeps fetching them.
+                val coarseMissing = coarseTimes.indices
+                    .filter { coarseTimes[it] !in done }
+                    .map { coarseOffsets[it] }
+                if (coarseMissing.isNotEmpty()) {
+                    runCatching { streamer.prefetchPreviewOffsets(hash, coarseMissing) }
+                }
+
+                // If the coarse tier is fully decoded AND every dense point has been attempted, there's
+                // nothing left that could ever land — stop polling.
+                val coarseDone = coarseTimes.all { it in done }
+                val denseDone = denseTimes.all { it in done }
+                if (coarseDone && denseDone) break
+
                 idleRounds = if (progressed) 0 else idleRounds + 1
                 // Back off as the buffered region stops growing; never give up entirely (the user may
-                // still be downloading) but don't spin tightly either.
+                // still be downloading more, unlocking more free dense frames) but don't spin tightly.
                 delay(if (idleRounds > 6) IDLE_POLL_MS else ACTIVE_POLL_MS)
             }
         } finally {
@@ -133,8 +195,54 @@ class FrameThumbnailExtractor(
         }
     }
 
-    private fun decodeFrame(retriever: MediaMetadataRetriever, index: Int): Bitmap? {
-        val timeUs = (index * intervalMs + intervalMs / 2) * 1000L
+    /** Decode the frame centred at [timeMs], store it (capped + evicting) and bump version. Returns
+     *  true if a bitmap was actually added. */
+    private fun decodeAndStore(retriever: MediaMetadataRetriever, timeMs: Long): Boolean {
+        val bmp = decodeFrame(retriever, timeMs) ?: return false
+        synchronized(lock) {
+            // Don't double-store (another tier may share an identical centre on tiny clips).
+            if (frames.containsKey(timeMs)) {
+                bmp.recycle()
+                return false
+            }
+            evictIfFullLocked(timeMs)
+            frames[timeMs] = bmp
+        }
+        _version.value = _version.value + 1
+        return true
+    }
+
+    /** If the cache is at capacity, drop the entry whose timestamp is farthest from the most recent
+     *  scrub position (the part of the timeline the user is least likely looking at). Caller holds
+     *  [lock]. [incomingTs] is the frame about to be added, so we don't evict to make room for
+     *  something even farther away. */
+    private fun evictIfFullLocked(incomingTs: Long) {
+        if (frames.size < MAX_FRAMES) return
+        val anchor = lastScrubMs
+        var farKey: Long? = null
+        var farDist = abs(incomingTs - anchor)
+        for (ts in frames.keys) {
+            val dist = abs(ts - anchor)
+            if (dist > farDist) {
+                farDist = dist
+                farKey = ts
+            }
+        }
+        // Only evict if some existing frame is farther from the anchor than the incoming one;
+        // otherwise the incoming frame is the least useful and we simply skip adding it.
+        if (farKey != null) {
+            frames.remove(farKey)?.let { runCatching { it.recycle() } }
+        }
+        // If farKey is null every existing frame is at least as close as the incoming one — but we
+        // still need room, so drop the single farthest existing entry to honour the cap.
+        if (frames.size >= MAX_FRAMES) {
+            val drop = frames.keys.maxByOrNull { abs(it - anchor) }
+            if (drop != null) frames.remove(drop)?.let { runCatching { it.recycle() } }
+        }
+    }
+
+    private fun decodeFrame(retriever: MediaMetadataRetriever, timeMs: Long): Bitmap? {
+        val timeUs = timeMs * 1000L
         val full = runCatching {
             retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
         }.getOrNull() ?: return null
@@ -149,8 +257,10 @@ class FrameThumbnailExtractor(
         }
     }
 
-    private fun sampleByteOffset(index: Int): Long {
-        val t = (index * intervalMs + intervalMs / 2).toDouble()
+    /** Approximate file byte offset of the keyframe nearest [timeMs] (linear time→byte; the
+     *  container's own index refines the actual frame inside getFrameAtTime). */
+    private fun byteOffsetForTime(timeMs: Long): Long {
+        val t = timeMs.toDouble()
         return ((t / durationMs) * fileLength).toLong().coerceIn(0L, (fileLength - 1).coerceAtLeast(0L))
     }
 
@@ -161,7 +271,8 @@ class FrameThumbnailExtractor(
         infoHash = null
         durationMs = 0L
         fileLength = 0L
-        intervalMs = 0L
+        denseIntervalMs = 0L
+        lastScrubMs = 0L
         synchronized(lock) {
             frames.values.forEach { runCatching { it.recycle() } }
             frames.clear()
@@ -180,10 +291,26 @@ class FrameThumbnailExtractor(
 
     private companion object {
         const val TAG = "FrameThumbs"
-        /** How many points across the timeline we sample. ~24 ≈ one every few minutes for a feature. */
-        const val SAMPLE_COUNT = 24
+
+        /** Coarse tier: evenly-spaced points across the whole timeline that we actively PREFETCH.
+         *  Bounds how much we ever download for previews (≈ the old fixed-24 behaviour). */
+        const val COARSE_COUNT = 20
+
+        /** Dense tier upper bound (~1 frame/min, clamped to this). Each thumb ≈ 230 KB, so the cap
+         *  keeps the bitmap cache well under ~40 MB even when fully populated. */
+        const val MAX_DENSE_COUNT = 180
+
+        /** Hard cap on cached bitmaps (≈ MAX_DENSE_COUNT plus a little headroom). Evict farthest from
+         *  the most-recent scrub when exceeded. ~180 × ~230 KB ≈ <40 MB. */
+        const val MAX_FRAMES = 180
+
         const val THUMB_HEIGHT_PX = 180
-        const val NEIGHBOUR_SEARCH = 2
+
+        /** How many dense intervals on each side [thumbnailAt] scans for the nearest decoded frame.
+         *  Wide enough that a scrub landing in an undownloaded (coarse-only) gap still resolves to the
+         *  closest coarse frame. */
+        const val NEIGHBOUR_SPAN = 8L
+
         const val ACTIVE_POLL_MS = 600L
         const val IDLE_POLL_MS = 2500L
     }

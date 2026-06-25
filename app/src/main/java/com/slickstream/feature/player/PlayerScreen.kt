@@ -92,6 +92,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
+import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.ui.theme.Brand
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -355,16 +356,17 @@ fun PlayerScreen(
                 onPlayOnDevice = viewModel::stopCasting,
             )
 
-            // Frame preview while dragging the seek bar: nearest sampled frame above the timecode, or
-            // just the timecode for a part of the timeline we haven't fetched a sample for yet.
+            // Film-strip preview while dragging the seek bar: a row of frames around the scrub point
+            // that scrolls as you drag (earlier frames left, later frames right), the centre frame
+            // being the target. Empty slots show for parts of the timeline not yet sampled.
             val previewMs = scrubPreviewMs
             if (previewMs != null && !isCasting) {
-                val frame = remember(previewMs / 5_000L, thumbnailVersion) {
-                    viewModel.thumbnailAt(previewMs)
-                }
-                ScrubPreviewBubble(
-                    positionMs = previewMs,
-                    thumbnail = frame,
+                val dur = activePlayer?.duration?.takeIf { it > 0 } ?: 0L
+                ScrubFilmstrip(
+                    centerMs = previewMs,
+                    durationMs = dur,
+                    thumbnailAt = viewModel::thumbnailAt,
+                    version = thumbnailVersion,
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
             }
@@ -401,6 +403,8 @@ fun PlayerScreen(
             SubtitlesSheetContent(
                 subtitles = subtitles,
                 current = currentSubtitle,
+                currentSize = captionPrefs.size,
+                onSizeChange = { viewModel.setSubtitleSize(it) },
                 onSelect = { track ->
                     viewModel.selectSubtitle(track)
                     scope.launch { subtitleSheetState.hide() }.invokeOnCompletion {
@@ -723,33 +727,44 @@ private fun bufferingStats(state: PlayerUiState.Buffering): String = buildString
 }
 
 /**
- * Floating preview shown while the user drags the seek bar: the nearest sparsely-sampled frame (when
- * that slice has been fetched + decoded) above a timecode pill. Sits just above the system controls.
- * The frame is null for parts of the timeline not yet sampled — then only the timecode shows.
+ * Film-strip preview shown while the user drags the seek bar: a row of frames around the scrub
+ * position. The centre frame (highlighted) is the target; neighbours show earlier (left) and later
+ * (right) moments [FILMSTRIP_STEP_MS] apart, so the strip appears to scroll as you drag. Slots whose
+ * slice hasn't been sampled yet show a dim placeholder, so the strip keeps its shape. Sits just above
+ * the system controls.
  */
 @Composable
-private fun ScrubPreviewBubble(
-    positionMs: Long,
-    thumbnail: android.graphics.Bitmap?,
+private fun ScrubFilmstrip(
+    centerMs: Long,
+    durationMs: Long,
+    thumbnailAt: (Long) -> android.graphics.Bitmap?,
+    version: Int,
     modifier: Modifier = Modifier,
 ) {
+    @Suppress("UNUSED_EXPRESSION") version  // touch so new frames recompose the strip
     Column(
-        modifier = modifier.padding(bottom = 92.dp),
+        modifier = modifier.padding(bottom = 86.dp, start = 12.dp, end = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        if (thumbnail != null) {
-            androidx.compose.foundation.Image(
-                bitmap = thumbnail.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier
-                    .height(108.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .border(2.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(10.dp)),
-            )
-            Spacer(Modifier.height(6.dp))
+        Row(
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            val half = FILMSTRIP_COUNT / 2
+            for (i in -half..half) {
+                val pos = (centerMs + i * FILMSTRIP_STEP_MS)
+                val center = i == 0
+                // Only render slots that map to a real point on the timeline (drop those off either end).
+                if (durationMs <= 0L || pos in 0L..durationMs) {
+                    FilmstripFrame(thumbnail = thumbnailAt(pos.coerceAtLeast(0L)), center = center)
+                } else {
+                    Spacer(Modifier.width(if (center) FILM_CENTER_W else FILM_SIDE_W))
+                }
+            }
         }
+        Spacer(Modifier.height(6.dp))
         Text(
-            text = formatTimecode(positionMs),
+            text = formatTimecode(centerMs),
             color = Color.White,
             fontWeight = FontWeight.Bold,
             fontSize = 14.sp,
@@ -758,6 +773,39 @@ private fun ScrubPreviewBubble(
                 .background(Color.Black.copy(alpha = 0.6f))
                 .padding(horizontal = 12.dp, vertical = 5.dp),
         )
+    }
+}
+
+private val FILM_CENTER_W = 150.dp
+private val FILM_SIDE_W = 104.dp
+private val FILM_CENTER_H = 86.dp
+private val FILM_SIDE_H = 60.dp
+private const val FILMSTRIP_COUNT = 5
+private const val FILMSTRIP_STEP_MS = 60_000L
+
+@Composable
+private fun FilmstripFrame(thumbnail: android.graphics.Bitmap?, center: Boolean) {
+    val w = if (center) FILM_CENTER_W else FILM_SIDE_W
+    val h = if (center) FILM_CENTER_H else FILM_SIDE_H
+    val shape = RoundedCornerShape(8.dp)
+    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.5f)
+    Box(
+        modifier = Modifier
+            .size(w, h)
+            .clip(shape)
+            .background(Color.Black.copy(alpha = 0.55f))
+            .border(if (center) 2.dp else 1.dp, borderColor, shape),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (thumbnail != null) {
+            androidx.compose.foundation.Image(
+                bitmap = thumbnail.asImageBitmap(),
+                contentDescription = null,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.fillMaxSize().clip(shape),
+                alpha = if (center) 1f else 0.7f,
+            )
+        }
     }
 }
 
@@ -895,6 +943,8 @@ private fun CastingOverlay(controlsVisible: Boolean, onPlayOnDevice: () -> Unit)
 private fun SubtitlesSheetContent(
     subtitles: List<SubtitleTrack>,
     current: SubtitleTrack?,
+    currentSize: SubtitleSize,
+    onSizeChange: (SubtitleSize) -> Unit,
     onSelect: (SubtitleTrack?) -> Unit,
     onSearch: () -> Unit,
 ) {
@@ -930,6 +980,43 @@ private fun SubtitlesSheetContent(
                 Text(text = "Search", color = Brand.OnSurface, fontSize = 13.sp)
             }
         }
+
+        // Text size — persisted system-wide (DataStore), applied live to the player.
+        Text(
+            text = "Text size",
+            color = Brand.OnSurfaceDim,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(start = 20.dp, top = 4.dp, bottom = 6.dp),
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SubtitleSize.entries.forEach { size ->
+                val selected = size == currentSize
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(50))
+                        .background(if (selected) Brand.Violet else Brand.SurfaceVariant)
+                        .clickable { onSizeChange(size) }
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = size.label,
+                        color = if (selected) Color.White else Brand.OnSurface,
+                        fontSize = 13.sp,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
 
         SubtitleRow(label = "Off", selected = current == null) { onSelect(null) }
 

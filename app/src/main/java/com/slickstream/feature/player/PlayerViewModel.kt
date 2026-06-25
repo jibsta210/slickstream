@@ -242,6 +242,12 @@ class PlayerViewModel @Inject constructor(
             CaptionPrefs(SubtitleSize.DEFAULT, SubtitleStyle.DEFAULT),
         )
 
+    /** Persist subtitle size system-wide (DataStore) straight from the player's subtitle menu;
+     *  [captionPrefs] re-emits and both players re-apply it live, and it sticks for next time. */
+    fun setSubtitleSize(size: SubtitleSize) {
+        viewModelScope.launch { settingsRepository.setSubtitleSize(size) }
+    }
+
     /** Outlives [viewModelScope] so final progress + torrent-stop survive onCleared(). */
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 

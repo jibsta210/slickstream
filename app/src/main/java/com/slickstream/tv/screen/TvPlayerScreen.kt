@@ -46,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -83,6 +84,7 @@ import androidx.tv.material3.Text
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
+import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.feature.player.PlayerUiState
 import com.slickstream.feature.player.PlayerViewModel
 import com.slickstream.feature.player.applyAppearance
@@ -344,6 +346,8 @@ fun TvPlayerScreen(
             SubtitlesPanel(
                 subtitles = subtitles,
                 current = currentSubtitle,
+                currentSize = captionPrefs.size,
+                onSizeChange = { viewModel.setSubtitleSize(it) },
                 onSelect = { track ->
                     viewModel.selectSubtitle(track)
                     subsPanelOpen = false
@@ -615,6 +619,7 @@ private fun TransportOverlay(
             ScrubBar(
                 player = player,
                 focusRequester = scrubFocus,
+                downFocus = playPauseFocus,
                 onScrubbingChange = onScrubbingChange,
                 onTogglePlayPause = onPlayPause,
                 thumbnailAt = thumbnailAt,
@@ -683,6 +688,7 @@ private fun TransportOverlay(
 private fun ScrubBar(
     player: androidx.media3.common.Player?,
     focusRequester: FocusRequester,
+    downFocus: FocusRequester,
     onScrubbingChange: (Boolean) -> Unit,
     onTogglePlayPause: () -> Unit,
     thumbnailAt: (Long) -> android.graphics.Bitmap?,
@@ -719,20 +725,27 @@ private fun ScrubBar(
 
     Column(modifier = modifier.fillMaxWidth(0.72f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (scrubbing) {
-            // Preview frame for the scrub target, when that slice has been sampled (null otherwise —
-            // we only ever sample sparsely across the buffered timeline). thumbnailVersion is read so a
-            // newly-decoded frame recomposes this.
-            val previewFrame = remember(scrubTargetMs / 5_000L, thumbnailVersion) { thumbnailAt(scrubTargetMs) }
-            previewFrame?.let { bmp ->
-                Image(
-                    bitmap = bmp.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = Modifier
-                        .align(Alignment.CenterHorizontally)
-                        .height(150.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .border(2.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(10.dp)),
-                )
+            // Film strip around the scrub target: the centre (highlighted) frame is where you'll land,
+            // neighbours show earlier (left) / later (right) moments, so it scrolls as you seek. Empty
+            // slots placeholder for slices not sampled yet. thumbnailVersion is touched so newly-decoded
+            // frames recompose the strip.
+            @Suppress("UNUSED_EXPRESSION") thumbnailVersion
+            val dur = durationMs.takeIf { it > 0 } ?: 0L
+            Row(
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val half = TV_FILMSTRIP_COUNT / 2
+                for (i in -half..half) {
+                    val pos = scrubTargetMs + i * TV_FILMSTRIP_STEP_MS
+                    val center = i == 0
+                    if (dur <= 0L || pos in 0L..dur) {
+                        TvFilmstripFrame(thumbnail = thumbnailAt(pos.coerceAtLeast(0L)), center = center)
+                    } else {
+                        Spacer(Modifier.width(if (center) 248.dp else 168.dp))
+                    }
+                }
             }
             Text(
                 text = fmtTime(scrubTargetMs),
@@ -749,6 +762,9 @@ private fun ScrubBar(
                 .clip(RoundedCornerShape(50))
                 .background(Brand.SurfaceVariant)
                 .focusRequester(focusRequester)
+                // DOWN from the scrub bar must always land on the centre Play/Pause button, not whatever
+                // happens to be geometrically nearest (it was jumping to the right-most transport button).
+                .focusProperties { down = downFocus }
                 .focusable(interactionSource = interaction)
                 .onKeyEvent { event ->
                     val p = player ?: return@onKeyEvent false
@@ -803,6 +819,35 @@ private fun fmtTime(ms: Long): String {
     val m = (s % 3600) / 60
     val sec = s % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
+}
+
+private const val TV_FILMSTRIP_COUNT = 5
+private const val TV_FILMSTRIP_STEP_MS = 60_000L
+
+@Composable
+private fun TvFilmstripFrame(thumbnail: android.graphics.Bitmap?, center: Boolean) {
+    val w = if (center) 248.dp else 168.dp
+    val h = if (center) 140.dp else 96.dp
+    val shape = RoundedCornerShape(10.dp)
+    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.5f)
+    Box(
+        modifier = Modifier
+            .size(w, h)
+            .clip(shape)
+            .background(Color.Black.copy(alpha = 0.55f))
+            .border(if (center) 3.dp else 1.dp, borderColor, shape),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (thumbnail != null) {
+            Image(
+                bitmap = thumbnail.asImageBitmap(),
+                contentDescription = null,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.fillMaxSize().clip(shape),
+                alpha = if (center) 1f else 0.7f,
+            )
+        }
+    }
 }
 
 @Composable
@@ -956,6 +1001,8 @@ private fun SourceRow(
 private fun SubtitlesPanel(
     subtitles: List<SubtitleTrack>,
     current: SubtitleTrack?,
+    currentSize: SubtitleSize,
+    onSizeChange: (SubtitleSize) -> Unit,
     onSelect: (SubtitleTrack?) -> Unit,
     onSearch: () -> Unit,
     onClose: () -> Unit,
@@ -981,6 +1028,13 @@ private fun SubtitlesPanel(
             style = MaterialTheme.typography.bodyMedium,
             color = Brand.OnSurfaceDim,
         )
+        // Text size — persisted system-wide, applied live. D-pad left/right between sizes.
+        Text("Text size", style = MaterialTheme.typography.labelLarge, color = Brand.OnSurfaceDim)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SubtitleSize.entries.forEach { size ->
+                TvSizeChip(label = size.label, selected = size == currentSize) { onSizeChange(size) }
+            }
+        }
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
@@ -1011,6 +1065,32 @@ private fun SubtitlesPanel(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun TvSizeChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(50)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (selected) Brand.Violet else Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = if (selected) Color.White else Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        )
     }
 }
 
