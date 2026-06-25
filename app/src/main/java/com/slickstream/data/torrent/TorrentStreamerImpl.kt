@@ -404,8 +404,8 @@ class TorrentStreamerImpl @Inject constructor(
         private const val MOOV_TAIL_BYTES = 8L * 1024L * 1024L
 
         /** Fixed seconds added to the byte ETA for the player's own prepare/first-frame after the
-         *  bytes are present. */
-        private const val PREPARE_MARGIN_SECONDS = 2L
+         *  bytes are present (container parse, decoder init, initial buffer fill). */
+        private const val PREPARE_MARGIN_SECONDS = 4L
 
         /** Hard cap for moov-critical mp4/m4v/mov: wait this long for the EOF moov before
          *  starting head-only (then the player's retries + source failover handle a truly-absent moov). */

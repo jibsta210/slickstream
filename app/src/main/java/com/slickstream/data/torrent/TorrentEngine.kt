@@ -501,12 +501,16 @@ class TorrentEngine @Inject constructor(
         // killer on big-piece torrents — 5 x 32 MB = 160 MB fetched in PARALLEL, so piece 0 (and thus
         // "head ready") didn't land for ~a minute even at 3 MB/s.
         val headPieces = maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
+        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen))
         val ext = active.filePath?.substringAfterLast('.', "")?.lowercase()
         val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
-        // mkv/webm have no startup tail. mp4/mov MUST have the EOF moov before the first frame, so fetch
-        // it IN PARALLEL with the head (interleaved deadlines), never behind the head band — putting it
-        // behind a big-piece head band delayed the moov by ~a minute.
-        val tailPieces = if (moovCritical) maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen)) else 0
+        // The EOF tail is ALWAYS fetched (mp4 moov AND mkv cues live there): ExoPlayer reads it to build
+        // its seek map during prepare, so if it's missing the player does a slow on-demand EOF read that
+        // can time out -> spurious failover on a perfectly healthy stream. The difference is WHEN:
+        //  - mp4/mov: moov is MANDATORY before the first frame -> fetch in parallel with the head.
+        //  - mkv/webm: cues aren't needed to START, so fetch them right AFTER the head band — the head
+        //    still fills first (fast start), the cues land before ExoPlayer's prepare needs them.
+        val tailBase = if (moovCritical) 0 else headPieces * 20 + 100
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
         // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
@@ -522,7 +526,7 @@ class TorrentEngine @Inject constructor(
                 val p = active.lastPiece - i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, i * 20)  // parallel with the head, not after it
+                    handle.setPieceDeadline(p, tailBase + i * 20)
                 }
             }
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }

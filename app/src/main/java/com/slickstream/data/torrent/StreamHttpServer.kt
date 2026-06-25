@@ -189,11 +189,15 @@ class StreamHttpServer(
         private var chunkStart = -1L
         private var chunkLen = 0
 
-        // Fail fast on low-power TV: a stalled read that would otherwise pin a NanoHTTPD worker for
-        // up to 60s (and hold the native handle) becomes a quick recoverable retry. 8s is safe —
-        // head/moov fuel arrives in <1s under the 8 MB/s cap.
-        private val readWaitMs = if (engine.isLowPower) 8_000L else READ_WAIT_TIMEOUT_MS
-        private val flushWaitMs = if (engine.isLowPower) 8_000L else FLUSH_WAIT_BUDGET_MS
+        // How long a read waits for its covering piece before giving up (ExoPlayer turns that give-up
+        // into an IO error -> our retry/failover). This MUST exceed the time for one piece to download
+        // on a healthy-but-slow link, or a fine stream gets failed over for no reason. A single 8 MB
+        // piece at ~1 MB/s is ~8s, so the old 8s cap timed out right at the edge — the "downloads at
+        // 1 MB/s but gives up and switches torrents" bug. 22s leaves comfortable margin (and ensureRange
+        // polls, so it isn't holding the native lock the whole time); a genuinely dead swarm is still
+        // caught by the buffering watchdog. ensureRange's deadline-fetch keeps the piece prioritised.
+        private val readWaitMs = if (engine.isLowPower) 22_000L else READ_WAIT_TIMEOUT_MS
+        private val flushWaitMs = if (engine.isLowPower) 15_000L else FLUSH_WAIT_BUDGET_MS
 
         private fun raf(): RandomAccessFile =
             raf ?: RandomAccessFile(file, "r").also { raf = it }
