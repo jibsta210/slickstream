@@ -551,13 +551,16 @@ private fun NavHostController.navigateToPlayer(item: MediaItem) {
 }
 
 private fun NavHostController.navigateToPlayer(history: WatchHistoryItem) {
-    // Resume a continue-watching entry at its real saved season/episode.
+    // Resume a continue-watching entry at its real saved season/episode. A FINISHED show episode
+    // advances to the NEXT one so a series continues forward instead of replaying the last episode.
+    val episode = if (history.media.mediaType == MediaType.TV && history.progress.isFinished)
+        (history.progress.episode ?: 1) + 1 else history.progress.episode
     navigate(
         Routes.player(
             history.media.mediaType,
             history.media.id,
             history.progress.season,
-            history.progress.episode,
+            episode,
         )
     )
 }

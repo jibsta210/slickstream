@@ -177,13 +177,16 @@ private fun DetailsContent(
         item("actions") {
             val isTv = item.mediaType == MediaType.TV
             val firstSeason = state.selectedSeasonNumber ?: state.seasons.firstOrNull()?.seasonNumber
+            val rt = state.resumeTarget
             Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     PlayButton(
-                        label = if (isTv) "Play S${firstSeason ?: 1}" else "Play",
+                        // Resume the in-progress episode / next after the last finished (from the VM),
+                        // not always S1E1.
+                        label = rt?.label ?: "Play",
                         onClick = {
                             if (isTv) {
-                                onPlay(item.mediaType, item.id, firstSeason ?: 1, 1)
+                                onPlay(item.mediaType, item.id, rt?.season ?: firstSeason ?: 1, rt?.episode ?: 1)
                             } else {
                                 onPlay(item.mediaType, item.id, null, null)
                             }

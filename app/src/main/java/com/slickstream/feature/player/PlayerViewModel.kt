@@ -681,22 +681,23 @@ class PlayerViewModel @Inject constructor(
             return
         }
 
-        // Start playing with a small buffer so we don't sit idle while the torrent fills ahead.
-        // On low-power TV, hard-cap the buffer to ~8 MB: the default 50s duration buffer can hold
-        // 60-95 MB of a high-bitrate stream — identical on a phone and a 1.5 GB TV — which drives the
-        // OOM/page-eviction pressure that freezes the whole device. bufferForPlaybackMs stays 1_500 so
-        // first-frame latency is unchanged.
+        // Start playing with a small buffer so we don't sit idle while the torrent fills ahead, but
+        // hold a DEEP enough steady-state buffer to ride out a high-bitrate VBR peak without stalling.
+        // The old 8 MB byte cap was only ~11 s of a ~6 Mbps 4K stream — a single dense scene drained it
+        // and rebuffered mid-stream even at 1.7 MB/s. 24 MB (~33 s of that 4K) absorbs the peaks and is
+        // still far under the 60-95 MB that caused OOM/page-eviction on a 1.5 GB box. bufferForPlaybackMs
+        // stays 1_500 so first-frame latency is unchanged.
         val lowPower = deviceProfile.isLowPower
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                if (lowPower) 8_000 else 15_000,  // minBufferMs
-                if (lowPower) 20_000 else 50_000, // maxBufferMs
-                1_500,                            // bufferForPlaybackMs — begin playback this fast
-                3_000,                            // bufferForPlaybackAfterRebufferMs
+                if (lowPower) 15_000 else 15_000,  // minBufferMs — rebuild this much before resuming
+                if (lowPower) 45_000 else 50_000,  // maxBufferMs
+                1_500,                             // bufferForPlaybackMs — begin playback this fast
+                4_000,                             // bufferForPlaybackAfterRebufferMs — bigger cushion on resume
             )
             .apply {
                 if (lowPower) {
-                    setTargetBufferBytes(8 * 1024 * 1024)
+                    setTargetBufferBytes(24 * 1024 * 1024)
                     setPrioritizeTimeOverSizeThresholds(false)
                 }
             }

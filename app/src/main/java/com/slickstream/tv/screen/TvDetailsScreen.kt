@@ -290,11 +290,13 @@ private fun HeroBlock(
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             Button(
                 onClick = {
+                    val rt = state.resumeTarget
                     if (state.isTv) {
-                        // Resume the selected season's first episode (or S1E1) for shows.
-                        val season = state.selectedSeasonNumber ?: state.seasons.firstOrNull()?.seasonNumber
-                        val episode = state.episodes.firstOrNull()?.episodeNumber ?: 1
-                        onPlay(MediaType.TV, item.id, season, episode)
+                        // Resume the in-progress episode, or the next one after the last you finished
+                        // (computed in the VM) — not always S1E1.
+                        val season = rt?.season ?: state.selectedSeasonNumber
+                            ?: state.seasons.firstOrNull()?.seasonNumber
+                        onPlay(MediaType.TV, item.id, season, rt?.episode ?: 1)
                     } else {
                         onPlay(MediaType.MOVIE, item.id, null, null)
                     }
@@ -307,7 +309,10 @@ private fun HeroBlock(
                     modifier = Modifier.size(24.dp),
                 )
                 Spacer(Modifier.width(8.dp))
-                Text(if (state.isTv) "Play S1E1" else "Play", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    text = state.resumeTarget?.label ?: "Play",
+                    style = MaterialTheme.typography.labelLarge,
+                )
             }
 
             Button(onClick = onToggleFavorite) {

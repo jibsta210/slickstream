@@ -46,10 +46,16 @@ data class DetailsUiState(
     val episodeProgress: Map<Int, Float> = emptyMap(),
     /** Whether this movie is marked watched (always false for TV titles). */
     val isMovieWatched: Boolean = false,
+    /** Where the main Play button should go: the in-progress episode (Resume), the next episode after
+     *  the last one you finished (Play SxEy), or the first episode if nothing's been watched. */
+    val resumeTarget: ResumeTarget? = null,
 ) {
     val mediaType: MediaType? get() = details?.item?.mediaType
     val isTv: Boolean get() = mediaType == MediaType.TV
 }
+
+/** The episode the Play button resumes/starts, with the label to show on it. season/episode null = movie. */
+data class ResumeTarget(val season: Int?, val episode: Int?, val label: String)
 
 @HiltViewModel
 class DetailsViewModel @Inject constructor(
@@ -96,23 +102,67 @@ class DetailsViewModel @Inject constructor(
             .launchIn(viewModelScope)
     }
 
+    /** Most-recent history row for THIS title (observeHistory is ordered newest-first). Drives the
+     *  Play button's resume/next-episode target; kept so [updateResumeTarget] can re-run once the
+     *  seasons resolve (which it needs to know a season's last episode). */
+    private var latestHistory: WatchHistoryItem? = null
+
     /** Fold the live history feed into [DetailsUiState.episodeProgress] / [DetailsUiState.isMovieWatched]
      *  for THIS title and the currently-selected season. Cheap and idempotent — only writes on change. */
     private fun applyWatchHistory(rows: List<WatchHistoryItem>) {
         val mine = rows.filter { it.media.id == mediaId && it.media.mediaType == mediaType }
+        latestHistory = mine.firstOrNull()
         if (mediaType == MediaType.MOVIE) {
             val watched = mine.any { it.progress.isFinished }
             if (watched != _uiState.value.isMovieWatched) {
                 _uiState.value = _uiState.value.copy(isMovieWatched = watched)
             }
         } else {
-            val season = _uiState.value.selectedSeasonNumber ?: return
-            val progress = mine.asSequence()
-                .filter { it.progress.season == season && it.progress.episode != null && it.progress.percent > 0f }
-                .associate { it.progress.episode!! to it.progress.percent }
-            if (progress != _uiState.value.episodeProgress) {
-                _uiState.value = _uiState.value.copy(episodeProgress = progress)
+            val season = _uiState.value.selectedSeasonNumber
+            if (season != null) {
+                val progress = mine.asSequence()
+                    .filter { it.progress.season == season && it.progress.episode != null && it.progress.percent > 0f }
+                    .associate { it.progress.episode!! to it.progress.percent }
+                if (progress != _uiState.value.episodeProgress) {
+                    _uiState.value = _uiState.value.copy(episodeProgress = progress)
+                }
             }
+        }
+        updateResumeTarget()
+    }
+
+    /** Recompute where Play should go from [latestHistory] + the resolved [seasons]. Called on every
+     *  history change AND after the seasons load (it needs episode counts to cross a season boundary). */
+    private fun updateResumeTarget() {
+        val state = _uiState.value
+        val latest = latestHistory
+        val target = if (mediaType == MediaType.MOVIE) {
+            when {
+                latest == null -> ResumeTarget(null, null, "Play")
+                latest.progress.isFinished -> ResumeTarget(null, null, "Play again")
+                else -> ResumeTarget(null, null, "Resume")
+            }
+        } else if (latest == null) {
+            val s = state.seasons.firstOrNull()?.seasonNumber ?: 1
+            ResumeTarget(s, 1, "Play S${s}E1")
+        } else {
+            val s = latest.progress.season ?: 1
+            val e = latest.progress.episode ?: 1
+            if (!latest.progress.isFinished) {
+                ResumeTarget(s, e, "Resume S${s}E$e")
+            } else {
+                // Finished -> next episode (cross the season boundary when the seasons are known).
+                val epCount = state.seasons.firstOrNull { it.seasonNumber == s }?.episodeCount ?: Int.MAX_VALUE
+                when {
+                    e < epCount -> ResumeTarget(s, e + 1, "Play S${s}E${e + 1}")
+                    else -> state.seasons.firstOrNull { it.seasonNumber > s }
+                        ?.let { ResumeTarget(it.seasonNumber, 1, "Play S${it.seasonNumber}E1") }
+                        ?: ResumeTarget(s, e, "Replay S${s}E$e")  // whole series watched
+                }
+            }
+        }
+        if (target != state.resumeTarget) {
+            _uiState.value = _uiState.value.copy(resumeTarget = target)
         }
     }
 
@@ -140,6 +190,8 @@ class DetailsViewModel @Inject constructor(
                         details = details,
                         seasons = playableSeasons,
                     )
+                    // Now that seasons (with episode counts) are known, derive where Play should go.
+                    updateResumeTarget()
                     // Default-select the first season for TV shows and eagerly load it.
                     if (details.item.mediaType == MediaType.TV) {
                         playableSeasons.firstOrNull()?.let { selectSeason(it.seasonNumber) }

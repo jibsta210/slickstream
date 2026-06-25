@@ -926,8 +926,10 @@ class TorrentEngine @Inject constructor(
          *  desktop client's throughput), at the cost of more buffered-ahead RAM. Capable devices only. */
         const val READAHEAD_BYTES = 32 * 1024 * 1024
 
-        /** Smaller look-ahead on Android TV / low-RAM devices to ease CPU/memory pressure. */
-        const val LOW_POWER_READAHEAD_BYTES = 6 * 1024 * 1024
+        /** Look-ahead on Android TV / low-RAM devices. Must be deep enough to keep the player's
+         *  steady-state buffer (now ~24 MB) prioritised AHEAD of the read head, or the read outruns the
+         *  prioritised window into un-deadlined pieces and rebuffers mid-stream on 4K VBR peaks. */
+        const val LOW_POWER_READAHEAD_BYTES = 24 * 1024 * 1024
 
         /** High-uptime public trackers appended to every magnet so cold pickup finds peers fast
          *  instead of waiting on DHT. Curated from the well-known best-uptime lists (udp-first). */

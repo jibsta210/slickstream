@@ -135,9 +135,13 @@ fun TvApp() {
                                 onMediaClick = ::openDetails,
                                 onPlayClick = { item -> openPlayer(item.mediaType, item.id) },
                                 // Resume carries the saved season/episode so TV shows find episode
-                                // sources (plain onPlayClick would play the show with no episode).
+                                // sources (plain onPlayClick would play the show with no episode). A
+                                // FINISHED show episode resumes the NEXT one, so a series you're working
+                                // through continues forward instead of replaying what you just watched.
                                 onResume = { h ->
-                                    openPlayer(h.media.mediaType, h.media.id, h.progress.season, h.progress.episode)
+                                    val ep = if (h.media.mediaType == MediaType.TV && h.progress.isFinished)
+                                        (h.progress.episode ?: 1) + 1 else h.progress.episode
+                                    openPlayer(h.media.mediaType, h.media.id, h.progress.season, ep)
                                 },
                             )
                         }

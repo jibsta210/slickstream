@@ -58,16 +58,17 @@ class HomeViewModel @Inject constructor(
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
 
     /**
-     * Live "Continue Watching" feed from the local library. The store now keeps a row per episode
-     * (incl. finished ones marked watched), so here we (a) drop finished rows so a watched item
-     * leaves the rail, and (b) collapse to the single most-recent in-progress row per title. The
-     * underlying flow is already ordered most-recent-first.
+     * Live "Continue Watching" feed from the local library — the user's full watch history, scrollable,
+     * not just the few in-progress items. We collapse to the single most-recent row per title (the
+     * underlying flow is ordered most-recent-first) but no longer drop a title once an episode is
+     * finished: a SHOW you're working through must STAY on the rail pointing at the next episode (it
+     * used to vanish the moment you finished one). A finished MOVIE is genuinely done, so it leaves.
      */
     private val history: StateFlow<List<WatchHistoryItem>> =
         libraryRepository.observeHistory()
             .map { rows ->
                 rows.asSequence()
-                    .filterNot { it.progress.isFinished }
+                    .filterNot { it.progress.isFinished && it.media.mediaType == MediaType.MOVIE }
                     .distinctBy { it.media.id to it.media.mediaType }
                     .toList()
             }
