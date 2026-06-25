@@ -173,12 +173,16 @@ class TorrentEngine @Inject constructor(
                 settings_pack.int_types.suggest_mode.swigValue(),
                 settings_pack.suggest_mode_t.suggest_read_cache.swigValue(),
             )
-            setInteger(settings_pack.int_types.whole_pieces_threshold.swigValue(), 60)
-            // Deeper outstanding-request pipeline on capable devices: with SEQUENTIAL_DOWNLOAD the
-            // throughput ceiling is how many block requests we keep in flight to the swarm at once, so
-            // a desktop client (rarest-first, huge queues) pulls ahead. 2500 keeps far more blocks
-            // requested concurrently across peers without the per-peer flooding that freezes weak SoCs.
-            setInteger(settings_pack.int_types.max_out_request_queue.swigValue(), if (lowPower) 500 else 2500)
+            // Lower so peers aren't encouraged to grab whole LATER pieces they happen to hold instead
+            // of converging on the deadlined head band (part of the block-scatter fix).
+            setInteger(settings_pack.int_types.whole_pieces_threshold.swigValue(), 20)
+            // Bounded outstanding-request pipeline. A very deep queue (the old 2500) under a cold head
+            // fills with SCATTERED blocks from peers that lack the head before the deadline reorder can
+            // land — the prime cause of "downloads fast but the contiguous head stays 0". 800 (~12 MB in
+            // flight at 16 KB blocks) still saturates any single video bitrate while letting the
+            // deadlined head band dominate new requests. Tunable: raise toward 1500 if pickup throughput
+            // regresses on fast links. Low-power TV stays 500.
+            setInteger(settings_pack.int_types.max_out_request_queue.swigValue(), if (lowPower) 500 else 800)
             setInteger(settings_pack.int_types.peer_connect_timeout.swigValue(), 8)
             setInteger(settings_pack.int_types.request_timeout.swigValue(), 20)
             setInteger(settings_pack.int_types.predictive_piece_announce.swigValue(), 3)
@@ -448,33 +452,33 @@ class TorrentEngine @Inject constructor(
                 "pieces=${active.firstPiece}..${active.lastPiece} path=${active.filePath}",
         )
 
-        // De-prioritize everything else so bandwidth concentrates on the chosen file.
+        // De-prioritize everything else so bandwidth concentrates on the chosen file; the head/tail
+        // ordering is driven by the staggered deadlines in prioritizeHeadAndTail.
+        // NOTE: never call prioritizeFiles() AFTER prioritizeHeadAndTail — file priorities reset every
+        // piece priority and would wipe the head/tail deadlines.
         val priorities = Array(numFiles) { Priority.IGNORE }
         priorities[chosen] = Priority.DEFAULT
         handle.prioritizeFiles(priorities)
     }
 
     private fun applySequentialAndPriority(handle: TorrentHandle, active: ActiveTorrent) {
-        // Force an actively-downloading state. The metadata-fetch phase can leave the torrent
-        // upload-only / paused / auto-managed (which downloads nothing); clear those and take
-        // manual control.
+        // Force an actively-downloading, RUNNING state and take manual control, THEN prime the
+        // deadlines. resume() runs BEFORE prioritizeHeadAndTail: set_piece_deadline only enters the
+        // time-critical list on a RUNNING torrent, so deadlines applied while still PAUSED (the
+        // Details-prewarm pause/resume path) silently didn't stick. SEQUENTIAL_DOWNLOAD stays on — it
+        // gives the in-order steady-state buffer-ahead playback relies on; the staggered head/tail
+        // deadlines (prioritizeHeadAndTail) ride ON TOP to pull the first pieces + the moov/cues to the
+        // front of that order.
         runCatching {
             handle.unsetFlags(
                 TorrentFlags.UPLOAD_MODE
                     .or_(TorrentFlags.PAUSED)
                     .or_(TorrentFlags.AUTO_MANAGED),
             )
-            // Strict in-order download. Without this, a fast swarm fills pieces out of order:
-            // you get 9 MB/s of *body* the player can't use yet while the contiguous head — the
-            // only thing the readiness gate counts — dribbles in (the "9 MB/s but still buffering
-            // for 45 s" bug). Sequential makes the head fill at the FULL swarm rate. The tail/moov
-            // pieces carry explicit deadlines in prioritizeHeadAndTail(); set_piece_deadline marks
-            // them "time critical" and libtorrent fetches those AHEAD of the sequential cursor, so
-            // the moov still arrives early and the moov gate never deadlocks.
             handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+            handle.resume()
         }.onFailure { Log.w(TAG, "set streaming flags failed", it) }
         prioritizeHeadAndTail(active)
-        runCatching { handle.resume() }
     }
 
     /**
@@ -500,33 +504,44 @@ class TorrentEngine @Inject constructor(
         // torrent has big pieces (8-32 MB), a few when pieces are small. A fixed 5-piece band was the
         // killer on big-piece torrents — 5 x 32 MB = 160 MB fetched in PARALLEL, so piece 0 (and thus
         // "head ready") didn't land for ~a minute even at 3 MB/s.
-        val headPieces = maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
+        // A multi-piece ORDERED head band — NOT a byte budget that collapses to 1 piece on big-piece
+        // torrents. With 8 MB pieces, ceilDiv(6MB,8MB)=1, so only piece 0 was ever time-critical and the
+        // rest of the request queue scattered. Deadlining the first HEAD_PRIORITY_PIECES with STRICTLY
+        // STAGGERED deadlines (0, 20, 40… ms) keeps the head pipeline continuously fed and forces them
+        // to complete IN ORDER (0→1→2→3) rather than in parallel — so the contiguous head actually
+        // fills. Capped small so a big-piece torrent doesn't deadline a huge band.
+        val headPieces = maxOf(HEAD_PRIORITY_PIECES, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
         val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen))
         val ext = active.filePath?.substringAfterLast('.', "")?.lowercase()
         val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
-        // The EOF tail is ALWAYS fetched (mp4 moov AND mkv cues live there): ExoPlayer reads it to build
-        // its seek map during prepare, so if it's missing the player does a slow on-demand EOF read that
-        // can time out -> spurious failover on a perfectly healthy stream. The difference is WHEN:
-        //  - mp4/mov: moov is MANDATORY before the first frame -> fetch in parallel with the head.
-        //  - mkv/webm: cues aren't needed to START, so fetch them right AFTER the head band — the head
-        //    still fills first (fast start), the cues land before ExoPlayer's prepare needs them.
-        val tailBase = if (moovCritical) 0 else headPieces * 20 + 100
+        // The EOF tail holds the mp4 moov AND the mkv cues (ExoPlayer reads it during prepare):
+        //  - mp4/mov: moov is MANDATORY before the first frame -> fetch in parallel with the head (0ms).
+        //  - mkv/webm: cues aren't needed to START, so give them a far deadline — they must NOT compete
+        //    with a cold head for the few head-bearing peers; they fill once the head is in.
+        val tailBase = if (moovCritical) 0 else MKV_TAIL_DEFER_MS
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
         // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
         synchronized(nativeLock) { runCatching {
+            // Clear any residue (e.g. from a prewarm prime) so a re-attach doesn't layer a new band over
+            // a stale one. Then raise + deadline the fresh head/tail bands. The deadline STEP must be
+            // LARGE (not ~20 ms): libtorrent works all time-critical pieces toward their deadlines in
+            // parallel, so near-equal deadlines let pieces complete in peer-speed order (observed: piece
+            // 2 landing before piece 0). A big per-piece step makes piece 0 FAR more overdue than 1,2,3,
+            // so the swarm converges on it first, then 1, then 2 — strict in-order head fill.
+            handle.clearPieceDeadlines()
             for (i in 0 until headPieces) {
                 val p = active.firstPiece + i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, i * 20)
+                    handle.setPieceDeadline(p, i * HEAD_DEADLINE_STEP_MS)
                 }
             }
             for (i in 0 until tailPieces) {
                 val p = active.lastPiece - i
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, tailBase + i * 20)
+                    handle.setPieceDeadline(p, tailBase + i * HEAD_DEADLINE_STEP_MS)
                 }
             }
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
@@ -884,6 +899,20 @@ class TorrentEngine @Inject constructor(
          * 8 MB comfortably spans a feature-length moov so the whole atom is deadline-fetched up front. */
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
         const val TAIL_PRIORITY_BYTES = 8 * 1024 * 1024
+
+        /** Minimum number of head pieces to deadline IN ORDER, regardless of piece size. On big-piece
+         *  torrents a byte budget collapses to 1 piece, leaving only piece 0 time-critical while the
+         *  request queue scatters; a small staggered-deadline band keeps the head pipeline fed. */
+        const val HEAD_PRIORITY_PIECES = 4
+
+        /** mkv/webm cues are seek-only — deadline them far out so they never preempt a cold head. */
+        const val MKV_TAIL_DEFER_MS = 30_000
+
+        /** Per-piece deadline STEP for the head band. Must be large: libtorrent works all time-critical
+         *  pieces toward their deadlines concurrently, so near-equal deadlines (~20 ms) complete in
+         *  peer-speed order. A multi-second step keeps only the earliest head piece "overdue" so the
+         *  swarm converges on it first, then the next — a strict in-order contiguous head fill. */
+        const val HEAD_DEADLINE_STEP_MS = 3_000
 
         /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
          *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
