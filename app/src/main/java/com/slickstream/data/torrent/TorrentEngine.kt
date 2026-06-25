@@ -107,7 +107,7 @@ class TorrentEngine @Inject constructor(
         val sp = SettingsPack().apply {
             // --- Peer load (the freeze comes from too many sockets + per-peer crypto on a weak SoC) ---
             // 20 peers still saturates any single video bitrate; 400 stays for capable devices.
-            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 20 else 400)
+            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 20 else 800)
             setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 4 else 8)
             setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 4 else 8)
             setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 8 else 16)
@@ -172,7 +172,11 @@ class TorrentEngine @Inject constructor(
                 settings_pack.suggest_mode_t.suggest_read_cache.swigValue(),
             )
             setInteger(settings_pack.int_types.whole_pieces_threshold.swigValue(), 60)
-            setInteger(settings_pack.int_types.max_out_request_queue.swigValue(), if (lowPower) 500 else 1500)
+            // Deeper outstanding-request pipeline on capable devices: with SEQUENTIAL_DOWNLOAD the
+            // throughput ceiling is how many block requests we keep in flight to the swarm at once, so
+            // a desktop client (rarest-first, huge queues) pulls ahead. 2500 keeps far more blocks
+            // requested concurrently across peers without the per-peer flooding that freezes weak SoCs.
+            setInteger(settings_pack.int_types.max_out_request_queue.swigValue(), if (lowPower) 500 else 2500)
             setInteger(settings_pack.int_types.peer_connect_timeout.swigValue(), 8)
             setInteger(settings_pack.int_types.request_timeout.swigValue(), 20)
             setInteger(settings_pack.int_types.predictive_piece_announce.swigValue(), 3)
@@ -828,8 +832,10 @@ class TorrentEngine @Inject constructor(
         /** Seed/upload cap (bytes/s) — keep a streaming client from saturating the home upstream. */
         const val UPLOAD_RATE_LIMIT = 100 * 1024
 
-        /** ~16 MB sliding look-ahead band kept hot ahead of the player's read position. */
-        const val READAHEAD_BYTES = 16 * 1024 * 1024
+        /** Sliding look-ahead band kept hot ahead of the player's read position. Bigger = more pieces
+         *  in flight concurrently = better swarm utilisation under SEQUENTIAL_DOWNLOAD (closer to a
+         *  desktop client's throughput), at the cost of more buffered-ahead RAM. Capable devices only. */
+        const val READAHEAD_BYTES = 32 * 1024 * 1024
 
         /** Smaller look-ahead on Android TV / low-RAM devices to ease CPU/memory pressure. */
         const val LOW_POWER_READAHEAD_BYTES = 6 * 1024 * 1024

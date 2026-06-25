@@ -56,6 +56,40 @@ interface LibraryRepository {
 
     /** Clear the watched/in-progress row for a movie or a specific episode. */
     suspend fun markUnwatched(item: MediaItem, season: Int?, episode: Int?)
+
+    // --- Cross-profile sync surface ---------------------------------------------------------------
+    // These operate on an EXPLICIT profileId (never the active profile) so cloud sync can push and
+    // merge every profile's library, keyed by its origin profile. The UI never touches these.
+
+    /** Every favourite across ALL profiles, paired with its origin profileId. */
+    suspend fun allFavoritesForSync(): List<Pair<String, FavoriteItem>>
+
+    /** Live cross-profile favourites feed (origin profileId + item) — drives the delta push. */
+    fun observeAllFavoritesForSync(): Flow<List<Pair<String, FavoriteItem>>>
+
+    /** Is [id]/[type] already favourited under [profileId] specifically? */
+    suspend fun isFavoriteInProfile(profileId: String, id: Int, type: MediaType): Boolean
+
+    /** UPSERT (never toggle) [item] as a favourite under [profileId] — used by the sync listener. */
+    suspend fun addFavoriteForProfile(profileId: String, item: MediaItem)
+
+    /** Every history row across ALL profiles, as (origin profileId, media, progress). */
+    suspend fun allHistoryForSync(): List<Triple<String, MediaItem, PlaybackProgress>>
+
+    /** Live cross-profile history feed (origin profileId, media, progress) — drives the delta push. */
+    fun observeAllHistoryForSync(): Flow<List<Triple<String, MediaItem, PlaybackProgress>>>
+
+    /** The resume point for [id]/[type]/[season]/[episode] under [profileId] specifically. */
+    suspend fun getProgressForProfile(
+        profileId: String,
+        id: Int,
+        type: MediaType,
+        season: Int?,
+        episode: Int?,
+    ): PlaybackProgress?
+
+    /** UPSERT [progress] for [item] under [profileId] specifically — used by the initial sync merge. */
+    suspend fun saveProgressForProfile(profileId: String, item: MediaItem, progress: PlaybackProgress)
 }
 
 /**
@@ -77,6 +111,12 @@ interface ProfileRepository {
     suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int): Profile
     suspend fun updateProfile(profile: Profile)
     suspend fun deleteProfile(profileId: String)
+
+    /** One-shot snapshot of every profile — used by cloud sync to push the full set. */
+    suspend fun allProfiles(): List<Profile>
+
+    /** UPSERT a profile arriving from another device WITHOUT changing the active profile. */
+    suspend fun upsertFromSync(profile: Profile)
 }
 
 /**

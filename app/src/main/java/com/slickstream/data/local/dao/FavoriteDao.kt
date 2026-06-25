@@ -16,6 +16,14 @@ interface FavoriteDao {
     @Query("SELECT * FROM favorites WHERE profileId = :profileId ORDER BY addedAt DESC")
     fun observeAll(profileId: String): Flow<List<FavoriteEntity>>
 
+    /** Every favourite across ALL profiles — used by cloud sync (each row carries its profileId). */
+    @Query("SELECT * FROM favorites ORDER BY addedAt DESC")
+    fun observeAllAcrossProfiles(): Flow<List<FavoriteEntity>>
+
+    /** One-shot snapshot of every favourite across ALL profiles — used by the initial sync merge. */
+    @Query("SELECT * FROM favorites ORDER BY addedAt DESC")
+    suspend fun getAllAcrossProfiles(): List<FavoriteEntity>
+
     @Query(
         "SELECT EXISTS(SELECT 1 FROM favorites " +
             "WHERE id = :id AND mediaType = :type AND profileId = :profileId)",

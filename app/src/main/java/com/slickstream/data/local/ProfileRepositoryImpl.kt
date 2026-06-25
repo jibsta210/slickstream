@@ -102,6 +102,15 @@ class ProfileRepositoryImpl @Inject constructor(
         }
     }
 
+    override suspend fun allProfiles(): List<Profile> =
+        dao.getAll().map(ProfileEntity::toProfile)
+
+    override suspend fun upsertFromSync(profile: Profile) {
+        // Upsert the row only — the active profile id (in DataStore) is left untouched, so a profile
+        // pulled from another device never hijacks which profile this device is currently using.
+        dao.upsert(ProfileEntity.from(profile))
+    }
+
     private companion object {
         val KEY_ACTIVE_PROFILE = stringPreferencesKey("active_profile_id")
     }

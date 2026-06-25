@@ -2,39 +2,47 @@ package com.slickstream.data.sync
 
 import android.util.Log
 import com.google.firebase.firestore.ListenerRegistration
-import com.slickstream.core.model.MediaType
 import com.slickstream.core.repository.LibraryRepository
+import com.slickstream.core.repository.ProfileRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Keeps the local [LibraryRepository] and the cloud [FirebaseSync] mirror in step while signed in.
+ * Keeps the local library/profiles and the cloud [FirebaseSync] mirror in step while signed in.
  *
- * On sign-in: pull remote → merge into local (favourites are additive; history takes the newer
- * timestamp), then push the local union up. Ongoing: local favourite add/remove is pushed as a
- * delta, history is pushed (debounced, since progress ticks every ~10s), and a live listener brings
- * favourites added on other devices down. Loop-free: the listener only adds-if-missing and pushes
- * only diff against the last known set, so steady state performs no writes.
+ * Everything is scoped BY PROFILE so a favourite added on the TV under profile X is re-attached to
+ * profile X on the phone (not the phone's active profile). On sign-in:
+ *   1. pull remote profiles → upsert each (without changing the active profile)
+ *   2. push every local profile up
+ *   3. listen for profiles created/edited on other devices → upsert each
+ *   4. initial merge: pull favourites/history (each carrying its origin profileId), add/merge the
+ *      missing/newer ones, then push the local union back up
+ *   5. ongoing favourite push: a delta against the last known per-profile key set
+ *   6. favourite listener: add-if-missing into the item's ORIGIN profile
+ *   7. ongoing history push: debounced, keyed by origin profile
  *
- * Removals do not propagate across devices in this version (union semantics) — see README.
+ * Loop-free: listeners only add-if-missing, and pushes only diff against the last known set, so
+ * steady state performs no writes. Removals do NOT propagate across devices (union semantics) — see
+ * README — so the favourite push never sends deletes.
  */
 @Singleton
 class LibrarySyncCoordinator @Inject constructor(
     private val library: LibraryRepository,
+    private val profiles: ProfileRepository,
     private val sync: FirebaseSync,
 ) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val jobs = mutableListOf<Job>()
     private var favListener: ListenerRegistration? = null
+    private var profileListener: ListenerRegistration? = null
     private var lastFavKeys: Set<String> = emptySet()
     @Volatile private var running = false
 
@@ -43,12 +51,15 @@ class LibrarySyncCoordinator @Inject constructor(
         if (running || !sync.isAvailable || sync.uid() == null) return
         running = true
         jobs += scope.launch {
+            runCatching { syncProfiles() }.onFailure { Log.w(TAG, "profile sync failed", it) }
             runCatching { initialMerge() }.onFailure { Log.w(TAG, "initial sync failed", it) }
             startFavoritePush()
             startHistoryPush()
-            favListener = sync.listenFavorites { item ->
+            favListener = sync.listenFavorites { pid, item ->
                 scope.launch {
-                    if (!library.isFavorite(item.id, item.mediaType)) library.toggleFavorite(item)
+                    if (!library.isFavoriteInProfile(pid, item.id, item.mediaType)) {
+                        library.addFavoriteForProfile(pid, item)
+                    }
                 }
             }
         }
@@ -59,31 +70,45 @@ class LibrarySyncCoordinator @Inject constructor(
         sync.signOut()
     }
 
+    /** Profiles: pull remote → upsert each; push the local set up; then listen for live changes. */
+    private suspend fun syncProfiles() {
+        sync.pullProfiles().forEach { profiles.upsertFromSync(it) }
+        profiles.allProfiles().forEach { sync.pushProfileNow(it) }
+        profileListener = sync.listenProfiles { p ->
+            scope.launch { profiles.upsertFromSync(p) }
+        }
+    }
+
     private suspend fun initialMerge() {
-        // Remote → local (favourites: add missing; history: take the newer).
-        sync.pullFavorites().forEach { item ->
-            if (!library.isFavorite(item.id, item.mediaType)) library.toggleFavorite(item)
+        // Remote → local, each item re-attached to its origin profile.
+        // Favourites: add-if-missing in that profile.
+        sync.pullFavorites().forEach { (pid, item) ->
+            if (!library.isFavoriteInProfile(pid, item.id, item.mediaType)) {
+                library.addFavoriteForProfile(pid, item)
+            }
         }
-        sync.pullHistory().forEach { (item, remote) ->
-            val local = library.getProgress(remote.mediaId, remote.mediaType, remote.season, remote.episode)
-            if (local == null || remote.updatedAt > local.updatedAt) library.saveProgress(item, remote)
+        // History: take the newer (per origin profile).
+        sync.pullHistory().forEach { (pid, item, remote) ->
+            val local = library.getProgressForProfile(pid, remote.mediaId, remote.mediaType, remote.season, remote.episode)
+            if (local == null || remote.updatedAt > local.updatedAt) {
+                library.saveProgressForProfile(pid, item, remote)
+            }
         }
-        // Local → remote (push the union).
-        val favs = library.observeFavorites().first()
-        favs.forEach { sync.pushFavorite(it.media) }
-        lastFavKeys = favs.map { key(it.media.id, it.media.mediaType) }.toSet()
-        library.observeHistory().first().forEach { sync.pushHistory(it.media, it.progress) }
+        // Local → remote: push the union of every profile's library.
+        val favs = library.allFavoritesForSync()
+        favs.forEach { (pid, fav) -> sync.pushFavorite(pid, fav.media) }
+        lastFavKeys = favs.map { (pid, fav) -> favKey(pid, fav.media.id, fav.media.mediaType) }.toSet()
+        library.allHistoryForSync().forEach { (pid, item, progress) -> sync.pushHistory(pid, item, progress) }
     }
 
     private fun startFavoritePush() {
         jobs += scope.launch {
-            library.observeFavorites().collectLatest { favs ->
-                val keys = favs.map { key(it.media.id, it.media.mediaType) }.toSet()
-                favs.filter { key(it.media.id, it.media.mediaType) !in lastFavKeys }
-                    .forEach { sync.pushFavorite(it.media) }
-                (lastFavKeys - keys).forEach { k ->
-                    parseKey(k)?.let { (id, type) -> sync.removeFavorite(id, type) }
-                }
+            // Cross-profile feed: push only keys not seen before (delta). Removals are union-only and
+            // are NOT propagated, so we never send deletes here.
+            library.observeAllFavoritesForSync().collectLatest { favs ->
+                val keys = favs.map { (pid, fav) -> favKey(pid, fav.media.id, fav.media.mediaType) }.toSet()
+                favs.filter { (pid, fav) -> favKey(pid, fav.media.id, fav.media.mediaType) !in lastFavKeys }
+                    .forEach { (pid, fav) -> sync.pushFavorite(pid, fav.media) }
                 lastFavKeys = keys
             }
         }
@@ -92,8 +117,8 @@ class LibrarySyncCoordinator @Inject constructor(
     private fun startHistoryPush() {
         jobs += scope.launch {
             // Progress saves tick frequently; debounce so we don't hammer Firestore.
-            library.observeHistory().debounce(HISTORY_DEBOUNCE_MS).collectLatest { history ->
-                history.forEach { sync.pushHistory(it.media, it.progress) }
+            library.observeAllHistoryForSync().debounce(HISTORY_DEBOUNCE_MS).collectLatest { history ->
+                history.forEach { (pid, item, progress) -> sync.pushHistory(pid, item, progress) }
             }
         }
     }
@@ -102,20 +127,15 @@ class LibrarySyncCoordinator @Inject constructor(
         running = false
         favListener?.remove()
         favListener = null
+        profileListener?.remove()
+        profileListener = null
         jobs.forEach { it.cancel() }
         jobs.clear()
         lastFavKeys = emptySet()
     }
 
-    private fun key(id: Int, type: MediaType) = "${type.name}_$id"
-
-    private fun parseKey(k: String): Pair<Int, MediaType>? {
-        val sep = k.lastIndexOf('_')
-        if (sep <= 0) return null
-        val type = runCatching { MediaType.valueOf(k.substring(0, sep)) }.getOrNull() ?: return null
-        val id = k.substring(sep + 1).toIntOrNull() ?: return null
-        return id to type
-    }
+    private fun favKey(profileId: String, id: Int, type: com.slickstream.core.model.MediaType) =
+        "${profileId}__${type.name}_$id"
 
     private companion object {
         const val TAG = "LibrarySync"

@@ -10,6 +10,7 @@ import com.google.firebase.firestore.ListenerRegistration
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.PlaybackProgress
+import com.slickstream.core.model.Profile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.tasks.await
 import javax.inject.Inject
@@ -21,7 +22,12 @@ import javax.inject.Singleton
  * Firebase isn't configured (no google-services.json) or the user is signed out, every call is a
  * safe no-op and the app stays local-only.
  *
- * Layout:  users/{uid}/favorites/{TYPE_id}   and   users/{uid}/history/{TYPE_id_season_episode}
+ * Layout:  users/{uid}/profiles/{profileId}
+ *          users/{uid}/favorites/{profileId__TYPE_id}
+ *          users/{uid}/history/{profileId__TYPE_mediaId_season_episode}
+ *
+ * Every favourite/history doc carries a "profileId" field so a device pulling them can re-attach
+ * each item to its ORIGIN profile (never the receiving device's active profile).
  */
 @Singleton
 class FirebaseSync @Inject constructor(
@@ -107,60 +113,132 @@ class FirebaseSync @Inject constructor(
         runCatching { db?.collection(PAIRING)?.document(code)?.delete()?.await() }
     }
 
-    // --- Favourites ---------------------------------------------------------
+    // --- Profiles -----------------------------------------------------------
 
-    suspend fun pushFavorite(item: MediaItem) {
-        val col = favCol() ?: return
-        runCatching { col.document(favKey(item.id, item.mediaType)).set(item.toMap()).await() }
+    fun pushProfile(p: Profile) {
+        val col = profileCol() ?: return
+        runCatching { col.document(p.id).set(p.toMap()) }
     }
 
-    suspend fun removeFavorite(id: Int, type: MediaType) {
-        val col = favCol() ?: return
-        runCatching { col.document(favKey(id, type)).delete().await() }
+    suspend fun pushProfileNow(p: Profile) {
+        val col = profileCol() ?: return
+        runCatching { col.document(p.id).set(p.toMap()).await() }
     }
 
-    suspend fun pullFavorites(): List<MediaItem> {
-        val col = favCol() ?: return emptyList()
+    fun removeProfile(id: String) {
+        val col = profileCol() ?: return
+        runCatching { col.document(id).delete() }
+    }
+
+    suspend fun pullProfiles(): List<Profile> {
+        val col = profileCol() ?: return emptyList()
         return runCatching {
-            col.get().await().documents.mapNotNull { it.data?.toMediaItem() }
+            col.get().await().documents.mapNotNull { it.data?.toProfile() }
         }.getOrDefault(emptyList())
     }
 
-    /** Live listener that surfaces favourites added on other devices (additive — never removes). */
-    fun listenFavorites(onItem: (MediaItem) -> Unit): ListenerRegistration? {
+    /** Live listener that surfaces profiles created/edited on other devices. */
+    fun listenProfiles(onItem: (Profile) -> Unit): ListenerRegistration? {
+        val col = profileCol() ?: return null
+        return col.addSnapshotListener { snap, _ ->
+            snap?.documents?.forEach { d -> d.data?.toProfile()?.let(onItem) }
+        }
+    }
+
+    // --- Favourites ---------------------------------------------------------
+
+    suspend fun pushFavorite(profileId: String, item: MediaItem) {
+        val col = favCol() ?: return
+        runCatching {
+            col.document(favKey(profileId, item.mediaType, item.id))
+                .set(item.toMap() + ("profileId" to profileId))
+                .await()
+        }
+    }
+
+    suspend fun removeFavorite(profileId: String, id: Int, type: MediaType) {
+        val col = favCol() ?: return
+        runCatching { col.document(favKey(profileId, type, id)).delete().await() }
+    }
+
+    /** Pulls (profileId, item) pairs so each favourite re-attaches to its origin profile. */
+    suspend fun pullFavorites(): List<Pair<String, MediaItem>> {
+        val col = favCol() ?: return emptyList()
+        return runCatching {
+            col.get().await().documents.mapNotNull { d ->
+                val data = d.data ?: return@mapNotNull null
+                val pid = data["profileId"] as? String ?: return@mapNotNull null
+                val media = data.toMediaItem() ?: return@mapNotNull null
+                pid to media
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Live listener: favourites added on other devices, with their origin profileId (additive). */
+    fun listenFavorites(onItem: (String, MediaItem) -> Unit): ListenerRegistration? {
         val col = favCol() ?: return null
         return col.addSnapshotListener { snap, _ ->
-            snap?.documents?.forEach { d -> d.data?.toMediaItem()?.let(onItem) }
+            snap?.documents?.forEach { d ->
+                val data = d.data ?: return@forEach
+                val pid = data["profileId"] as? String ?: return@forEach
+                data.toMediaItem()?.let { onItem(pid, it) }
+            }
         }
     }
 
     // --- History ------------------------------------------------------------
 
-    suspend fun pushHistory(item: MediaItem, progress: PlaybackProgress) {
+    suspend fun pushHistory(profileId: String, item: MediaItem, progress: PlaybackProgress) {
         val col = histCol() ?: return
-        runCatching { col.document(histKey(progress)).set(item.toMap() + progress.toMap()).await() }
+        runCatching {
+            col.document(histKey(profileId, progress))
+                .set(item.toMap() + progress.toMap() + ("profileId" to profileId))
+                .await()
+        }
     }
 
-    suspend fun pullHistory(): List<Pair<MediaItem, PlaybackProgress>> {
+    /** Pulls (profileId, item, progress) triples so each row re-attaches to its origin profile. */
+    suspend fun pullHistory(): List<Triple<String, MediaItem, PlaybackProgress>> {
         val col = histCol() ?: return emptyList()
         return runCatching {
             col.get().await().documents.mapNotNull { d ->
                 val data = d.data ?: return@mapNotNull null
+                val pid = data["profileId"] as? String ?: return@mapNotNull null
                 val media = data.toMediaItem() ?: return@mapNotNull null
                 val progress = data.toPlaybackProgress() ?: return@mapNotNull null
-                media to progress
+                Triple(pid, media, progress)
             }
         }.getOrDefault(emptyList())
     }
 
     // --- helpers ------------------------------------------------------------
 
+    private fun profileCol() = uid()?.let { db?.collection("users")?.document(it)?.collection("profiles") }
     private fun favCol() = uid()?.let { db?.collection("users")?.document(it)?.collection("favorites") }
     private fun histCol() = uid()?.let { db?.collection("users")?.document(it)?.collection("history") }
 
-    private fun favKey(id: Int, type: MediaType) = "${type.name}_$id"
-    private fun histKey(p: PlaybackProgress) =
-        "${p.mediaType.name}_${p.mediaId}_${p.season ?: -1}_${p.episode ?: -1}"
+    private fun favKey(profileId: String, type: MediaType, id: Int) = "${profileId}__${type.name}_$id"
+    private fun histKey(profileId: String, p: PlaybackProgress) =
+        "${profileId}__${p.mediaType.name}_${p.mediaId}_${p.season ?: -1}_${p.episode ?: -1}"
+
+    private fun Profile.toMap(): Map<String, Any?> = mapOf(
+        "id" to id,
+        "name" to name,
+        "isKids" to isKids,
+        "colorIndex" to colorIndex,
+        "createdAt" to createdAt,
+    )
+
+    private fun Map<String, Any?>.toProfile(): Profile? {
+        val id = this["id"] as? String ?: return null
+        return Profile(
+            id = id,
+            name = this["name"] as? String ?: "",
+            isKids = this["isKids"] as? Boolean ?: false,
+            colorIndex = (this["colorIndex"] as? Number)?.toInt() ?: 0,
+            createdAt = (this["createdAt"] as? Number)?.toLong() ?: 0L,
+        )
+    }
 
     private fun MediaItem.toMap(): Map<String, Any?> = mapOf(
         "id" to id,

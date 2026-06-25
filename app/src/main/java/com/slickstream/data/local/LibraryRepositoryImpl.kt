@@ -136,6 +136,62 @@ class LibraryRepositoryImpl @Inject constructor(
         )
     }
 
+    // --- Cross-profile sync surface ---
+    // These take/return an EXPLICIT profileId so cloud sync can mirror every profile's library keyed
+    // by its origin profile, never the active one. The UI never calls these.
+
+    override suspend fun allFavoritesForSync(): List<Pair<String, FavoriteItem>> =
+        favoriteDao.getAllAcrossProfiles().map { it.profileId to it.toFavoriteItem() }
+
+    override fun observeAllFavoritesForSync(): Flow<List<Pair<String, FavoriteItem>>> =
+        favoriteDao.observeAllAcrossProfiles()
+            .map { rows -> rows.map { it.profileId to it.toFavoriteItem() } }
+
+    override suspend fun isFavoriteInProfile(profileId: String, id: Int, type: MediaType): Boolean =
+        favoriteDao.isFavorite(id, type, profileId)
+
+    override suspend fun addFavoriteForProfile(profileId: String, item: MediaItem) {
+        // UPSERT (not toggle): an item arriving from another device must be added, never removed.
+        favoriteDao.upsert(
+            FavoriteEntity.from(item, addedAt = System.currentTimeMillis(), profileId = profileId),
+        )
+    }
+
+    override suspend fun allHistoryForSync(): List<Triple<String, MediaItem, PlaybackProgress>> =
+        watchHistoryDao.getAllAcrossProfiles()
+            .map { Triple(it.profileId, it.toMediaItem(), it.toPlaybackProgress()) }
+
+    override fun observeAllHistoryForSync(): Flow<List<Triple<String, MediaItem, PlaybackProgress>>> =
+        watchHistoryDao.observeAllAcrossProfiles()
+            .map { rows -> rows.map { Triple(it.profileId, it.toMediaItem(), it.toPlaybackProgress()) } }
+
+    override suspend fun getProgressForProfile(
+        profileId: String,
+        id: Int,
+        type: MediaType,
+        season: Int?,
+        episode: Int?,
+    ): PlaybackProgress? =
+        watchHistoryDao
+            .getByEpisode(
+                id,
+                type,
+                season ?: WatchHistoryEntity.NO_KEY,
+                episode ?: WatchHistoryEntity.NO_KEY,
+                profileId,
+            )
+            ?.toPlaybackProgress()
+
+    override suspend fun saveProgressForProfile(
+        profileId: String,
+        item: MediaItem,
+        progress: PlaybackProgress,
+    ) {
+        watchHistoryDao.upsert(
+            WatchHistoryEntity.from(item, progress, addedAt = System.currentTimeMillis(), profileId = profileId),
+        )
+    }
+
     private companion object {
         /** position == duration == 1ms -> percent 1.0f, so the row reads as finished/watched. */
         const val WATCHED_SENTINEL_MS = 1L

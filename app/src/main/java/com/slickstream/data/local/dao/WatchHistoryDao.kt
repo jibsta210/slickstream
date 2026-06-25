@@ -15,6 +15,14 @@ interface WatchHistoryDao {
     @Query("SELECT * FROM watch_history WHERE profileId = :profileId ORDER BY updatedAt DESC")
     fun observeAll(profileId: String): Flow<List<WatchHistoryEntity>>
 
+    /** Every history row across ALL profiles — used by cloud sync (each row carries its profileId). */
+    @Query("SELECT * FROM watch_history ORDER BY updatedAt DESC")
+    fun observeAllAcrossProfiles(): Flow<List<WatchHistoryEntity>>
+
+    /** One-shot snapshot of every history row across ALL profiles — used by the initial sync merge. */
+    @Query("SELECT * FROM watch_history ORDER BY updatedAt DESC")
+    suspend fun getAllAcrossProfiles(): List<WatchHistoryEntity>
+
     /**
      * The exact per-episode row. [seasonKey]/[episodeKey] are the non-null key mirrors
      * (-1 == movie / no season-episode).
