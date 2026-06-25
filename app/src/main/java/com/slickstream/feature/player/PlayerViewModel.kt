@@ -172,6 +172,11 @@ class PlayerViewModel @Inject constructor(
     private val _title = MutableStateFlow("Now Playing")
     val title: StateFlow<String> = _title.asStateFlow()
 
+    /** Backdrop (or poster) art for the title, shown behind the buffering overlay so the wait feels
+     *  like the movie loading instead of a black void — dissolves into the real first frame on play. */
+    private val _backdropUrl = MutableStateFlow<String?>(null)
+    val backdropUrl: StateFlow<String?> = _backdropUrl.asStateFlow()
+
     // --- Episode navigation (TV only) ---------------------------------------
     /** Episodes of the current season — empty for movies; drives the episode-list UI. */
     private val _episodes = MutableStateFlow<List<Episode>>(emptyList())
@@ -304,6 +309,7 @@ class PlayerViewModel @Inject constructor(
             }
             details = d
             _title.value = buildTitle(d)
+            _backdropUrl.value = d.item.backdropUrl ?: d.item.posterUrl
             viewModelScope.launch { loadSubtitles(d) }
             viewModelScope.launch { loadEpisodeList() }
 

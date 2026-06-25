@@ -135,6 +135,7 @@ fun PlayerScreen(
     val suggestSmaller by viewModel.suggestSmaller.collectAsState()
     val thumbnailVersion by viewModel.thumbnailVersion.collectAsState()
     val rebuffering by viewModel.rebuffering.collectAsState()
+    val backdropUrl by viewModel.backdropUrl.collectAsState()
     val context = LocalContext.current
 
     // Scrub-preview: the ms position the user is dragging the built-in time bar to (null = not
@@ -343,6 +344,9 @@ fun PlayerScreen(
                 // second step where the branded ETA vanished and ExoPlayer's bare spinner took over.
                 is PlayerUiState.Buffering -> BufferingOverlay(
                     state = state,
+                    // Title art behind the overlay — the "rollercoaster line-up", so the wait feels like
+                    // the movie loading instead of a black screen.
+                    backdropUrl = backdropUrl,
                     // Gentle "taking a while? try a smaller stream" nudge — only after a long, starved buffer.
                     suggestSmaller = suggestSmaller,
                     onSwitchToSmaller = viewModel::switchToSmaller,
@@ -593,6 +597,7 @@ private fun SourcesButton(onClick: () -> Unit) {
 @Composable
 private fun BufferingOverlay(
     state: PlayerUiState.Buffering,
+    backdropUrl: String? = null,
     suggestSmaller: Boolean = false,
     onSwitchToSmaller: () -> Unit = {},
     onDismissSuggestSmaller: () -> Unit = {},
@@ -600,13 +605,35 @@ private fun BufferingOverlay(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color.Black.copy(alpha = 0.35f), Color.Black.copy(alpha = 0.7f)),
-                )
-            ),
+            .background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
+        // Title art behind the scrim — fades in when it loads so the buffering screen feels alive.
+        if (backdropUrl != null) {
+            androidx.compose.animation.AnimatedVisibility(
+                visible = true,
+                enter = fadeIn(),
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                coil.compose.AsyncImage(
+                    model = backdropUrl,
+                    contentDescription = null,
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        // Scrim over the art so the spinner / ETA / progress bar stay legible.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color.Black.copy(alpha = 0.45f), Color.Black.copy(alpha = 0.78f)),
+                    )
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
@@ -666,6 +693,7 @@ private fun BufferingOverlay(
                     onSwitchToSmaller = onSwitchToSmaller,
                     onDismiss = onDismissSuggestSmaller,
                 )
+            }
             }
         }
     }

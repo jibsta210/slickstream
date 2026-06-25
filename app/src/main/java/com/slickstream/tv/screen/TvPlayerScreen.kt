@@ -77,6 +77,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import coil.compose.AsyncImage
 import com.slickstream.data.vlc.VlcPlayer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -127,6 +128,7 @@ fun TvPlayerScreen(
     val suggestSmaller by viewModel.suggestSmaller.collectAsStateWithLifecycle()
     val thumbnailVersion by viewModel.thumbnailVersion.collectAsStateWithLifecycle()
     val rebuffering by viewModel.rebuffering.collectAsStateWithLifecycle()
+    val backdropUrl by viewModel.backdropUrl.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -250,6 +252,7 @@ fun TvPlayerScreen(
                 state = s,
                 title = title,
                 onBack = onBack,
+                backdropUrl = backdropUrl,
                 canSwitchSource = sources.size > 1,
                 onSwitchSource = { panelOpen = true },
                 // Gentle "taking a while? try a smaller stream" nudge — only after a long, starved buffer.
@@ -403,6 +406,7 @@ private fun BufferingOverlay(
     state: PlayerUiState.Buffering,
     title: String,
     onBack: () -> Unit,
+    backdropUrl: String? = null,
     canSwitchSource: Boolean = false,
     onSwitchSource: () -> Unit = {},
     suggestSmaller: Boolean = false,
@@ -423,9 +427,25 @@ private fun BufferingOverlay(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xCC000000)),
+            .background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
+        // Title art behind the scrim — the "rollercoaster line-up": the wait looks like the movie
+        // loading, not a black screen. Dissolves into the real first frame once playback starts.
+        if (backdropUrl != null) {
+            AsyncImage(
+                model = backdropUrl,
+                contentDescription = null,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xCC000000)),
+            contentAlignment = Alignment.Center,
+        ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -496,6 +516,7 @@ private fun BufferingOverlay(
                     ErrorButton("Switch source", onClick = onSwitchSource)
                 }
             }
+        }
         }
     }
 }
