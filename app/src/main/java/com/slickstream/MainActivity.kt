@@ -25,8 +25,12 @@ import com.slickstream.feature.update.UpdateGate
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.slickstream.data.settings.AppSettings
+import com.slickstream.data.settings.ScreenCalibration
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.feature.player.LocalPipController
 import com.slickstream.feature.player.PipController
@@ -111,13 +115,44 @@ class MainActivity : ComponentActivity() {
         inPipState.value = isInPictureInPictureMode
     }
 
+    /**
+     * Android TV: go genuinely immersive — edge-to-edge alone draws BEHIND the system bars but doesn't
+     * remove them, so a panel that reports a (sometimes asymmetric) system-bar/safe-area inset can leave
+     * a black gutter on one side. Hiding the bars hands the app the whole panel. TVs drop immersive on
+     * focus changes, so this is re-asserted from [onWindowFocusChanged]. Phones keep their bars (the UI
+     * pads for them); the phone player hides them itself only during fullscreen playback.
+     */
+    private fun applyTvImmersiveIfNeeded() {
+        if (!onTv) return
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applyTvImmersiveIfNeeded()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        applyTvImmersiveIfNeeded()
         setContent {
             val settings by settingsRepository.settings
                 .collectAsStateWithLifecycle(initialValue = AppSettings())
+            // Live override (in-memory, instant) wins while the user is on the calibration screen;
+            // otherwise the persisted values drive the fit. null = no override active.
+            val liveCalibration by settingsRepository.liveCalibration
+                .collectAsStateWithLifecycle()
+            val calibration = liveCalibration ?: ScreenCalibration(
+                scale = settings.screenScale,
+                offsetX = settings.screenOffsetX,
+                offsetY = settings.screenOffsetY,
+            )
             val base = LocalDensity.current
             CompositionLocalProvider(
                 // Scale dp (and therefore sp) uniformly — a true "DPI" change.
@@ -128,9 +163,9 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.fillMaxSize()) {
                         // Screen calibration fits the whole app (UI + video) to the user's TV.
                         com.slickstream.ui.ScreenCalibrated(
-                            scale = settings.screenScale,
-                            offsetX = settings.screenOffsetX,
-                            offsetY = settings.screenOffsetY,
+                            scale = calibration.scale,
+                            offsetX = calibration.offsetX,
+                            offsetY = calibration.offsetY,
                         ) {
                             if (onTv) TvApp() else PhoneApp()
                         }

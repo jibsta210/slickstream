@@ -8,9 +8,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -31,6 +34,8 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -65,17 +70,41 @@ fun TvScreenCalibrationScreen(
     }
     var sel by remember { mutableStateOf(0) } // 0 size · 1 horizontal · 2 vertical · 3 reset · 4 done
     val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+    // Retry focus past layout — a single requestFocus() fired before the focusable is attached silently
+    // fails on a real TV, leaving the D-pad uncaptured so arrow presses escaped to navigation.
+    LaunchedEffect(Unit) {
+        repeat(12) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { focus.requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
 
-    fun save() = viewModel.setScreenCalibration(scale, offX, offY)
+    // Live preview is instant + in-memory (no disk write per keypress); the value is persisted ONCE,
+    // when the user leaves the screen (Done or Back) — so adjustments stick without hammering DataStore.
+    fun preview() = viewModel.setLiveCalibration(scale, offX, offY)
+    fun finish() {
+        viewModel.commitScreenCalibration(scale, offX, offY)
+        onBack()
+    }
     fun adjust(dir: Int) {
         when (sel) {
             0 -> scale = (scale + dir * 0.005f).coerceIn(0.80f, 1.20f)
             1 -> offX = (offX + dir * 4f).coerceIn(-200f, 200f)
             2 -> offY = (offY + dir * 4f).coerceIn(-200f, 200f)
         }
-        save()
+        preview()
     }
+
+    // Diagnostic: what insets does the panel actually report? If these are all 0 and a black border
+    // still shows, it's true hardware overscan (use the sliders). If a side is non-zero / left != right,
+    // it's a window inset the app should consume — tells us which problem we're really looking at.
+    val density = LocalDensity.current
+    val ld = LocalLayoutDirection.current
+    val bars = WindowInsets.systemBars
+    val cut = WindowInsets.displayCutout
+    val insetReadout = "panel report — bars L${bars.getLeft(density, ld)} T${bars.getTop(density)} " +
+        "R${bars.getRight(density, ld)} B${bars.getBottom(density)} · " +
+        "cutout L${cut.getLeft(density, ld)} R${cut.getRight(density, ld)}"
 
     Box(
         modifier = Modifier
@@ -92,12 +121,12 @@ fun TvScreenCalibrationScreen(
                     Key.DirectionRight -> { if (sel <= 2) adjust(+1); true }
                     Key.DirectionCenter, Key.Enter -> {
                         when (sel) {
-                            3 -> { scale = 1f; offX = 0f; offY = 0f; save() }
-                            4 -> onBack()
+                            3 -> { scale = 1f; offX = 0f; offY = 0f; preview() }
+                            4 -> finish()
                         }
                         true
                     }
-                    Key.Back -> { onBack(); true }
+                    Key.Back -> { finish(); true }
                     else -> false
                 }
             },
@@ -133,6 +162,11 @@ fun TvScreenCalibrationScreen(
                 "↑↓ select   ·   ←→ adjust   ·   OK to reset / finish",
                 color = Brand.OnSurfaceDim,
                 fontSize = 12.sp,
+            )
+            Text(
+                insetReadout,
+                color = Brand.OnSurfaceDim.copy(alpha = 0.6f),
+                fontSize = 10.sp,
             )
         }
     }

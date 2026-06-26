@@ -7,6 +7,9 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
@@ -129,6 +132,13 @@ data class AppSettings(
     val screenOffsetY: Float = 0f,
 )
 
+/** Screen-calibration triple (uniform scale + dp shift) used for the live, in-memory preview. */
+data class ScreenCalibration(
+    val scale: Float = 1f,
+    val offsetX: Float = 0f,
+    val offsetY: Float = 0f,
+)
+
 /**
  * App preferences, backed by the shared DataStore. Holds the per-network default quality caps
  * and the UI density scale.
@@ -137,6 +147,30 @@ data class AppSettings(
 class SettingsRepository @Inject constructor(
     private val dataStore: DataStore<Preferences>,
 ) {
+    /**
+     * Live, in-memory calibration override used ONLY while the user is on the calibration screen.
+     * null = no override active → the app uses the persisted [AppSettings] values. This decouples the
+     * live preview from DataStore so each D-pad nudge updates instantly (no disk write per keypress) and
+     * does NOT re-emit the whole settings flow; the value is persisted once, on leaving the screen.
+     */
+    private val _liveCalibration = MutableStateFlow<ScreenCalibration?>(null)
+    val liveCalibration: StateFlow<ScreenCalibration?> = _liveCalibration.asStateFlow()
+
+    /** Instant in-memory update for the calibration preview (no disk). */
+    fun setLiveCalibration(scale: Float, offsetX: Float, offsetY: Float) {
+        _liveCalibration.value = ScreenCalibration(
+            scale = scale.coerceIn(SCALE_MIN, SCALE_MAX),
+            offsetX = offsetX.coerceIn(OFFSET_MIN, OFFSET_MAX),
+            offsetY = offsetY.coerceIn(OFFSET_MIN, OFFSET_MAX),
+        )
+    }
+
+    /** Persist the calibration AND keep the live override in sync. Call on leaving the screen. */
+    suspend fun commitScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) {
+        setLiveCalibration(scale, offsetX, offsetY)
+        setScreenCalibration(scale, offsetX, offsetY)
+    }
+
     val settings: Flow<AppSettings> = dataStore.data.map { p ->
         AppSettings(
             wifiQuality = p[KEY_WIFI].toQuality(QualityPreference.AUTO),
@@ -154,9 +188,9 @@ class SettingsRepository @Inject constructor(
                 ?: StreamSizePreference.DEFAULT,
             maxCacheSize = p[KEY_MAX_CACHE]?.let { runCatching { CacheSize.valueOf(it) }.getOrNull() }
                 ?: CacheSize.DEFAULT,
-            screenScale = (p[KEY_SCREEN_SCALE] ?: 1f).coerceIn(0.80f, 1.20f),
-            screenOffsetX = (p[KEY_SCREEN_OFF_X] ?: 0f).coerceIn(-200f, 200f),
-            screenOffsetY = (p[KEY_SCREEN_OFF_Y] ?: 0f).coerceIn(-200f, 200f),
+            screenScale = (p[KEY_SCREEN_SCALE] ?: 1f).coerceIn(SCALE_MIN, SCALE_MAX),
+            screenOffsetX = (p[KEY_SCREEN_OFF_X] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
+            screenOffsetY = (p[KEY_SCREEN_OFF_Y] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
         )
     }
 
@@ -172,9 +206,9 @@ class SettingsRepository @Inject constructor(
     suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
     suspend fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) = dataStore.edit {
-        it[KEY_SCREEN_SCALE] = scale.coerceIn(0.80f, 1.20f)
-        it[KEY_SCREEN_OFF_X] = offsetX.coerceIn(-200f, 200f)
-        it[KEY_SCREEN_OFF_Y] = offsetY.coerceIn(-200f, 200f)
+        it[KEY_SCREEN_SCALE] = scale.coerceIn(SCALE_MIN, SCALE_MAX)
+        it[KEY_SCREEN_OFF_X] = offsetX.coerceIn(OFFSET_MIN, OFFSET_MAX)
+        it[KEY_SCREEN_OFF_Y] = offsetY.coerceIn(OFFSET_MIN, OFFSET_MAX)
     }
 
     private fun String?.toQuality(default: QualityPreference): QualityPreference =
@@ -193,5 +227,11 @@ class SettingsRepository @Inject constructor(
         val KEY_SCREEN_SCALE = floatPreferencesKey("screen_scale")
         val KEY_SCREEN_OFF_X = floatPreferencesKey("screen_offset_x")
         val KEY_SCREEN_OFF_Y = floatPreferencesKey("screen_offset_y")
+
+        // Calibration bounds (shared by the persisted read/write and the live in-memory preview).
+        const val SCALE_MIN = 0.80f
+        const val SCALE_MAX = 1.20f
+        const val OFFSET_MIN = -200f
+        const val OFFSET_MAX = 200f
     }
 }

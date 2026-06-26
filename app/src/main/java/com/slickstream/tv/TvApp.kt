@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavType
@@ -44,6 +43,15 @@ import com.slickstream.ui.theme.Brand
  * player routes (which hide the rail). Everything is reachable with a D-pad only. Existing
  * feature ViewModels are reused on every screen — no data logic is duplicated here.
  */
+/**
+ * Process-scoped latch: the launch profile picker shows at most ONCE per app launch and can never be
+ * re-triggered by a recomposition or a full rebuild of [TvApp]. A rememberSaveable here used to reset
+ * when the whole TV app was torn down and rebuilt (the old calibration wrapper did exactly that on the
+ * first slider nudge), which re-fired the gate mid-session and yanked the user to the profile picker. A
+ * top-level flag survives recomposition AND a TvApp rebuild, resetting only on a fresh process.
+ */
+private var launchProfileGateConsumed = false
+
 @Composable
 fun TvApp() {
     SlickStreamTvTheme {
@@ -57,12 +65,9 @@ fun TvApp() {
         val profileViewModel: com.slickstream.feature.profile.ProfileViewModel =
             androidx.hilt.navigation.compose.hiltViewModel()
         val profiles by profileViewModel.profiles.collectAsStateWithLifecycle()
-        var profileGateShown by androidx.compose.runtime.saveable.rememberSaveable {
-            androidx.compose.runtime.mutableStateOf(false)
-        }
         androidx.compose.runtime.LaunchedEffect(profiles.size) {
-            if (!profileGateShown && profiles.size > 1) {
-                profileGateShown = true
+            if (!launchProfileGateConsumed && profiles.size > 1) {
+                launchProfileGateConsumed = true
                 navController.navigate(Routes.PROFILE_PICKER) {
                     launchSingleTop = true
                 }

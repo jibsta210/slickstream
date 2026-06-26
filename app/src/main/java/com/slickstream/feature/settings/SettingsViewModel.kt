@@ -76,7 +76,15 @@ class SettingsViewModel @Inject constructor(
     fun setStreamSize(s: com.slickstream.data.settings.StreamSizePreference) =
         viewModelScope.launch { repo.setStreamSize(s) }
 
-    /** Screen calibration (TV fit). Saved live so the whole app re-fits as the user adjusts. */
-    fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) =
-        viewModelScope.launch { repo.setScreenCalibration(scale, offsetX, offsetY) }
+    /**
+     * Screen calibration (TV fit). The live preview updates an in-memory value instantly on every
+     * D-pad nudge ([setLiveCalibration], no disk), and we persist once when the user leaves the
+     * calibration screen ([commitScreenCalibration]). Writing DataStore per keypress used to re-emit
+     * the whole settings flow and re-fit the app on every press — janky, and it tore focus apart.
+     */
+    fun setLiveCalibration(scale: Float, offsetX: Float, offsetY: Float) =
+        repo.setLiveCalibration(scale, offsetX, offsetY)
+
+    fun commitScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) =
+        viewModelScope.launch { repo.commitScreenCalibration(scale, offsetX, offsetY) }
 }
