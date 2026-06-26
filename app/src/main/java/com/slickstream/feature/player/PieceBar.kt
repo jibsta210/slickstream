@@ -1,16 +1,31 @@
 package com.slickstream.feature.player
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.slickstream.ui.theme.Brand
+import kotlin.math.roundToInt
 
 /**
  * A torrent-style "chunk bar": a thin strip spanning the whole file (left = start, right = end) where
@@ -58,3 +73,68 @@ fun PieceBar(
 
 /** Bucket count for the chunk bar — fine enough to read the fill pattern, cheap to recompute. */
 const val PIECE_BAR_BUCKETS = 110
+
+/**
+ * The chunk bar plus a one-line info row: a health dot, live seeders/peers, download speed, and a
+ * warning ("low buffer" / "stalled") when the download is at risk of out-running playback.
+ */
+@Composable
+fun PieceBarPanel(
+    map: FloatArray,
+    playheadFraction: Float,
+    stats: StreamStats?,
+    modifier: Modifier = Modifier,
+) {
+    val health = healthOf(map, playheadFraction, stats)
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Spacer(
+                Modifier.size(8.dp).clip(CircleShape).background(health.color),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = buildString {
+                    if (stats != null) {
+                        append("${stats.seeders} seeders")
+                        if (stats.peers > stats.seeders) append(" · ${stats.peers} peers")
+                        append(" · ${formatRate(stats.downloadRateBytes)}")
+                        append(" · ${(stats.progress * 100).roundToInt()}% downloaded")
+                    } else {
+                        append("Downloading…")
+                    }
+                    health.warning?.let { append(" · "); append(it) }
+                },
+                color = Color.White.copy(alpha = 0.85f),
+                fontWeight = FontWeight.Medium,
+                fontSize = 12.sp,
+            )
+        }
+        PieceBar(map, playheadFraction)
+    }
+}
+
+private class BarHealth(val color: Color, val warning: String?)
+
+/**
+ * Green = a comfortable downloaded lead ahead of the playhead. Amber = the lead is thin (will buffer
+ * soon if the rate dips). Red = stalled (0 B/s and not complete).
+ */
+private fun healthOf(map: FloatArray, playheadFraction: Float, stats: StreamStats?): BarHealth {
+    if (stats == null || map.isEmpty()) return BarHealth(Brand.Cyan, null)
+    if (stats.downloadRateBytes == 0 && stats.progress < 0.99f) return BarHealth(Brand.Error, "stalled")
+    val ph = (playheadFraction * map.size).toInt().coerceIn(0, map.size - 1)
+    var lead = 0
+    var i = ph
+    while (i < map.size && map[i] >= 0.85f) { lead++; i++ }
+    val leadFraction = lead.toFloat() / map.size
+    return when {
+        leadFraction < 0.02f -> BarHealth(Brand.Star, "low buffer")
+        else -> BarHealth(Brand.Cyan, null)
+    }
+}
+
+private fun formatRate(bytesPerSec: Int): String = when {
+    bytesPerSec <= 0 -> "0 KB/s"
+    bytesPerSec >= 1024 * 1024 -> "%.1f MB/s".format(bytesPerSec / (1024f * 1024f))
+    else -> "${bytesPerSec / 1024} KB/s"
+}

@@ -346,9 +346,11 @@ fun TvPlayerScreen(
         if (uiState is PlayerUiState.Playing) {
             var pieceMap by remember { mutableStateOf(FloatArray(0)) }
             var playheadFrac by remember { mutableStateOf(0f) }
+            var stats by remember { mutableStateOf<com.slickstream.feature.player.StreamStats?>(null) }
             LaunchedEffect(player) {
                 while (true) {
                     pieceMap = viewModel.pieceMap(com.slickstream.feature.player.PIECE_BAR_BUCKETS)
+                    stats = viewModel.streamStats()
                     val p = player
                     playheadFrac = if (p != null && p.duration > 0)
                         (p.currentPosition.toFloat() / p.duration).coerceIn(0f, 1f) else 0f
@@ -361,10 +363,11 @@ fun TvPlayerScreen(
                 exit = fadeOut(),
                 modifier = Modifier.align(Alignment.BottomCenter),
             ) {
-                com.slickstream.feature.player.PieceBar(
+                com.slickstream.feature.player.PieceBarPanel(
                     map = pieceMap,
                     playheadFraction = playheadFrac,
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+                    stats = stats,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
                 )
             }
         }

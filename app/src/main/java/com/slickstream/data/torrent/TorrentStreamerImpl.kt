@@ -133,30 +133,19 @@ class TorrentStreamerImpl @Inject constructor(
                 val headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= READY_HEAD_BYTES
                 if (headReady && headReadySince == 0L) headReadySince = System.currentTimeMillis()
-                // Prefer having the tail (mp4 moov / mkv cues) so playback starts instantly, but
-                // don't block forever if those pieces lag — fall back after a grace window.
+                // Gate READY on head + tail for EVERY container. ExoPlayer reads the EOF tail (mp4 moov
+                // OR mkv cues) during prepare, so starting before it's in just moves the wait into a
+                // ~15s "Almost ready" stall AFTER the countdown hit zero. Waiting for it (the engine now
+                // fetches it in parallel with the head) makes the byte countdown actually cover the time
+                // to first frame. Hard-capped so a genuinely-absent/slow tail still starts eventually and
+                // lets the player's retries + failover take over instead of blocking forever.
                 val tailReady = engine.tailAvailable(infoHash)
-                // mp4/m4v/mov carry the moov atom (MANDATORY before the first frame) at EOF. Unlike
-                // mkv — whose cues are only needed to SEEK, so it can start head-only — an mp4 that
-                // starts without its tail makes ExoPlayer attach, range to the missing moov, and
-                // dead-end on a parse/IO error. So give moov-critical containers a much longer hard
-                // cap to wait for the real tail (which prioritizeHeadAndTail is fetching aggressively);
-                // only if even that lapses do they start anyway, so the player's retries + source
-                // failover can take over instead of looping forever. mkv keeps the snappy 8s grace.
-                val ext = engine.selectedFileExt(infoHash)
-                val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
-                // mp4/m4v/mov carry the moov atom at EOF and CANNOT render a frame without it, so wait
-                // for the real tail (hard-capped, then start anyway and let player retries/failover
-                // handle a truly-absent moov). mkv/webm carry only seek cues at EOF — not needed to
-                // START — so they begin the instant the head is ready (the engine no longer fetches
-                // their tail up front, so waiting on it would just stall the start for nothing).
                 val tailGraceElapsed = headReadySince > 0L &&
-                    System.currentTimeMillis() - headReadySince > MP4_TAIL_HARD_CAP_MS
-                val canStart =
-                    if (moovCritical) headReady && (tailReady || tailGraceElapsed) else headReady
+                    System.currentTimeMillis() - headReadySince > TAIL_HARD_CAP_MS
+                val canStart = headReady && (tailReady || tailGraceElapsed)
 
-                // ETA to first frame, against the real gate (head + mp4 moov tail), refreshed each poll.
-                val eta = estimateEta(snap, headBytes, tailReady, moovCritical)
+                // ETA to first frame, against the real gate (head + tail), refreshed each poll.
+                val eta = estimateEta(snap, headBytes, tailReady)
 
                 if (pollCount++ % DIAG_EVERY == 0) {
                     Log.d(
@@ -384,16 +373,16 @@ class TorrentStreamerImpl @Inject constructor(
 
     /**
      * Seconds until first frame, measured against the SAME gate that flips to READY: the contiguous
-     * head reaching [READY_HEAD_BYTES] plus, for moov-critical mp4/m4v/mov, the ~moov-sized tail band.
-     * Using whole-file downloaded bytes (which counts the head AND the deadline-fetched tail pieces)
-     * as the credit means the countdown keeps falling as the moov arrives, instead of hitting zero on
-     * the head and then "buffering more" for the moov — the regression the unified estimate introduced.
-     * Null while there's no download rate yet (still finding peers / fetching metadata).
+     * head reaching [READY_HEAD_BYTES] PLUS the EOF tail (moov/cues), which the player needs to prepare.
+     * Counting the tail is what makes the countdown match reality — without it the number hit zero on the
+     * head and the player then stalled ~15s reading the tail. Whole-file downloaded bytes (which counts
+     * the head AND the deadline-fetched tail pieces) is the credit, so the number keeps falling as the
+     * tail arrives. Null while there's no download rate yet (still finding peers / fetching metadata).
      */
-    private fun estimateEta(snap: EngineStatus, headBytes: Long, tailReady: Boolean, moovCritical: Boolean): Int? {
+    private fun estimateEta(snap: EngineStatus, headBytes: Long, tailReady: Boolean): Int? {
         val rate = snap.downloadRate
         if (rate <= 0) return null
-        val tailNeeded = if (moovCritical && !tailReady) MOOV_TAIL_BYTES else 0L
+        val tailNeeded = if (tailReady) 0L else MOOV_TAIL_BYTES
         val target = READY_HEAD_BYTES + tailNeeded
         val headRemaining = (READY_HEAD_BYTES - headBytes).coerceAtLeast(0L)
         val remaining = (target - snap.downloadedBytes).coerceAtLeast(headRemaining)
@@ -429,9 +418,10 @@ class TorrentStreamerImpl @Inject constructor(
          *  bytes are present (container parse, decoder init, initial buffer fill). */
         private const val PREPARE_MARGIN_SECONDS = 4L
 
-        /** Hard cap for moov-critical mp4/m4v/mov: wait this long for the EOF moov before
-         *  starting head-only (then the player's retries + source failover handle a truly-absent moov). */
-        private const val MP4_TAIL_HARD_CAP_MS = 30_000L
+        /** Hard cap for the EOF tail (moov/cues) after the head is ready: on a healthy swarm the tail
+         *  (fetched in parallel) is in well before this, so the gate rarely waits; this just bounds the
+         *  worst case so a slow/absent tail starts head-only and lets player retries + failover handle it. */
+        private const val TAIL_HARD_CAP_MS = 15_000L
 
         /** Emit a diagnostic log line every Nth poll (~2 s at a 500 ms interval). */
         private const val DIAG_EVERY = 4

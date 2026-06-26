@@ -390,9 +390,11 @@ fun PlayerScreen(
             if (uiState is PlayerUiState.Playing && !isCasting) {
                 var pieceMap by remember { mutableStateOf(FloatArray(0)) }
                 var playheadFrac by remember { mutableStateOf(0f) }
+                var stats by remember { mutableStateOf<StreamStats?>(null) }
                 LaunchedEffect(activePlayer) {
                     while (true) {
                         pieceMap = viewModel.pieceMap(PIECE_BAR_BUCKETS)
+                        stats = viewModel.streamStats()
                         val p = activePlayer
                         playheadFrac = if (p != null && p.duration > 0)
                             (p.currentPosition.toFloat() / p.duration).coerceIn(0f, 1f) else 0f
@@ -405,10 +407,11 @@ fun PlayerScreen(
                     exit = fadeOut(),
                     modifier = Modifier.align(Alignment.BottomCenter),
                 ) {
-                    PieceBar(
+                    PieceBarPanel(
                         map = pieceMap,
                         playheadFraction = playheadFrac,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        stats = stats,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                     )
                 }
             }

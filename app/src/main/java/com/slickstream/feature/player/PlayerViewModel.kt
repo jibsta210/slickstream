@@ -97,6 +97,9 @@ data class RebufferState(
 /** Subtitle appearance the players apply to their Media3 SubtitleView. */
 data class CaptionPrefs(val size: SubtitleSize, val style: SubtitleStyle)
 
+/** Live swarm/transfer snapshot shown under the player's chunk bar. */
+data class StreamStats(val seeders: Int, val peers: Int, val downloadRateBytes: Int, val progress: Float)
+
 @HiltViewModel
 class PlayerViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
@@ -256,6 +259,11 @@ class PlayerViewModel @Inject constructor(
     /** Per-bucket download fill (0f..1f) across the file for the player's chunk bar; empty when N/A. */
     fun pieceMap(buckets: Int): FloatArray =
         activeInfoHash?.let { torrentStreamer.pieceMap(it, buckets) } ?: FloatArray(0)
+
+    /** Live swarm/transfer stats for the chunk-bar info row, or null when not torrent-backed. */
+    fun streamStats(): StreamStats? = latestStatus?.let {
+        StreamStats(seeders = it.seeders, peers = it.peers, downloadRateBytes = it.downloadRateBytes, progress = it.progress)
+    }
 
     // --- Subtitles ---
     private val _subtitles = MutableStateFlow<List<SubtitleTrack>>(emptyList())

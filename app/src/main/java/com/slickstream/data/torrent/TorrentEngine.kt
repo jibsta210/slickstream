@@ -514,13 +514,12 @@ class TorrentEngine @Inject constructor(
         // fills. Capped small so a big-piece torrent doesn't deadline a huge band.
         val headPieces = maxOf(HEAD_PRIORITY_PIECES, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
         val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen))
-        val ext = active.filePath?.substringAfterLast('.', "")?.lowercase()
-        val moovCritical = ext == "mp4" || ext == "m4v" || ext == "mov"
-        // The EOF tail holds the mp4 moov AND the mkv cues (ExoPlayer reads it during prepare):
-        //  - mp4/mov: moov is MANDATORY before the first frame -> fetch in parallel with the head (0ms).
-        //  - mkv/webm: cues aren't needed to START, so give them a far deadline — they must NOT compete
-        //    with a cold head for the few head-bearing peers; they fill once the head is in.
-        val tailBase = if (moovCritical) 0 else MKV_TAIL_DEFER_MS
+        // The EOF tail holds the mp4 moov AND the mkv cues, and ExoPlayer reads BOTH during prepare to
+        // build its seek map — so fetch the tail in PARALLEL with the head (deadline 0) for every
+        // container. Deferring the mkv cues was a mistake: the player then stalled ~15s on an on-demand
+        // EOF read after the head was already in (the "countdown says 2s, Almost-ready takes 15s" bug).
+        // With the tail in by READY, prepare is near-instant and the byte countdown matches first frame.
+        val tailBase = 0
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
         // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
@@ -952,9 +951,6 @@ class TorrentEngine @Inject constructor(
          *  torrents a byte budget collapses to 1 piece, leaving only piece 0 time-critical while the
          *  request queue scatters; a small staggered-deadline band keeps the head pipeline fed. */
         const val HEAD_PRIORITY_PIECES = 4
-
-        /** mkv/webm cues are seek-only — deadline them far out so they never preempt a cold head. */
-        const val MKV_TAIL_DEFER_MS = 30_000
 
         /** Per-piece deadline STEP for the head band. Must be large: libtorrent works all time-critical
          *  pieces toward their deadlines concurrently, so near-equal deadlines (~20 ms) complete in
