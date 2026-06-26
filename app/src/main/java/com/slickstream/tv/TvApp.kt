@@ -14,6 +14,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.slickstream.core.model.resumePoint
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.navigation.NavArg
@@ -124,9 +125,8 @@ fun TvApp() {
                                 // FINISHED show episode resumes the NEXT one, so a series you're working
                                 // through continues forward instead of replaying what you just watched.
                                 onResume = { h ->
-                                    val ep = if (h.media.mediaType == MediaType.TV && h.progress.isFinished)
-                                        (h.progress.episode ?: 1) + 1 else h.progress.episode
-                                    openPlayer(h.media.mediaType, h.media.id, h.progress.season, ep)
+                                    val r = h.resumePoint()
+                                    openPlayer(h.media.mediaType, h.media.id, r.season, r.episode)
                                 },
                             )
                         }

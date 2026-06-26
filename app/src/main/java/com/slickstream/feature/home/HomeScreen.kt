@@ -24,6 +24,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.slickstream.core.model.resumePoint
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.ui.components.ErrorRetry
@@ -93,8 +94,10 @@ private fun HomeContent(
 ) {
     // Fast lookup of resume progress for the "Continue Watching" row. Derived once per
     // continueWatching change (mirrors TvHomeScreen) so scrolling doesn't rebuild these maps.
+    // Display the SAME thing the tile will play (see resumePoint): a finished episode rolls the tile
+    // forward to the next one at 0%, instead of showing the just-finished episode near 100%.
     val progressByMediaId: Map<Int, Float> = remember(state.continueWatching) {
-        state.continueWatching.associate { it.media.id to it.progress.percent }
+        state.continueWatching.associate { it.media.id to it.resumePoint().percent }
     }
     val historyByMediaId: Map<Int, WatchHistoryItem> = remember(state.continueWatching) {
         state.continueWatching.associateBy { it.media.id }
@@ -103,9 +106,12 @@ private fun HomeContent(
         // Show the specific episode on the tile (e.g. "Game of Thrones · S1E3"), not just the show
         // name. id is unchanged so the progress + resume lookups still match.
         state.continueWatching.map { h ->
-            val s = h.progress.season
-            val e = h.progress.episode
-            if (s != null && e != null) h.media.copy(title = "${h.media.title} · S${s}E$e") else h.media
+            val r = h.resumePoint()
+            if (r.season != null && r.episode != null) {
+                h.media.copy(title = "${h.media.title} · S${r.season}E${r.episode}")
+            } else {
+                h.media
+            }
         }
     }
 
