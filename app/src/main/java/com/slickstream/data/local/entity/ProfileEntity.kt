@@ -18,6 +18,8 @@ data class ProfileEntity(
     // Default matches MIGRATION_3_4's ADD COLUMN ... DEFAULT 0 so Room's schema validation is exact.
     @ColumnInfo(defaultValue = "0") val avatarIndex: Int = 0,
     val createdAt: Long,
+    // Default matches MIGRATION_4_5's ADD COLUMN ... DEFAULT 0; existing rows are backfilled to createdAt.
+    @ColumnInfo(defaultValue = "0") val updatedAt: Long = 0L,
 ) {
     fun toProfile(): Profile = Profile(
         id = id,
@@ -26,6 +28,7 @@ data class ProfileEntity(
         colorIndex = colorIndex,
         avatarIndex = avatarIndex,
         createdAt = createdAt,
+        updatedAt = if (updatedAt > 0L) updatedAt else createdAt,
     )
 
     companion object {
@@ -39,6 +42,7 @@ data class ProfileEntity(
             colorIndex = profile.colorIndex,
             avatarIndex = profile.avatarIndex,
             createdAt = profile.createdAt,
+            updatedAt = if (profile.updatedAt > 0L) profile.updatedAt else profile.createdAt,
         )
     }
 }

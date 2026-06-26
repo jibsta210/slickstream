@@ -17,7 +17,8 @@ import com.slickstream.data.local.entity.WatchHistoryEntity
     // v3: multi-profile — favorites/watch_history scoped by profileId + a profiles table.
     // v4: profiles gain an avatarIndex (pickable emoji avatar) — migrated in place (see MIGRATION_3_4)
     // so existing profiles/favourites/history are NOT wiped.
-    version = 4,
+    // v5: profiles gain updatedAt (last-write-wins for cross-device profile edits) — MIGRATION_4_5.
+    version = 5,
     exportSchema = false,
 )
 @TypeConverters(MediaTypeConverter::class)
@@ -33,6 +34,15 @@ abstract class SlickDatabase : RoomDatabase() {
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE profiles ADD COLUMN avatarIndex INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /** Add profiles.updatedAt (default 0) and backfill it to createdAt for existing rows, without
+         *  wiping data. updatedAt drives last-write-wins for cross-device profile edits. */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE profiles ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE profiles SET updatedAt = createdAt")
             }
         }
     }

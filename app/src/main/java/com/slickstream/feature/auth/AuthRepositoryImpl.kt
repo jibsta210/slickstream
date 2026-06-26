@@ -75,14 +75,16 @@ class AuthRepositoryImpl @Inject constructor(
             val googleCredential = response.asGoogleIdCredential()
                 ?: return DataResult.Error("Couldn't read your Google account. Please try again.")
 
-            // Best-effort: exchange the Google ID token for a Firebase session so favourites and
-            // watch history sync across devices. No-ops when Firebase isn't configured.
-            runCatching { firebaseSync.signInWithGoogle(googleCredential.idToken) }
+            // Exchange the Google ID token for a Firebase session so favourites/history/profiles sync.
+            // Capture the uid: only START sync once Firebase actually keyed us (otherwise onSignedIn()
+            // early-returns on a null uid and NOTHING ever syncs while the UI claims "signed in").
+            val uid = runCatching { firebaseSync.signInWithGoogle(googleCredential.idToken) }.getOrNull()
 
             val profile = googleCredential.toUserProfile()
             persist(profile)
             _currentUser.value = profile
-            syncCoordinator.onSignedIn()
+            // Phone may run local-only when Firebase isn't configured; start cross-device sync only with a uid.
+            if (uid != null) syncCoordinator.onSignedIn()
             DataResult.Success(profile)
         } catch (e: GetCredentialCancellationException) {
             DataResult.Error("Sign-in was cancelled.", e)
@@ -108,10 +110,17 @@ class AuthRepositoryImpl @Inject constructor(
         val profile = profileFromIdToken(idToken)
             ?: return DataResult.Error("Couldn't verify your Google account. Please try again.")
         return try {
-            runCatching { firebaseSync.signInWithGoogle(idToken) }
+            val uid = runCatching { firebaseSync.signInWithGoogle(idToken) }.getOrNull()
             persist(profile)
             _currentUser.value = profile
-            syncCoordinator.onSignedIn()
+            if (uid != null) {
+                syncCoordinator.onSignedIn()
+            } else if (firebaseSync.isAvailable) {
+                // TV pairing exists ONLY to enable sync. If the Firebase exchange failed, surface a real
+                // failure instead of a false "Success" that silently never syncs ("TV paired but nothing
+                // syncs"). The user can re-pair to get a fresh id-token.
+                return DataResult.Error("Couldn't link this TV for sync. Please try pairing again.")
+            }
             DataResult.Success(profile)
         } catch (e: Exception) {
             DataResult.Error(e.message ?: "Google sign-in failed. Please try again.", e)

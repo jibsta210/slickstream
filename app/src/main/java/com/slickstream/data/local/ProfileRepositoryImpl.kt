@@ -77,20 +77,24 @@ class ProfileRepositoryImpl @Inject constructor(
     }
 
     override suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int): Profile {
+        val now = System.currentTimeMillis()
         val profile = Profile(
             id = UUID.randomUUID().toString(),
             name = name,
             isKids = isKids,
             colorIndex = colorIndex,
             avatarIndex = avatarIndex,
-            createdAt = System.currentTimeMillis(),
+            createdAt = now,
+            updatedAt = now,
         )
         dao.upsert(ProfileEntity.from(profile))
         return profile
     }
 
     override suspend fun updateProfile(profile: Profile) {
-        dao.upsert(ProfileEntity.from(profile))
+        // Bump updatedAt so the edit (rename/avatar/kids) is detected as a change and pushed to other
+        // devices, and so last-write-wins picks it over a stale remote copy.
+        dao.upsert(ProfileEntity.from(profile.copy(updatedAt = System.currentTimeMillis())))
     }
 
     override suspend fun deleteProfile(profileId: String) {
@@ -107,9 +111,14 @@ class ProfileRepositoryImpl @Inject constructor(
         dao.getAll().map(ProfileEntity::toProfile)
 
     override suspend fun upsertFromSync(profile: Profile) {
-        // Upsert the row only — the active profile id (in DataStore) is left untouched, so a profile
-        // pulled from another device never hijacks which profile this device is currently using.
-        dao.upsert(ProfileEntity.from(profile))
+        // Last-write-wins: only adopt the incoming profile if it's NEWER than (or equal to) our local
+        // copy, so a rename pulled from another device isn't clobbered by a stale local row, and an echo
+        // of our own push (same updatedAt) is a harmless no-op. The active profile id (DataStore) is
+        // left untouched, so a profile pulled from another device never hijacks the current selection.
+        val existing = dao.getById(profile.id)?.toProfile()
+        if (existing == null || profile.updatedAt >= existing.updatedAt) {
+            dao.upsert(ProfileEntity.from(profile))
+        }
     }
 
     private companion object {

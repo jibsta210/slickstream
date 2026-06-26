@@ -13,4 +13,7 @@ data class Profile(
     val colorIndex: Int,
     val avatarIndex: Int = 0,
     val createdAt: Long,
+    /** Bumped on every local edit (rename, avatar, kids flag). Drives last-write-wins cross-device sync
+     *  so an edit actually propagates and a stale remote copy never clobbers a newer one. */
+    val updatedAt: Long = createdAt,
 )

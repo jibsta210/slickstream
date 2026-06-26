@@ -48,7 +48,9 @@ class LibrarySyncCoordinator @Inject constructor(
     private var profileListener: ListenerRegistration? = null
     private var settingsListener: ListenerRegistration? = null
     private var lastFavKeys: Set<String> = emptySet()
-    private var lastProfileIds: Set<String> = emptySet()
+    /** Per-profile last-pushed updatedAt, so the push observer fires on EDITS (rename/avatar), not just
+     *  new ids — and skips echoing a profile we just pulled (same updatedAt). */
+    private var lastProfileSigs: Map<String, Long> = emptyMap()
     private var lastSettingsSig: String? = null
     @Volatile private var running = false
 
@@ -83,11 +85,12 @@ class LibrarySyncCoordinator @Inject constructor(
         sync.pullProfiles().forEach { profiles.upsertFromSync(it) }
         reconcileDuplicateProfiles()
         profiles.allProfiles().forEach { sync.pushProfileNow(it) }
-        lastProfileIds = profiles.allProfiles().map { it.id }.toSet()
+        lastProfileSigs = profiles.allProfiles().associate { it.id to it.updatedAt }
         startProfilePush()
         profileListener = sync.listenProfiles { p ->
             scope.launch {
-                lastProfileIds = lastProfileIds + p.id   // pre-mark so the push observer doesn't echo it back
+                // Pre-mark the incoming updatedAt so the push observer doesn't echo this profile back up.
+                lastProfileSigs = lastProfileSigs + (p.id to p.updatedAt)
                 profiles.upsertFromSync(p)
                 reconcileDuplicateProfiles()
             }
@@ -113,6 +116,9 @@ class LibrarySyncCoordinator @Inject constructor(
                 dups.filter { it.id != canonical.id && it.id != ProfileEntity.DEFAULT_PROFILE_ID }
                     .forEach { loser ->
                         library.reassignProfile(loser.id, canonical.id)
+                        // Re-key the loser's CLOUD favourites/history onto the canonical id too — otherwise
+                        // they stay orphaned under the dead id and initialMerge re-pulls them as a split.
+                        sync.reassignProfileDocs(loser.id, canonical.id)
                         if (profiles.currentProfileId() == loser.id) profiles.setActiveProfile(canonical.id)
                         profiles.deleteProfile(loser.id)
                         sync.removeProfile(loser.id)
@@ -120,13 +126,17 @@ class LibrarySyncCoordinator @Inject constructor(
             }
     }
 
-    /** Push a profile to the cloud the moment it's created/edited (delta vs lastProfileIds), so the
-     *  other device adopts the EXISTING id instead of minting a fresh UUID for the same name. */
+    /** Push a profile to the cloud the moment it's created OR edited, so the other device adopts the
+     *  EXISTING id (no divergent UUID) and gets renames/avatar changes. Pushes on any CONTENT change by
+     *  comparing updatedAt per id — the old id-only delta never pushed edits (the "rename didn't sync" bug). */
     private fun startProfilePush() {
         jobs += scope.launch {
             profiles.observeProfiles().collectLatest { list ->
-                list.filter { it.id !in lastProfileIds }.forEach { sync.pushProfile(it) }
-                lastProfileIds = list.map { it.id }.toSet()
+                list.forEach { p ->
+                    val seen = lastProfileSigs[p.id]
+                    if (seen == null || p.updatedAt > seen) sync.pushProfile(p)
+                }
+                lastProfileSigs = list.associate { it.id to it.updatedAt }
             }
         }
     }
@@ -235,7 +245,7 @@ class LibrarySyncCoordinator @Inject constructor(
         jobs.forEach { it.cancel() }
         jobs.clear()
         lastFavKeys = emptySet()
-        lastProfileIds = emptySet()
+        lastProfileSigs = emptyMap()
         lastSettingsSig = null
     }
 

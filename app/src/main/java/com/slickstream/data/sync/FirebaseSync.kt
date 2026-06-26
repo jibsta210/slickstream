@@ -130,6 +130,37 @@ class FirebaseSync @Inject constructor(
         runCatching { col.document(id).delete() }
     }
 
+    /**
+     * Move every favourite + history doc from [fromId] to [toId] IN THE CLOUD (idempotent), then delete
+     * the orphaned source docs. Called when reconciling two divergent profile ids for the same person so
+     * the loser's cloud favourites land under the canonical id instead of re-pulling as orphans/dupes.
+     */
+    suspend fun reassignProfileDocs(fromId: String, toId: String) {
+        if (fromId == toId) return
+        favCol()?.let { col ->
+            runCatching {
+                col.whereEqualTo("profileId", fromId).get().await().documents.forEach { d ->
+                    val data = d.data ?: return@forEach
+                    val media = data.toMediaItem() ?: return@forEach
+                    col.document(favKey(toId, media.mediaType, media.id))
+                        .set(data + ("profileId" to toId)).await()
+                    runCatching { d.reference.delete().await() }
+                }
+            }.onFailure { Log.w(TAG, "reassign favourites $fromId->$toId failed", it) }
+        }
+        histCol()?.let { col ->
+            runCatching {
+                col.whereEqualTo("profileId", fromId).get().await().documents.forEach { d ->
+                    val data = d.data ?: return@forEach
+                    val progress = data.toPlaybackProgress() ?: return@forEach
+                    col.document(histKey(toId, progress))
+                        .set(data + ("profileId" to toId)).await()
+                    runCatching { d.reference.delete().await() }
+                }
+            }.onFailure { Log.w(TAG, "reassign history $fromId->$toId failed", it) }
+        }
+    }
+
     suspend fun pullProfiles(): List<Profile> {
         val col = profileCol() ?: return emptyList()
         return runCatching {
@@ -257,17 +288,21 @@ class FirebaseSync @Inject constructor(
         "colorIndex" to colorIndex,
         "avatarIndex" to avatarIndex,
         "createdAt" to createdAt,
+        "updatedAt" to updatedAt,
     )
 
     private fun Map<String, Any?>.toProfile(): Profile? {
         val id = this["id"] as? String ?: return null
+        val createdAt = (this["createdAt"] as? Number)?.toLong() ?: 0L
         return Profile(
             id = id,
             name = this["name"] as? String ?: "",
             isKids = this["isKids"] as? Boolean ?: false,
             colorIndex = (this["colorIndex"] as? Number)?.toInt() ?: 0,
             avatarIndex = (this["avatarIndex"] as? Number)?.toInt() ?: 0,
-            createdAt = (this["createdAt"] as? Number)?.toLong() ?: 0L,
+            createdAt = createdAt,
+            // Older docs (pre-updatedAt) fall back to createdAt so they never win over a real edit.
+            updatedAt = (this["updatedAt"] as? Number)?.toLong() ?: createdAt,
         )
     }
 
