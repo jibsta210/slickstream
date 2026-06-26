@@ -100,9 +100,11 @@ class TorrentStreamerImpl @Inject constructor(
         val server = ensureServer()
         val streamUrl = server.urlFor(infoHash)
 
-        // Only mp4/m4v/mov MUST have the EOF moov atom present before ExoPlayer can parse a frame. mkv/
-        // webm/avi keep their index near the front, so they can START on the head alone — no tail wait.
-        val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS
+        // Only mp4/m4v/mov CAN need the EOF moov atom before ExoPlayer parses a frame — and even then,
+        // only when the moov is at the END (not a "faststart"/web-optimized file whose moov is up front
+        // in the head). mkv/webm/avi keep their index near the front and never wait. The faststart check
+        // needs head bytes, so it's resolved per-poll below.
+        val containerNeedsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS
 
         // BUFFERING phase.
         trySend(buildStatus(source, infoHash, StreamState.BUFFERING, streamUrl = null))
@@ -154,6 +156,8 @@ class TorrentStreamerImpl @Inject constructor(
                 // head can stay pinned below the gate (one slow early piece) so the head-keyed grace
                 // clock never even armed. After OVERALL_HARD_CAP_MS we start with whatever head exists
                 // and let the player's retries + the buffering watchdog take over.
+                // mp4 needs the EOF moov ONLY when it's not faststart (moov already up front in the head).
+                val needsTail = containerNeedsTail && engine.mp4MoovInHead(infoHash) != true
                 val tailReady = !needsTail || engine.tailAvailable(infoHash)
                 val tailGraceElapsed = headReadySince > 0L && now - headReadySince > TAIL_HARD_CAP_MS
                 val overallGrace = now - streamStartMs > OVERALL_HARD_CAP_MS

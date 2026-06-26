@@ -780,6 +780,51 @@ class TorrentEngine @Inject constructor(
     fun selectedFileExt(infoHash: String): String? =
         torrents[infoHash]?.filePath?.substringAfterLast('.', "")?.lowercase()?.takeIf { it.isNotBlank() }
 
+    /**
+     * For an mp4/m4v/mov: is the `moov` index up FRONT (a "faststart"/web-optimized file)? Walks the
+     * top-level boxes in the already-downloaded contiguous head:
+     *  - `true`  = `moov` appears before any media (`mdat`/`moof`) → the index is in the head, so we can
+     *    start WITHOUT the EOF tail (it streams in with the head),
+     *  - `false` = media comes first → the moov is at the END → the tail genuinely IS required,
+     *  - `null`  = not enough head yet to decide (caller stays conservative until it resolves).
+     * Reads the on-disk file directly (offset 0 = file start); only bytes within the contiguous head.
+     */
+    fun mp4MoovInHead(infoHash: String): Boolean? {
+        val active = torrents[infoHash] ?: return null
+        val path = active.filePath ?: return null
+        val head = contiguousHeadBytes(infoHash)
+        if (head < 16L) return null
+        return runCatching {
+            java.io.RandomAccessFile(path, "r").use { raf ->
+                var pos = 0L
+                val hdr = ByteArray(8)
+                while (pos + 8 <= head && pos < MP4_SCAN_LIMIT) {
+                    raf.seek(pos)
+                    if (raf.read(hdr, 0, 8) < 8) return@use null
+                    val size32 = ((hdr[0].toInt() and 0xFF) shl 24) or ((hdr[1].toInt() and 0xFF) shl 16) or
+                        ((hdr[2].toInt() and 0xFF) shl 8) or (hdr[3].toInt() and 0xFF)
+                    when (String(hdr, 4, 4, Charsets.US_ASCII)) {
+                        "moov" -> return@use true               // index up front → faststart, no tail wait
+                        "mdat", "moof" -> return@use false      // media before index → moov at EOF
+                    }
+                    val boxLen: Long = when {
+                        size32 == 1 -> {                        // 64-bit largesize
+                            if (pos + 16 > head) return@use null
+                            raf.seek(pos + 8); val lb = ByteArray(8)
+                            if (raf.read(lb, 0, 8) < 8) return@use null
+                            var s = 0L; for (b in lb) s = (s shl 8) or (b.toLong() and 0xFF); s
+                        }
+                        size32 == 0 -> return@use false         // box runs to EOF before moov
+                        else -> size32.toLong()
+                    }
+                    if (boxLen < 8L) return@use null
+                    pos += boxLen
+                }
+                null
+            }
+        }.getOrNull()
+    }
+
     /** Length in bytes of the selected file. */
     fun fileLength(infoHash: String): Long = torrents[infoHash]?.fileLength ?: 0L
 
@@ -965,6 +1010,10 @@ class TorrentEngine @Inject constructor(
          * 8 MB comfortably spans a feature-length moov so the whole atom is deadline-fetched up front. */
         const val HEAD_PRIORITY_BYTES = 6 * 1024 * 1024
         const val TAIL_PRIORITY_BYTES = 8 * 1024 * 1024
+
+        /** Cap on how far into the head we walk mp4 boxes looking for moov/mdat (ftyp+moov sit right at
+         *  the front of a faststart file, so this resolves almost immediately). */
+        const val MP4_SCAN_LIMIT = 64L * 1024 * 1024
 
         /** Minimum number of head pieces to deadline IN ORDER, regardless of piece size. On big-piece
          *  torrents a byte budget collapses to 1 piece, leaving only piece 0 time-critical while the
