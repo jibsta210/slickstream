@@ -273,10 +273,18 @@ class TorrentStreamerImpl @Inject constructor(
         // Make room if over budget, but never evict the playing torrent OR the one we're warming.
         runCatching { cache.enforceBudget(protectedHashes + infoHash) }
 
-        // Buffer a small head so first-frame is instant later, then park the torrent.
+        // Buffer a small head AND the moov tail (for non-faststart mp4) so first-frame is INSTANT when
+        // the user advances — warming the head alone left the reused torrent stalling on the EOF moov,
+        // exactly the gate the foreground stream waits on. mkv/webm + faststart mp4 need only the head.
+        // Container/needsTail is re-checked each tick: right after addMagnet, metadata (so the file
+        // extension) isn't known yet, so we can't decide once up front.
         val deadline = System.currentTimeMillis() + PREFETCH_BUDGET_MS
         while (currentCoroutineContext().isActive && System.currentTimeMillis() < deadline) {
-            if (engine.contiguousHeadBytes(infoHash) >= PREFETCH_HEAD_BYTES) break
+            val headReady = engine.contiguousHeadBytes(infoHash) >= PREFETCH_HEAD_BYTES
+            val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS &&
+                engine.mp4MoovInHead(infoHash) != true
+            val tailReady = !needsTail || engine.tailAvailable(infoHash)
+            if (headReady && tailReady) break
             delay(POLL_INTERVAL_MS)
         }
         // Park the warmed torrent — UNLESS a player has meanwhile started streaming it (Play pressed

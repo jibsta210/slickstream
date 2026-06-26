@@ -1452,6 +1452,11 @@ class PlayerViewModel @Inject constructor(
             progressTickJob?.cancel()
             bufferWatchdogJob?.cancel()
             stopActiveStream(removeFiles = false)
+            // Capture the next-episode torrent we PRE-WARMED before clearing it, so the source pick below
+            // can reuse it (its head + moov are already buffered) instead of re-ranking from scratch and
+            // possibly landing on a different, cold release — which is why "precache next episode" looked
+            // like it did nothing.
+            val warmedHash = prefetchedInfoHash
             prefetchJob?.cancel()
             prefetchedInfoHash = null
 
@@ -1492,8 +1497,10 @@ class PlayerViewModel @Inject constructor(
             // Fresh episode -> fresh failover budget over the new candidate list.
             triedInfoHashes.clear()
             failoverCount = 0
-            // Reuse the SAME torrent if this episode was already partly downloaded; else auto-pick.
-            val best = pickResumeOrPreferred(list, currentSeason, currentEpisode)
+            // Prefer the torrent we PRE-WARMED for this episode (instant start), then one we already
+            // partly downloaded, then a fresh auto-pick.
+            val best = warmedHash?.let { w -> list.firstOrNull { it.infoHash == w } }
+                ?: pickResumeOrPreferred(list, currentSeason, currentEpisode)
             startSource(best)
         }
     }
