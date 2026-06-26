@@ -129,6 +129,7 @@ fun TvPlayerScreen(
     val thumbnailVersion by viewModel.thumbnailVersion.collectAsStateWithLifecycle()
     val rebuffering by viewModel.rebuffering.collectAsStateWithLifecycle()
     val backdropUrl by viewModel.backdropUrl.collectAsStateWithLifecycle()
+    val upNext by viewModel.upNextEpisode.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -138,10 +139,14 @@ fun TvPlayerScreen(
     var scrubbing by remember { mutableStateOf(false) }
     // Fit (letterbox) vs Zoom (crop-to-fill) — toggled from the transport row.
     var zoomFill by remember { mutableStateOf(false) }
+    // "Up next" card near the end of an episode; dismissal resets whenever the episode changes.
+    var nearEnd by remember { mutableStateOf(false) }
+    var upNextDismissed by remember(currentSeasonNumber, currentEpisodeNumber) { mutableStateOf(false) }
 
     val rootFocus = remember { FocusRequester() }
     val playPauseFocus = remember { FocusRequester() }
     val scrubFocus = remember { FocusRequester() }
+    val upNextFocus = remember { FocusRequester() }
 
     // Track play state for the toggle icon.
     DisposableEffect(player) {
@@ -156,6 +161,35 @@ fun TvPlayerScreen(
 
     val anyPanelOpen = panelOpen || subsPanelOpen || episodesPanelOpen
 
+    // The "Up next" card shows when we're near the end of a TV episode that has a next one, the user
+    // hasn't dismissed it, and the transport isn't up (the card owns focus when it's visible).
+    val showUpNext = nearEnd && hasNext && upNext != null && !upNextDismissed &&
+        !controlsVisible && uiState is PlayerUiState.Playing
+
+    // Poll position ~1/s to learn when we've crossed UP_NEXT_PCT. Movies / no-next never qualify.
+    LaunchedEffect(player, uiState) {
+        if (uiState !is PlayerUiState.Playing) {
+            nearEnd = false
+            return@LaunchedEffect
+        }
+        while (true) {
+            val p = player
+            nearEnd = p != null && p.duration > 0 &&
+                p.currentPosition.toFloat() / p.duration >= UP_NEXT_PCT
+            kotlinx.coroutines.delay(1000)
+        }
+    }
+    // Land focus on the card's "Play now" the moment it appears so it's immediately D-pad operable.
+    // Retry past the slide-in animation — a single requestFocus can fire before the button is attached.
+    LaunchedEffect(showUpNext) {
+        if (showUpNext) {
+            repeat(12) {
+                kotlinx.coroutines.delay(50)
+                if (runCatching { upNextFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
+    }
+
     // Auto-hide the transport overlay after a few seconds of no interaction (never while a panel is
     // open or a scrub is in progress).
     LaunchedEffect(controlsVisible, anyPanelOpen, scrubbing) {
@@ -168,8 +202,8 @@ fun TvPlayerScreen(
     // When the controls are hidden (and no panel is open) there is no focusable
     // overlay target, so pull focus back to the root Box. Its onPreviewKeyEvent then
     // receives any D-pad press and re-shows the transport.
-    LaunchedEffect(controlsVisible, anyPanelOpen) {
-        if (!controlsVisible && !anyPanelOpen) {
+    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext) {
+        if (!controlsVisible && !anyPanelOpen && !showUpNext) {
             rootFocus.requestFocus()
         }
     }
@@ -179,6 +213,8 @@ fun TvPlayerScreen(
             episodesPanelOpen -> episodesPanelOpen = false
             subsPanelOpen -> subsPanelOpen = false
             panelOpen -> panelOpen = false
+            // Back on the Up-next card just hides it (keep watching the tail of the episode).
+            showUpNext -> upNextDismissed = true
             // While buffering/fetching or errored there's no transport to dismiss — leave at once.
             uiState !is PlayerUiState.Playing -> onBack()
             controlsVisible -> controlsVisible = false
@@ -207,8 +243,9 @@ fun TvPlayerScreen(
                     Key.MediaStop -> { onBack(); true }
                     Key.Back -> false   // never swallow Back, or buffering/error states would trap the user
                     else -> {
-                        // Any other D-pad press just re-shows the transport (while playing).
-                        if (!controlsVisible && !anyPanelOpen && uiState is PlayerUiState.Playing) {
+                        // Any other D-pad press just re-shows the transport (while playing) — UNLESS the
+                        // Up-next card is up, in which case the press belongs to the card's buttons.
+                        if (!controlsVisible && !anyPanelOpen && !showUpNext && uiState is PlayerUiState.Playing) {
                             controlsVisible = true
                             true
                         } else {
@@ -368,6 +405,23 @@ fun TvPlayerScreen(
                     playheadFraction = playheadFrac,
                     stats = stats,
                     modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                )
+            }
+        }
+
+        // "Up next" card — slides in near the end of an episode with the next one's art + title.
+        AnimatedVisibility(
+            visible = showUpNext,
+            enter = slideInHorizontally { it } + fadeIn(),
+            exit = slideOutHorizontally { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 32.dp, bottom = 32.dp),
+        ) {
+            upNext?.let { ep ->
+                TvUpNextCard(
+                    episode = ep,
+                    playFocus = upNextFocus,
+                    onPlay = { viewModel.nextEpisode() },
+                    onDismiss = { upNextDismissed = true },
                 )
             }
         }
@@ -584,6 +638,63 @@ private fun ErrorOverlay(
                 ErrorButton("Try again", onClick = onRetry, focusRequester = retryFocus)
                 if (canSwitchSource) ErrorButton("Other streams", onClick = onSwitchSource)
                 ErrorButton("Back", onClick = onBack)
+            }
+        }
+    }
+}
+
+/** Fraction of the runtime after which the "Up next" card appears (the user's "~90% played"). */
+private const val UP_NEXT_PCT = 0.90f
+
+/**
+ * "Up next" card: the next episode's still + title with a focusable "Play now" / "Dismiss". Shown near
+ * the end of a TV episode; "Play now" jumps straight to the next episode (the natural end-of-file
+ * auto-advance still fires if the user just lets it ride).
+ */
+@Composable
+private fun TvUpNextCard(
+    episode: Episode,
+    playFocus: FocusRequester,
+    onPlay: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color.Black.copy(alpha = 0.88f))
+            .width(440.dp)
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        if (!episode.stillUrl.isNullOrBlank()) {
+            AsyncImage(
+                model = episode.stillUrl,
+                contentDescription = null,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.size(150.dp, 84.dp).clip(RoundedCornerShape(8.dp)),
+            )
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                "Up next",
+                style = MaterialTheme.typography.labelMedium,
+                color = Brand.Cyan,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "S${episode.seasonNumber}E${episode.episodeNumber} · ${episode.name}",
+                style = MaterialTheme.typography.titleSmall,
+                color = Color.White,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ErrorButton("Play now", onClick = onPlay, focusRequester = playFocus)
+                ErrorButton("Dismiss", onClick = onDismiss)
             }
         }
     }

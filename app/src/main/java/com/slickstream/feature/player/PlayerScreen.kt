@@ -136,6 +136,7 @@ fun PlayerScreen(
     val thumbnailVersion by viewModel.thumbnailVersion.collectAsState()
     val rebuffering by viewModel.rebuffering.collectAsState()
     val backdropUrl by viewModel.backdropUrl.collectAsState()
+    val upNext by viewModel.upNextEpisode.collectAsState()
     val context = LocalContext.current
 
     // Scrub-preview: the ms position the user is dragging the built-in time bar to (null = not
@@ -154,6 +155,10 @@ fun PlayerScreen(
     // Fit (letterbox) vs Zoom (crop-to-fill) — survives rotation so entering fullscreen keeps the
     // user's choice. Applied to PlayerView.resizeMode in the AndroidView update block.
     var zoomFill by rememberSaveable { mutableStateOf(false) }
+
+    // "Up next" card near the end of an episode; dismissal resets whenever the episode changes.
+    var nearEnd by remember { mutableStateOf(false) }
+    var upNextDismissed by remember(currentSeasonNumber, currentEpisodeNumber) { mutableStateOf(false) }
 
     // Fullscreen + Picture-in-Picture
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
@@ -270,6 +275,20 @@ fun PlayerScreen(
             if (overlayVisible && uiState is PlayerUiState.Playing && !isInPip && !isCasting) {
                 delay(AUTO_HIDE_MS)
                 overlayVisible = false
+            }
+        }
+
+        // Poll position ~1/s to learn when we're near the end (movies / no-next never qualify).
+        LaunchedEffect(player, uiState) {
+            if (uiState !is PlayerUiState.Playing) {
+                nearEnd = false
+                return@LaunchedEffect
+            }
+            while (true) {
+                val p = player
+                nearEnd = p != null && p.duration > 0 &&
+                    p.currentPosition.toFloat() / p.duration >= UP_NEXT_PCT
+                delay(1000)
             }
         }
 
@@ -415,6 +434,25 @@ fun PlayerScreen(
                     )
                 }
             }
+
+            // "Up next" card near the end of an episode — tap "Play now" to jump to the next one (the
+            // end-of-file auto-advance still fires if the user just lets it play out).
+            val showUpNext = nearEnd && hasNext && upNext != null && !upNextDismissed &&
+                uiState is PlayerUiState.Playing && !isCasting
+            AnimatedVisibility(
+                visible = showUpNext,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 90.dp),
+            ) {
+                upNext?.let { ep ->
+                    PhoneUpNextCard(
+                        episode = ep,
+                        onPlay = { viewModel.nextEpisode() },
+                        onDismiss = { upNextDismissed = true },
+                    )
+                }
+            }
         }
     }
 
@@ -479,6 +517,80 @@ fun PlayerScreen(
                     }
                 },
             )
+        }
+    }
+}
+
+/** Fraction of the runtime after which the "Up next" card appears (the user's "~90% played"). */
+private const val UP_NEXT_PCT = 0.90f
+
+/**
+ * Phone "Up next" card: the next episode's still + title with tappable Play now / Dismiss. Shown near
+ * the end of a TV episode; "Play now" jumps to the next episode (the end-of-file auto-advance still
+ * fires if the user just lets it play out).
+ */
+@Composable
+private fun PhoneUpNextCard(
+    episode: Episode,
+    onPlay: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.Black.copy(alpha = 0.88f))
+            .width(360.dp)
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (!episode.stillUrl.isNullOrBlank()) {
+            coil.compose.AsyncImage(
+                model = episode.stillUrl,
+                contentDescription = null,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.size(112.dp, 63.dp).clip(RoundedCornerShape(8.dp)),
+            )
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text("Up next", color = Brand.Cyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text(
+                "S${episode.seasonNumber}E${episode.episodeNumber} · ${episode.name}",
+                color = Color.White,
+                fontSize = 14.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Play now",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Brand.Violet)
+                        .clickable(onClick = onPlay)
+                        .padding(horizontal = 18.dp, vertical = 8.dp),
+                )
+                Text(
+                    "Dismiss",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Color.White.copy(alpha = 0.12f))
+                        .clickable(onClick = onDismiss)
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+            }
         }
     }
 }

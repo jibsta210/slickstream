@@ -199,6 +199,11 @@ class PlayerViewModel @Inject constructor(
     private val _hasPrevious = MutableStateFlow(false)
     val hasPrevious: StateFlow<Boolean> = _hasPrevious.asStateFlow()
 
+    /** Metadata (title + still) for the NEXT episode, resolved on load / episode switch so the player
+     *  can show an "Up next" card near the end. Null for movies or at the series finale. */
+    private val _upNextEpisode = MutableStateFlow<Episode?>(null)
+    val upNextEpisode: StateFlow<Episode?> = _upNextEpisode.asStateFlow()
+
     // --- Internal -----------------------------------------------------------
     private var details: MediaDetails? = null
     private var streamJob: Job? = null
@@ -1302,11 +1307,21 @@ class PlayerViewModel @Inject constructor(
         if (d == null || s == null || e == null) {
             _hasNext.value = false
             _hasPrevious.value = false
+            _upNextEpisode.value = null
             return
         }
-        _hasNext.value = nextEpisodeCoords(d, s, e) != null
+        val nextCoords = nextEpisodeCoords(d, s, e)
+        _hasNext.value = nextCoords != null
         _hasPrevious.value = previousEpisodeCoords(d, s, e) != null
+        // Resolve the next episode's title/still for the "Up next" card (getEpisodes is cached).
+        _upNextEpisode.value = nextCoords?.let { (ns, ne) -> fetchEpisodeMeta(ns, ne) }
     }
+
+    private suspend fun fetchEpisodeMeta(season: Int, episode: Int): Episode? =
+        when (val r = catalogRepository.getEpisodes(mediaId, season)) {
+            is DataResult.Success -> r.data.firstOrNull { it.episodeNumber == episode }
+            is DataResult.Error -> null
+        }
 
     /**
      * Switch playback to a specific episode of this series: save the current spot, tear down the
