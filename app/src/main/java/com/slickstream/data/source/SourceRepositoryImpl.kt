@@ -69,7 +69,7 @@ class SourceRepositoryImpl @Inject constructor(
             // (e.g. a Spanish-only foreign film), and only to the raw list if even that is empty.
             val movieTitle = details.item.title
             val english = sources.filter {
-                it.englishLikely && StreamPicker.noForeignLanguageTag(it.title, movieTitle)
+                it.englishLikely && StreamPicker.noForeignTag(it.title, movieTitle)
             }
             val filtered = english.ifEmpty {
                 sources.filterNot { StreamPicker.hasNonLatin(it.title) }.ifEmpty { sources }

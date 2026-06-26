@@ -122,15 +122,17 @@ object StreamPicker {
     private val NON_WORD = Regex("[^\\p{L}0-9]+")
 
     /**
-     * True unless a bare foreign language-NAME survives once the movie's OWN title words are removed.
-     * So "The French Dispatch" keeps 'french' (a title word → stripped → fine), but a ".SPANISH." dub
-     * of an English film leaves 'spanish' behind → rejected. Pairs with [looksEnglish] (which handles
-     * non-Latin scripts, flags, native words and codes) for the full English-only decision.
+     * True only if NO foreign-language marker — a language CODE/native word ([FOREIGN]: ita, spa,
+     * castellano…) OR a bare language NAME ([LANG_NAME]) — survives once the movie's OWN title words
+     * are removed. So "The French Dispatch" keeps 'french' (a title word → stripped → fine), but a
+     * ".ITA.ENG." dual-audio or ".SPANISH." dub leaves the foreign tag behind → rejected, even when it
+     * ALSO tags English (an English-only viewer doesn't want a release whose first audio track is
+     * Italian). Pairs with [looksEnglish]/[hasNonLatin] for the full English-only decision.
      */
-    fun noForeignLanguageTag(sourceText: String, movieTitle: String): Boolean {
+    fun noForeignTag(sourceText: String, movieTitle: String): Boolean {
         val titleWords = movieTitle.lowercase().split(NON_WORD).filter { it.length >= 3 }.toSet()
         val rest = sourceText.split(NON_WORD).filterNot { it.lowercase() in titleWords }.joinToString(" ")
-        return !LANG_NAME.containsMatchIn(rest)
+        return !FOREIGN.containsMatchIn(rest) && !LANG_NAME.containsMatchIn(rest)
     }
 
     // Codecs/containers Android's ExoPlayer cannot decode without the FFmpeg extension: XviD/DivX

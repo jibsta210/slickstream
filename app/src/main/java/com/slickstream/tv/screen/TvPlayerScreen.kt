@@ -426,13 +426,14 @@ fun TvPlayerScreen(
             }
         }
 
-        // Torrent chunk bar pinned to the very bottom edge, shown with the transport. Lets the viewer
-        // watch the file fill in (downloaded slices vs the playhead). Polled ~1/s.
-        if (uiState is PlayerUiState.Playing) {
+        // Torrent chunk bar pinned to the bottom edge. Shown during BUFFERING too (over the loading
+        // overlay) so you can SEE what's downloading while it starts up — diagnose a stuck head vs a
+        // scattered download. While Playing it rides with the transport. Polled ~1/s.
+        if (uiState is PlayerUiState.Playing || uiState is PlayerUiState.Buffering) {
             var pieceMap by remember { mutableStateOf(FloatArray(0)) }
             var playheadFrac by remember { mutableStateOf(0f) }
             var stats by remember { mutableStateOf<com.slickstream.feature.player.StreamStats?>(null) }
-            LaunchedEffect(player) {
+            LaunchedEffect(Unit) {
                 while (true) {
                     pieceMap = viewModel.pieceMap(com.slickstream.feature.player.PIECE_BAR_BUCKETS)
                     stats = viewModel.streamStats()
@@ -442,8 +443,10 @@ fun TvPlayerScreen(
                     kotlinx.coroutines.delay(1000)
                 }
             }
+            // During buffering the bar is always up (no transport to ride with); while playing it
+            // appears/hides with the controls.
             AnimatedVisibility(
-                visible = controlsVisible,
+                visible = uiState is PlayerUiState.Buffering || controlsVisible,
                 enter = fadeIn(),
                 exit = fadeOut(),
                 modifier = Modifier.align(Alignment.BottomCenter),
