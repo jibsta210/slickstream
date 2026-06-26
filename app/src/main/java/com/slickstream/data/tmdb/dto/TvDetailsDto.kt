@@ -21,10 +21,25 @@ data class TvDetailsDto(
     @SerialName("episode_run_time") val episodeRunTime: List<Int> = emptyList(),
     @SerialName("genres") val genres: List<GenreDto> = emptyList(),
     @SerialName("seasons") val seasons: List<SeasonSummaryDto> = emptyList(),
+    @SerialName("last_episode_to_air") val lastEpisodeToAir: EpisodeToAirDto? = null,
+    @SerialName("next_episode_to_air") val nextEpisodeToAir: EpisodeToAirDto? = null,
 
     // appended
     @SerialName("credits") val credits: CreditsDto? = null,
     @SerialName("external_ids") val externalIds: ExternalIdsDto? = null,
+)
+
+/** The series' most-recently-aired / next-scheduled episode, returned inline on tv details — lets us
+ *  spot a fresh episode without enumerating every season. */
+@Serializable
+data class EpisodeToAirDto(
+    @SerialName("season_number") val seasonNumber: Int = 0,
+    @SerialName("episode_number") val episodeNumber: Int = 0,
+    @SerialName("name") val name: String? = null,
+    @SerialName("overview") val overview: String? = null,
+    @SerialName("air_date") val airDate: String? = null,
+    @SerialName("still_path") val stillPath: String? = null,
+    @SerialName("runtime") val runtime: Int? = null,
 )
 
 /** A season entry embedded in tv details. */

@@ -3,8 +3,11 @@ package com.slickstream.feature.home
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.slickstream.core.model.DataResult
+import com.slickstream.core.model.FavoriteItem
+import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
+import com.slickstream.core.model.PlaybackProgress
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.core.model.hasAired
 import com.slickstream.core.model.isoToday
@@ -29,6 +32,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -50,6 +54,9 @@ data class HomeUiState(
     val errorMessage: String? = null,
     val featured: MediaItem? = null,
     val continueWatching: List<WatchHistoryItem> = emptyList(),
+    /** Favourite shows you're CAUGHT UP on that just got a fresh episode (within the last few weeks).
+     *  Each row's [WatchHistoryItem.progress] points at the new episode (0%), ready to play. */
+    val newEpisodes: List<WatchHistoryItem> = emptyList(),
     val rows: List<MediaRowUi> = emptyList(),
 ) {
     val isEmpty: Boolean get() = featured == null && rows.isEmpty()
@@ -88,11 +95,94 @@ class HomeViewModel @Inject constructor(
             .map { (it.upNextPercent / 100f) to (it.movieBarPercent / 100f) }
             .distinctUntilChanged()
 
+    /** Coarse "what's been watched" signal: a key per (show, season, episode, finished?) row. It changes
+     *  only when an episode is added/removed or its FINISHED state flips — NOT on every position tick — so
+     *  the new-episodes resolve (which fans out to the catalog) doesn't re-run every ~10s during playback. */
+    private val watchedSignal: Flow<Set<String>> =
+        libraryRepository.observeHistory()
+            .map { rows ->
+                rows.mapTo(HashSet()) {
+                    "${it.media.id}:${it.progress.season}:${it.progress.episode}:${it.progress.isFinished}"
+                }
+            }
+            .distinctUntilChanged()
+
+    /**
+     * "New Episodes" rail: a favourite show you're CAUGHT UP on just got a fresh episode. Resolved from
+     * the active profile's favourites + TMDB's last_episode_to_air, re-run when favourites change or when
+     * an episode is finished/added (via [watchedSignal] — the actual progress is read per-show below).
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val newEpisodes: StateFlow<List<WatchHistoryItem>> =
+        combine(libraryRepository.observeFavorites(), watchedSignal) { favs, _ -> favs }
+            .mapLatest { favs -> resolveNewEpisodes(favs) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val newEpisodeIds: Flow<Set<Int>> = newEpisodes.map { list -> list.mapTo(HashSet()) { it.media.id } }
+
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val continueWatching: StateFlow<List<WatchHistoryItem>> =
-        combine(rawHistory, endThresholds) { rows, th -> rows to th }
-            .mapLatest { (rows, th) -> resolveContinueWatching(rows, th.first, th.second) }
+        combine(rawHistory, endThresholds, newEpisodeIds) { rows, th, newIds -> Triple(rows, th, newIds) }
+            .mapLatest { (rows, th, newIds) ->
+                // A caught-up favourite with a fresh episode lives on the "New Episodes" rail, NOT here —
+                // exclude those show ids so the same title isn't shown twice.
+                resolveContinueWatching(rows, th.first, th.second).filterNot { it.media.id in newIds }
+            }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private suspend fun resolveNewEpisodes(favorites: List<FavoriteItem>): List<WatchHistoryItem> = coroutineScope {
+        val today = isoToday()
+        val cutoff = isoDaysAgo(NEW_EPISODE_WINDOW_DAYS)
+        favorites
+            .filter { it.media.mediaType == MediaType.TV }
+            .map { fav -> async { runCatching { resolveNewEpisodeFor(fav.media, today, cutoff) }.getOrNull() } }
+            .awaitAll()
+            .filterNotNull()
+    }
+
+    /**
+     * Is [show]'s latest aired episode a "new drop" the user is ready for? Yes only when it aired within
+     * the window, the user hasn't started it, AND they're CAUGHT UP (finished the episode right before it,
+     * or it's the series premiere). No point flagging S3E8 to someone still on S1E1 — that's a backlog,
+     * which Continue Watching already handles.
+     */
+    private suspend fun resolveNewEpisodeFor(show: MediaItem, today: String, cutoff: String): WatchHistoryItem? {
+        val details = (catalogRepository.getDetails(show.id, MediaType.TV) as? DataResult.Success)?.data ?: return null
+        val last = details.lastEpisodeToAir ?: return null
+        val air = last.airDate ?: return null
+        if (air > today || air < cutoff) return null                         // not aired yet, or too old to be "new"
+        val ls = last.seasonNumber
+        val le = last.episodeNumber
+        // Already started/watched it → it's a Continue-Watching item, not a fresh surprise.
+        if (libraryRepository.getProgress(show.id, MediaType.TV, ls, le) != null) return null
+        val pred = predecessorEpisode(details, ls, le)
+        val caughtUp = pred == null ||
+            libraryRepository.getProgress(show.id, MediaType.TV, pred.first, pred.second)?.isFinished == true
+        if (!caughtUp) return null
+        return WatchHistoryItem(
+            media = show,
+            progress = PlaybackProgress(
+                mediaId = show.id, mediaType = MediaType.TV,
+                season = ls, episode = le,
+                positionMs = 0L, durationMs = 0L, updatedAt = 0L,
+            ),
+        )
+    }
+
+    /** The episode immediately before [season]/[episode]: same-season -1, else the last episode of the
+     *  previous real season (episode counts from [MediaDetails.seasons]). Null at the series premiere. */
+    private fun predecessorEpisode(details: MediaDetails, season: Int, episode: Int): Pair<Int, Int>? {
+        if (episode > 1) return season to (episode - 1)
+        val prevSeason = details.seasons.map { it.seasonNumber }.filter { it in 1 until season }.maxOrNull() ?: return null
+        val count = details.seasons.firstOrNull { it.seasonNumber == prevSeason }?.episodeCount ?: return null
+        return if (count > 0) prevSeason to count else null
+    }
+
+    private fun isoDaysAgo(days: Int): String {
+        val cal = java.util.Calendar.getInstance()
+        cal.add(java.util.Calendar.DAY_OF_YEAR, -days)
+        return java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(cal.time)
+    }
 
     /**
      * Turn raw history into the Continue-Watching rail:
@@ -158,9 +248,13 @@ class HomeViewModel @Inject constructor(
     private var kidsMode: Boolean = false
 
     init {
-        // Keep the continue-watching row in sync with the local library + settings at all times.
+        // Keep the continue-watching + new-episodes rows in sync with the library + settings at all times
+        // (atomic update so the two collectors can't clobber each other's slice of the state).
         continueWatching
-            .onEach { items -> _uiState.value = _uiState.value.copy(continueWatching = items) }
+            .onEach { items -> _uiState.update { it.copy(continueWatching = items) } }
+            .launchIn(viewModelScope)
+        newEpisodes
+            .onEach { items -> _uiState.update { it.copy(newEpisodes = items) } }
             .launchIn(viewModelScope)
 
         // Re-load Home whenever the active profile's identity OR kids-ness changes (a switch to a
@@ -301,5 +395,8 @@ class HomeViewModel @Inject constructor(
         const val GENRE_FAMILY = 10751
         const val GENRE_ANIMATION = 16
         const val GENRE_TV_KIDS = 10762
+
+        /** How recently a favourite's latest episode must have aired to count as a "new" drop. */
+        const val NEW_EPISODE_WINDOW_DAYS = 21
     }
 }

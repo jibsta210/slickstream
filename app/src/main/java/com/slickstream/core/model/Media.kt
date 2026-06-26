@@ -82,4 +82,8 @@ data class MediaDetails(
     val numberOfSeasons: Int? = null,
     val status: String? = null,
     val imdbId: String?,             // required to resolve torrent sources
+    /** TV only: the most-recently-aired and next-scheduled episodes (TMDB inline). Lets the home
+     *  "New Episodes" rail spot a fresh drop without enumerating every season. Null for movies. */
+    val lastEpisodeToAir: Episode? = null,
+    val nextEpisodeToAir: Episode? = null,
 )

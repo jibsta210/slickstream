@@ -133,6 +133,22 @@ private fun HomeContent(
         { item -> historyByMediaId[item.id]?.let(onResume) }
     }
 
+    // "New Episodes": favourites you're caught up on that just dropped a fresh episode. progress already
+    // points at the new episode, so a tap resumes straight into it (same onResume plumbing).
+    val newEpisodeItems: List<MediaItem> = remember(state.newEpisodes) {
+        state.newEpisodes.map { h ->
+            val s = h.progress.season
+            val e = h.progress.episode
+            if (s != null && e != null) h.media.copy(title = "${h.media.title} · New S${s}E$e") else h.media
+        }
+    }
+    val newEpisodeById: Map<Int, WatchHistoryItem> = remember(state.newEpisodes) {
+        state.newEpisodes.associateBy { it.media.id }
+    }
+    val onNewEpisodeClick: (MediaItem) -> Unit = remember(newEpisodeById, onResume) {
+        { item -> newEpisodeById[item.id]?.let(onResume) }
+    }
+
     // Land focus on the hero Play button on entry (it was unfocused, so Play looked inert until you
     // pressed Enter). Focusing it also pauses the carousel auto-advance — the right 10-ft behavior.
     val heroPlayFocus = remember { FocusRequester() }
@@ -158,6 +174,17 @@ private fun HomeContent(
                     onPlay = onPlayClick,
                     onDetails = onMediaClick,
                     playFocus = heroPlayFocus,
+                )
+            }
+        }
+
+        if (newEpisodeItems.isNotEmpty()) {
+            item(key = "new-episodes") {
+                TvMediaRow(
+                    title = "New Episodes",
+                    items = newEpisodeItems,
+                    onItemClick = onNewEpisodeClick,
+                    wide = true,
                 )
             }
         }

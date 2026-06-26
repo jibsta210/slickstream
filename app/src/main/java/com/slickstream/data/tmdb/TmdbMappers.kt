@@ -10,6 +10,7 @@ import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.Season
 import com.slickstream.data.tmdb.dto.CastDto
 import com.slickstream.data.tmdb.dto.EpisodeDto
+import com.slickstream.data.tmdb.dto.EpisodeToAirDto
 import com.slickstream.data.tmdb.dto.GenreDto
 import com.slickstream.data.tmdb.dto.MediaListItemDto
 import com.slickstream.data.tmdb.dto.MovieDetailsDto
@@ -163,5 +164,17 @@ internal fun TvDetailsDto.toDomain(): MediaDetails {
         numberOfSeasons = numberOfSeasons,
         status = status,
         imdbId = imdb,
+        lastEpisodeToAir = lastEpisodeToAir?.toDomain(),
+        nextEpisodeToAir = nextEpisodeToAir?.toDomain(),
     )
 }
+
+private fun EpisodeToAirDto.toDomain(): Episode = Episode(
+    seasonNumber = seasonNumber,
+    episodeNumber = episodeNumber,
+    name = name.orEmpty(),
+    overview = overview.orEmpty(),
+    stillUrl = Img.url(stillPath, Img.BACKDROP),
+    airDate = airDate,
+    runtimeMinutes = runtime,
+)

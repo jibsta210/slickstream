@@ -119,6 +119,22 @@ private fun HomeContent(
         { item -> progressByMediaId[item.id] }
     }
 
+    // "New Episodes": favourites you're caught up on that just got a fresh episode. progress already
+    // points at the new episode, so tapping resumes straight into it (same onResumeClick plumbing).
+    val newEpisodeItems: List<MediaItem> = remember(state.newEpisodes) {
+        state.newEpisodes.map { h ->
+            val s = h.progress.season
+            val e = h.progress.episode
+            if (s != null && e != null) h.media.copy(title = "${h.media.title} · New S${s}E$e") else h.media
+        }
+    }
+    val newEpisodeById: Map<Int, WatchHistoryItem> = remember(state.newEpisodes) {
+        state.newEpisodes.associateBy { it.media.id }
+    }
+    val onNewEpisodeClick: (MediaItem) -> Unit = remember(newEpisodeById, onResumeClick) {
+        { item -> newEpisodeById[item.id]?.let(onResumeClick) }
+    }
+
     LazyColumn(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(20.dp),
@@ -130,6 +146,17 @@ private fun HomeContent(
                     item = featured,
                     onPlay = onPlayClick,
                     onDetails = onMediaClick,
+                )
+            }
+        }
+
+        if (newEpisodeItems.isNotEmpty()) {
+            item(key = "new-episodes") {
+                MediaRow(
+                    title = "New Episodes",
+                    items = newEpisodeItems,
+                    onItemClick = onNewEpisodeClick,
+                    wide = true,
                 )
             }
         }
