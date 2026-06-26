@@ -253,6 +253,14 @@ fun TvApp() {
                                         launchSingleTop = true
                                     }
                                 },
+                                // End-of-series suggestion: open the picked show's details (you choose
+                                // where to start). Replace the finished player so Back returns to browse.
+                                onOpenDetails = { type, id ->
+                                    navController.navigate(Routes.details(type, id)) {
+                                        popUpTo(Routes.PLAYER) { inclusive = true }
+                                        launchSingleTop = true
+                                    }
+                                },
                             )
                         }
                     }

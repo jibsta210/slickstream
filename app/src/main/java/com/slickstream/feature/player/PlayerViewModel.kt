@@ -348,7 +348,8 @@ class PlayerViewModel @Inject constructor(
      *  callback (wired in ensureCastPlayer) drives transferToLocal() at the cast position. */
     fun stopCasting() = castManager.stopCasting(stopReceiver = true)
 
-    /** Fetch TMDB "similar" titles for the end-of-movie autoplay bar (non-critical; ignore failures). */
+    /** Fetch TMDB "similar" titles for the end-of-content suggestion bar — similar films at the end of a
+     *  movie, or similar shows at the end of the available series (non-critical; ignore failures). */
     private suspend fun loadSimilarMovies() {
         when (val r = catalogRepository.getSimilar(mediaId, mediaType)) {
             is DataResult.Success -> _similarMovies.value = r.data.filter { it.posterUrl != null }.take(12)
@@ -1381,6 +1382,12 @@ class PlayerViewModel @Inject constructor(
         _hasPrevious.value = previousEpisodeCoords(d, s, e) != null
         // Resolve the next episode's title/still for the "Up next" card (getEpisodes is cached).
         _upNextEpisode.value = nextCoords?.let { (ns, ne) -> fetchEpisodeMeta(ns, ne) }
+        // End of the AVAILABLE series (last aired episode, no next) → fetch "similar shows" so the
+        // player can offer an end-of-series suggestion bar (mirrors the end-of-movie bar). Loaded once,
+        // lazily, only here — never during a normal mid-series binge.
+        if (nextCoords == null && _similarMovies.value.isEmpty()) {
+            viewModelScope.launch { loadSimilarMovies() }
+        }
     }
 
     private suspend fun fetchEpisodeMeta(season: Int, episode: Int): Episode? =

@@ -118,6 +118,7 @@ fun TvPlayerScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     onPlayMedia: (com.slickstream.core.model.MediaType, Int) -> Unit = { _, _ -> },
+    onOpenDetails: (com.slickstream.core.model.MediaType, Int) -> Unit = { _, _ -> },
     viewModel: PlayerViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -184,24 +185,37 @@ fun TvPlayerScreen(
     val showUpNext = nearEnd && hasNext && upNext != null && !upNextDismissed &&
         !controlsVisible && uiState is PlayerUiState.Playing
 
-    // End-of-movie: a bottom bar of similar titles that autoplays the most-related (Prime-style).
-    // Movies use a LATER threshold than episodes — a 2-hour film's last 5% is still ~6 minutes.
-    val showMovieBar = viewModel.isMovie && movieNearEnd && similarMovies.isNotEmpty() &&
-        !movieBarDismissed && !controlsVisible && uiState is PlayerUiState.Playing
+    // End-of-AVAILABLE-series: a TV show whose last AIRED episode has no next one (future episodes
+    // exist but can't stream). Treated like the end of a movie — a suggestion bar instead of "Up next".
+    val seriesEnd = !viewModel.isMovie && !hasNext
+
+    // Bottom suggestion bar of similar titles (Prime-style). Shows at the end of a MOVIE (similar films,
+    // autoplay the top pick) OR the end of the available SERIES (similar shows; if nothing is picked we
+    // return to the UI rather than autoplaying a whole other show). Movies use a LATER threshold than
+    // episodes — a 2-hour film's last 5% is still ~6 minutes; the series-end case is an episode, so it
+    // uses the episode threshold.
+    val showSimilarBar = similarMovies.isNotEmpty() && !movieBarDismissed &&
+        !controlsVisible && uiState is PlayerUiState.Playing &&
+        ((viewModel.isMovie && movieNearEnd) || (seriesEnd && nearEnd))
 
     // Autoplay countdown: ARMS only in the final stretch (so a movie isn't cut off at 93%), and ticks
-    // only until the user browses the row — then it waits for an explicit OK.
-    LaunchedEffect(showMovieBar, movieBarTouched, endingSoon) {
-        if (!showMovieBar || movieBarTouched || !endingSoon) return@LaunchedEffect
+    // only until the user browses the row — then it waits for an explicit OK. At expiry a movie plays
+    // the focused similar film; the end of a series simply returns to the UI ("nothing picked").
+    LaunchedEffect(showSimilarBar, movieBarTouched, endingSoon) {
+        if (!showSimilarBar || movieBarTouched || !endingSoon) return@LaunchedEffect
         movieAutoplaySecs = MOVIE_AUTOPLAY_SECS
         while (movieAutoplaySecs > 0) {
             kotlinx.coroutines.delay(1000)
             movieAutoplaySecs--
         }
-        similarMovies.getOrNull(movieBarFocused)?.let { onPlayMedia(it.mediaType, it.id) }
+        if (viewModel.isMovie) {
+            similarMovies.getOrNull(movieBarFocused)?.let { onPlayMedia(it.mediaType, it.id) }
+        } else {
+            onBack()   // finished the available series and picked nothing → back to the UI
+        }
     }
-    LaunchedEffect(showMovieBar) {
-        if (showMovieBar) runCatching { movieBarFocus.requestFocus() }
+    LaunchedEffect(showSimilarBar) {
+        if (showSimilarBar) runCatching { movieBarFocus.requestFocus() }
     }
 
     // Poll position ~1/s to learn when we've crossed UP_NEXT_PCT. Movies / no-next never qualify.
@@ -255,8 +269,8 @@ fun TvPlayerScreen(
     // When the controls are hidden (and no panel is open) there is no focusable
     // overlay target, so pull focus back to the root Box. Its onPreviewKeyEvent then
     // receives any D-pad press and re-shows the transport.
-    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showMovieBar) {
-        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showMovieBar) {
+    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showSimilarBar) {
+        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showSimilarBar) {
             rootFocus.requestFocus()
         }
     }
@@ -268,7 +282,7 @@ fun TvPlayerScreen(
             panelOpen -> panelOpen = false
             // Back on the Up-next card / movie bar just hides it (keep watching the tail).
             showUpNext -> upNextDismissed = true
-            showMovieBar -> movieBarDismissed = true
+            showSimilarBar -> movieBarDismissed = true
             // While buffering/fetching or errored there's no transport to dismiss — leave at once.
             uiState !is PlayerUiState.Playing -> onBack()
             controlsVisible -> controlsVisible = false
@@ -299,7 +313,7 @@ fun TvPlayerScreen(
                     else -> {
                         // Any other D-pad press just re-shows the transport (while playing) — UNLESS the
                         // Up-next card is up, in which case the press belongs to the card's buttons.
-                        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showMovieBar && uiState is PlayerUiState.Playing) {
+                        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showSimilarBar && uiState is PlayerUiState.Playing) {
                             controlsVisible = true
                             true
                         } else {
@@ -485,7 +499,7 @@ fun TvPlayerScreen(
 
         // End-of-movie "similar titles" bar — autoplays the most-related; ◀▶ to pick another.
         AnimatedVisibility(
-            visible = showMovieBar,
+            visible = showSimilarBar,
             enter = slideInVertically { it } + fadeIn(),
             exit = slideOutVertically { it } + fadeOut(),
             modifier = Modifier.align(Alignment.BottomCenter),
@@ -493,12 +507,21 @@ fun TvPlayerScreen(
             TvSimilarMoviesBar(
                 movies = similarMovies,
                 autoplaySecs = if (movieBarTouched || !endingSoon) null else movieAutoplaySecs,
+                isSeriesEnd = seriesEnd,
                 firstFocus = movieBarFocus,
                 onFocusIndex = { idx ->
                     movieBarFocused = idx
                     if (idx != 0) movieBarTouched = true   // browsed off the default -> stop the clock
                 },
-                onPlay = { item -> onPlayMedia(item.mediaType, item.id) },
+                // A movie suggestion plays straight away; a show suggestion opens its details (you pick
+                // where to start) rather than dumping you into S1E1.
+                onPlay = { item ->
+                    if (item.mediaType == com.slickstream.core.model.MediaType.MOVIE) {
+                        onPlayMedia(item.mediaType, item.id)
+                    } else {
+                        onOpenDetails(item.mediaType, item.id)
+                    }
+                },
             )
         }
 
@@ -738,6 +761,7 @@ private const val MOVIE_AUTOPLAY_LEAD_MS = 35_000L
 private fun TvSimilarMoviesBar(
     movies: List<MediaItem>,
     autoplaySecs: Int?,
+    isSeriesEnd: Boolean,
     firstFocus: FocusRequester,
     onFocusIndex: (Int) -> Unit,
     onPlay: (MediaItem) -> Unit,
@@ -753,8 +777,13 @@ private fun TvSimilarMoviesBar(
     ) {
         val first = movies.firstOrNull()
         Text(
-            text = if (autoplaySecs != null && first != null) "Up next  ·  ${first.title}  ·  playing in ${autoplaySecs}s"
-            else "Similar movies  ·  pick one to play",
+            text = when {
+                // End of the available series: nothing autoplays — the countdown returns to the UI.
+                isSeriesEnd && autoplaySecs != null -> "You're all caught up  ·  back to home in ${autoplaySecs}s"
+                isSeriesEnd -> "You're all caught up  ·  more shows like this"
+                autoplaySecs != null && first != null -> "Up next  ·  ${first.title}  ·  playing in ${autoplaySecs}s"
+                else -> "Similar movies  ·  pick one to play"
+            },
             style = MaterialTheme.typography.titleMedium,
             color = Color.White,
             fontWeight = FontWeight.Bold,
