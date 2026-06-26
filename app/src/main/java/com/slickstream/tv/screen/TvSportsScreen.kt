@@ -273,10 +273,17 @@ private fun TvStreamPanel(
 ) {
     BackHandler(enabled = true) { onClose() }
     val firstFocus = remember { FocusRequester() }
-    // Re-focus when the content settles (loading -> list, or -> error button) so the remote always
-    // has a target — fixes "the retry/back buttons don't auto-focus".
+    // Land focus on the panel's first target ONCE, the moment its content settles (loading -> list /
+    // error), so the remote always has a target. The didFocus guard stops it re-grabbing on every later
+    // state tick (which yanked focus away mid-navigation).
+    var didFocus by remember { mutableStateOf(false) }
     LaunchedEffect(sheet.loading, sheet.streams.size, sheet.error) {
-        runCatching { firstFocus.requestFocus() }
+        if (!didFocus && !sheet.loading) {
+            repeat(10) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { firstFocus.requestFocus() }.isSuccess) { didFocus = true; return@LaunchedEffect }
+            }
+        }
     }
     Column(
         modifier = Modifier

@@ -68,13 +68,13 @@ fun TvProfilePickerScreen(
     var editing by remember { mutableStateOf<Profile?>(null) }
     var deleting by remember { mutableStateOf<Profile?>(null) }
 
+    // Land focus on the first profile ONCE on entry. Keyed on Unit (not profiles.isNotEmpty()) so a later
+    // profiles update can't yank focus back to the first tile mid-navigation.
     val firstFocus = remember { FocusRequester() }
-    LaunchedEffect(profiles.isNotEmpty()) {
-        if (profiles.isNotEmpty()) {
-            repeat(12) {
-                kotlinx.coroutines.delay(40)
-                if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
-            }
+    LaunchedEffect(Unit) {
+        repeat(20) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
         }
     }
 

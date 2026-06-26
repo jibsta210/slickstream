@@ -82,15 +82,11 @@ private fun CatalogContent(
             ?: listOfNotNull(state.featured)
     }
 
+    // The hero Play button keeps a focus requester (so RIGHT from the nav rail lands on it) but we do
+    // NOT auto-grab focus: the old LaunchedEffect re-fired whenever the rows reloaded (carouselItems
+    // changed), yanking focus back to the hero while the user was browsing further down. Focus arrives
+    // naturally from the nav rail.
     val heroPlayFocus = remember { FocusRequester() }
-    LaunchedEffect(carouselItems.isNotEmpty()) {
-        if (carouselItems.isNotEmpty()) {
-            repeat(16) {
-                kotlinx.coroutines.delay(60)
-                if (runCatching { heroPlayFocus.requestFocus() }.isSuccess) return@LaunchedEffect
-            }
-        }
-    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),

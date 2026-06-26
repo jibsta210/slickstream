@@ -225,11 +225,13 @@ private fun HeroBlock(
     val details = state.details ?: return
     val item = details.item
 
-    // Details hides the rail — land focus on Play the moment it resolves (and on details->details
-    // navigation) so the first D-pad press isn't swallowed.
+    // Details hides the rail — land focus on Play ONCE when this screen opens so the first D-pad press
+    // isn't swallowed. Keyed on Unit (not item.id): a "More like this" jump opens a NEW details screen
+    // whose own effect focuses its Play, while re-keying on item.id could yank focus off the episode list
+    // you were browsing.
     val playFocus = androidx.compose.runtime.remember { androidx.compose.ui.focus.FocusRequester() }
-    androidx.compose.runtime.LaunchedEffect(item.id) {
-        repeat(12) {
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        repeat(20) {
             kotlinx.coroutines.delay(40)
             if (runCatching { playFocus.requestFocus() }.isSuccess) return@LaunchedEffect
         }
@@ -295,7 +297,7 @@ private fun HeroBlock(
         Spacer(Modifier.height(6.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            Button(
+            DetailsActionButton(
                 onClick = {
                     val rt = state.resumeTarget
                     if (state.isTv) {
@@ -308,6 +310,7 @@ private fun HeroBlock(
                         onPlay(MediaType.MOVIE, item.id, null, null)
                     }
                 },
+                primary = true,
                 modifier = Modifier.focusRequester(playFocus),
             ) {
                 Icon(
@@ -322,7 +325,7 @@ private fun HeroBlock(
                 )
             }
 
-            Button(onClick = onToggleFavorite) {
+            DetailsActionButton(onClick = onToggleFavorite) {
                 Icon(
                     imageVector = if (isFavorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
                     contentDescription = if (isFavorite) "Remove from favourites" else "Add to favourites",
@@ -336,7 +339,7 @@ private fun HeroBlock(
             // Movies: a focusable Mark watched / unwatched action beside Play + Favourite.
             if (!state.isTv) {
                 val watched = state.isMovieWatched
-                Button(onClick = { if (watched) onMarkMovieUnwatched() else onMarkMovieWatched() }) {
+                DetailsActionButton(onClick = { if (watched) onMarkMovieUnwatched() else onMarkMovieWatched() }) {
                     Icon(
                         imageVector = if (watched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
                         contentDescription = if (watched) "Mark unwatched" else "Mark watched",
@@ -348,6 +351,42 @@ private fun HeroBlock(
                 }
             }
         }
+    }
+}
+
+/**
+ * Details Play / Favourite / Mark-watched action with strong 10-foot focus feedback (violet fill + 3dp
+ * white ring + scale), matching the home hero + nav rail. The plain Material3 Button barely changed on
+ * focus. [primary] paints Play violet even at rest so it reads as the main action.
+ */
+@Composable
+private fun DetailsActionButton(
+    onClick: () -> Unit,
+    primary: Boolean = false,
+    modifier: Modifier = Modifier,
+    content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit,
+) {
+    val shape = androidx.compose.foundation.shape.RoundedCornerShape(10.dp)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (primary) Brand.Violet else Brand.SurfaceVariant,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Color.White,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+        modifier = modifier,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            content = content,
+        )
     }
 }
 
