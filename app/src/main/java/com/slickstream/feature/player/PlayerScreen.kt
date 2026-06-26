@@ -172,8 +172,7 @@ fun PlayerScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
-            .clickable { overlayVisible = !overlayVisible },
+            .background(Color.Black),
     ) {
         // --- Video surface ---------------------------------------------------
         val activePlayer = player
@@ -194,6 +193,18 @@ fun PlayerScreen(
                         useController = true
                         keepScreenOn = true
                         setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+                        // Make the built-in controller the single source of truth for "are controls
+                        // showing". Our custom overlays (top bar, chunk/download bar, Up-next) are gated
+                        // on `overlayVisible`; the PlayerView consumes taps for its own controller, so a
+                        // separate Box click never fired and those overlays stopped re-appearing after the
+                        // first auto-hide. Mirror the controller's visibility into `overlayVisible` and
+                        // give it our auto-hide timeout so everything shows/hides together.
+                        controllerShowTimeoutMs = AUTO_HIDE_MS.toInt()
+                        setControllerVisibilityListener(
+                            PlayerView.ControllerVisibilityListener { visibility ->
+                                overlayVisible = visibility == android.view.View.VISIBLE
+                            },
+                        )
                         // A non-null listener makes the built-in fullscreen button visible.
                         setFullscreenButtonClickListener { enter -> isFullscreen = enter }
                         this.player = activePlayer
@@ -269,14 +280,9 @@ fun PlayerScreen(
         // Entering PiP drops fullscreen so we don't restore a stuck landscape/immersive state.
         LaunchedEffect(isInPip) { if (isInPip) isFullscreen = false }
 
-        // Auto-hide the custom chrome while actively playing (re-keys on every tap/show to restart
-        // the countdown; never hides during buffering/error, in PiP, or while casting).
-        LaunchedEffect(overlayVisible, uiState, isInPip, isCasting) {
-            if (overlayVisible && uiState is PlayerUiState.Playing && !isInPip && !isCasting) {
-                delay(AUTO_HIDE_MS)
-                overlayVisible = false
-            }
-        }
+        // Auto-hide is now owned by the PlayerView controller (controllerShowTimeoutMs above), which
+        // mirrors its visibility back into `overlayVisible` — so the custom overlays hide/show in lockstep
+        // with the built-in controls instead of on a separate timer that drifted out of sync.
 
         // Poll position ~1/s to learn when we're near the end (movies / no-next never qualify).
         LaunchedEffect(player, uiState) {
