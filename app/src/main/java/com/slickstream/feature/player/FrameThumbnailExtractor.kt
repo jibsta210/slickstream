@@ -50,6 +50,7 @@ class FrameThumbnailExtractor(
     private var job: Job? = null
 
     @Volatile private var url: String? = null
+    @Volatile private var filePath: String? = null
     @Volatile private var infoHash: String? = null
     @Volatile private var durationMs: Long = 0L
     @Volatile private var fileLength: Long = 0L
@@ -73,11 +74,12 @@ class FrameThumbnailExtractor(
      * Begin sampling for [streamUrl]. Idempotent for the same URL; switching URL resets everything.
      * Call once playback is up and [durationMs] is known (so the container index/moov is present).
      */
-    fun start(streamUrl: String, hash: String, durationMs: Long, fileLength: Long) {
+    fun start(streamUrl: String, hash: String, durationMs: Long, fileLength: Long, filePath: String? = null) {
         if (streamUrl == url && job?.isActive == true) return
         reset()
         if (durationMs <= 0L || fileLength <= 0L) return
         url = streamUrl
+        this.filePath = filePath
         infoHash = hash
         this.durationMs = durationMs
         this.fileLength = fileLength
@@ -131,10 +133,18 @@ class FrameThumbnailExtractor(
         // Kick off the coarse prefetch up front (relaxed deadline; never competes with playback).
         runCatching { streamer.prefetchPreviewOffsets(hash, coarseOffsets) }
 
+        // Prefer the on-disk file (libtorrent allocates the whole file up front; we only ever decode
+        // slices that isByteAvailable() confirms are present). MediaMetadataRetriever reading the local
+        // file is far more reliable than pointing it at the NanoHTTPD URL, which silently fails to
+        // decode on some TVs (the "chunk bar works but no preview frames" bug). Fall back to the URL.
+        val path = filePath
         val retriever = runCatching {
-            MediaMetadataRetriever().apply { setDataSource(streamUrl, HashMap<String, String>()) }
+            MediaMetadataRetriever().apply {
+                if (path != null && java.io.File(path).exists()) setDataSource(path)
+                else setDataSource(streamUrl, HashMap<String, String>())
+            }
         }.getOrNull() ?: run {
-            Log.w(TAG, "thumbnail retriever setDataSource failed for $streamUrl")
+            Log.w(TAG, "thumbnail retriever setDataSource failed (path=$path url=$streamUrl)")
             return
         }
 

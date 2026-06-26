@@ -160,6 +160,11 @@ interface TorrentStreamer {
     /** Length (bytes) of the selected file for a stream, or 0 until known. */
     fun fileLength(infoHash: String): Long
 
+    /** On-disk absolute path of the selected video file, or null until known. Lets the thumbnail
+     *  extractor decode frames straight off disk — far more reliable than MediaMetadataRetriever over
+     *  the local HTTP server (which silently fails on some TVs). */
+    fun filePath(infoHash: String): String?
+
     /**
      * Best-effort, NON-BLOCKING: nudge the engine to fetch the slices covering these file byte-offsets
      * for scrub-preview thumbnails, at a relaxed priority so playback's head/read-ahead always wins.

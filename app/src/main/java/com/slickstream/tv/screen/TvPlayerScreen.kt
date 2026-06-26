@@ -16,6 +16,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -69,6 +70,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -862,10 +864,12 @@ private fun TransportOverlay(
 }
 
 /**
- * Focusable D-pad scrub bar: progress + buffered band + current/total time. LEFT/RIGHT seek with a
- * RAMPING step (longer hold = bigger jump), committing on release (or Center). DOWN moves focus to
- * the transport buttons. No thumbnail strip — frames over a partially-downloaded torrent aren't
- * feasible; the live frame updates after the seek commits.
+ * Focusable D-pad scrub bar with a Netflix-style hold-to-accelerate transport. Press & HOLD ◀/▶: for
+ * the first ~500 ms nothing moves (the film-strip + target time appear), then it scrubs at 1×,
+ * DOUBLING every 500 ms held (1× 2× 4× 8× …). RELEASE and it KEEPS gliding at that speed (coasting);
+ * the next key — OK, the other direction, anything — commits the seek and resumes playback. The live
+ * speed shows as ▶ ▶▶ ▶▶▶ … A wide film-strip (~6 frames edge-to-edge) previews around the target.
+ * DOWN moves focus to the transport buttons.
  */
 @Composable
 private fun ScrubBar(
@@ -880,18 +884,19 @@ private fun ScrubBar(
 ) {
     var scrubbing by remember { mutableStateOf(false) }
     var scrubTargetMs by remember { mutableStateOf(0L) }
-    var rampPresses by remember { mutableStateOf(0) }   // consecutive held presses -> ramp the step
+    var dir by remember { mutableStateOf(0) }            // +1 forward, -1 back, 0 idle
+    var held by remember { mutableStateOf(false) }       // the direction key is currently held down
+    var holdStartMs by remember { mutableStateOf(0L) }   // uptime when the current hold began
+    var speedLevel by remember { mutableStateOf(-1) }    // -1 = grace (no move yet); else 2^level ×
     var positionMs by remember { mutableStateOf(0L) }
     var bufferedMs by remember { mutableStateOf(0L) }
     var durationMs by remember { mutableStateOf(0L) }
 
+    // Live position poll while NOT scrubbing.
     LaunchedEffect(player) {
         while (true) {
             val p = player
             if (p != null && !scrubbing) {
-                // Only write when the value actually changed — an unconditional assignment every 500ms
-                // dirties these state objects and forces a recomposition even when nothing moved (e.g.
-                // paused, or while the overlay is hidden off-screen).
                 val pos = p.currentPosition.coerceAtLeast(0L)
                 val buf = p.bufferedPosition.coerceAtLeast(0L)
                 val dur = p.duration.takeIf { it > 0 } ?: 0L
@@ -903,60 +908,68 @@ private fun ScrubBar(
         }
     }
 
+    // Drive loop: while scrubbing, ramp the speed (grace → 1× → doubling, only while held) and glide
+    // the target by dir × 2^level video-ms per real-ms each tick. On release the level just stops
+    // changing, so it coasts at whatever speed it reached until a key commits.
+    LaunchedEffect(scrubbing) {
+        if (!scrubbing) return@LaunchedEffect
+        var last = android.os.SystemClock.elapsedRealtime()
+        while (true) {
+            kotlinx.coroutines.delay(SCRUB_TICK_MS)
+            val now = android.os.SystemClock.elapsedRealtime()
+            val dt = now - last
+            last = now
+            if (held) {
+                val heldFor = now - holdStartMs
+                speedLevel = if (heldFor < SCRUB_GRACE_MS) -1
+                else ((heldFor - SCRUB_GRACE_MS) / SCRUB_DOUBLE_MS).toInt().coerceIn(0, SCRUB_MAX_LEVEL)
+            }
+            val durMax = durationMs.takeIf { it > 0 } ?: continue
+            if (speedLevel >= 0 && dir != 0) {
+                scrubTargetMs = (scrubTargetMs + dir.toLong() * (1L shl speedLevel) * dt).coerceIn(0L, durMax)
+            }
+        }
+    }
+
+    fun startScrub(d: Int) {
+        scrubbing = true
+        onScrubbingChange(true)
+        scrubTargetMs = positionMs
+        dir = d
+        held = true
+        holdStartMs = android.os.SystemClock.elapsedRealtime()
+        speedLevel = -1
+    }
+    fun commit() {
+        player?.seekTo(scrubTargetMs)
+        scrubbing = false; held = false; dir = 0; speedLevel = -1
+        onScrubbingChange(false)
+    }
+
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
 
-    Column(modifier = modifier.fillMaxWidth(0.72f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (scrubbing) {
-            // Film strip around the scrub target: a ribbon pinned to whole-minute timeline anchors that
-            // glides toward the next/previous frame as you seek (the D-pad steps the target, an eased
-            // animation slides the ribbon there), with the frame nearest the target swelling to full
-            // size + cyan border. Off-timeline slots are dropped. thumbnailVersion is touched so newly-
-            // decoded frames recompose the strip.
             @Suppress("UNUSED_EXPRESSION") thumbnailVersion
-            val dur = durationMs.takeIf { it > 0 } ?: 0L
-            val animatedCenter by animateFloatAsState(
-                targetValue = scrubTargetMs.toFloat(),
-                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
-                label = "filmstrip-slide",
-            )
-            val pitchPx = with(LocalDensity.current) { TV_FILM_PITCH.toPx() }
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(TV_FILM_FRAME_H)
-                    .clipToBounds(),
-                contentAlignment = Alignment.Center,
-            ) {
-                val step = TV_FILMSTRIP_STEP_MS
-                val centerK = Math.round(animatedCenter / step).toInt()
-                // Draw far → near so the swollen centre frame lands on top of its shrunk neighbours.
-                for (k in (centerK - TV_FILM_SPAN..centerK + TV_FILM_SPAN)
-                        .sortedByDescending { kotlin.math.abs(it.toLong() * step - animatedCenter.toLong()) }) {
-                    val posMs = k.toLong() * step
-                    if (dur > 0L && posMs !in 0L..dur) continue
-                    val distSteps = (posMs - animatedCenter) / step
-                    val prox = (1f - kotlin.math.abs(distSteps)).coerceIn(0f, 1f)
-                    val scale = TV_FILM_SIDE_SCALE + (1f - TV_FILM_SIDE_SCALE) * prox
-                    TvFilmstripFrame(
-                        thumbnail = thumbnailAt(posMs.coerceAtLeast(0L)),
-                        center = kotlin.math.abs(distSteps) < 0.5f,
-                        modifier = Modifier.graphicsLayer {
-                            translationX = distSteps * pitchPx
-                            scaleX = scale
-                            scaleY = scale
-                            alpha = 0.4f + 0.6f * prox
-                        },
-                    )
-                }
-            }
-            Text(
-                text = fmtTime(scrubTargetMs),
-                style = MaterialTheme.typography.headlineSmall,
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
+            TvFilmstrip(centerMs = scrubTargetMs, durationMs = durationMs, thumbnailAt = thumbnailAt)
+            Row(
                 modifier = Modifier.align(Alignment.CenterHorizontally),
-            )
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (speedLevel >= 0) {
+                    val chevrons = (if (dir < 0) "◀" else "▶").repeat((speedLevel + 1).coerceAtMost(6))
+                    Text(chevrons, color = Brand.Cyan, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                    Text("${1 shl speedLevel}×", color = Brand.Cyan, style = MaterialTheme.typography.labelLarge)
+                }
+                Text(
+                    text = fmtTime(scrubTargetMs),
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
         }
         Box(
             modifier = Modifier
@@ -970,31 +983,31 @@ private fun ScrubBar(
                 .focusProperties { down = downFocus }
                 .focusable(interactionSource = interaction)
                 .onKeyEvent { event ->
-                    val p = player ?: return@onKeyEvent false
-                    val dur = durationMs.takeIf { it > 0 } ?: Long.MAX_VALUE
+                    val isLeft = event.key == Key.DirectionLeft
+                    val isRight = event.key == Key.DirectionRight
+                    val isCenter = event.key == Key.DirectionCenter || event.key == Key.Enter
                     when {
-                        event.type == KeyEventType.KeyUp && scrubbing &&
-                            (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) -> {
-                            p.seekTo(scrubTargetMs); scrubbing = false; rampPresses = 0; onScrubbingChange(false); true
-                        }
-                        event.type == KeyEventType.KeyDown &&
-                            (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) -> {
-                            if (!scrubbing) { scrubbing = true; onScrubbingChange(true); scrubTargetMs = positionMs; rampPresses = 0 }
-                            rampPresses++
-                            val step = when {
-                                rampPresses <= 3 -> 10_000L
-                                rampPresses <= 7 -> 30_000L
-                                rampPresses <= 13 -> 60_000L
-                                else -> 120_000L
+                        (isLeft || isRight) && event.type == KeyEventType.KeyDown -> {
+                            val d = if (isRight) 1 else -1
+                            when {
+                                !scrubbing -> startScrub(d)
+                                held && dir == d -> Unit  // auto-repeat of the held key — drive loop owns timing
+                                else -> commit()           // a fresh press while coasting (any dir) -> stop + seek
                             }
-                            val delta = if (event.key == Key.DirectionRight) step else -step
-                            scrubTargetMs = (scrubTargetMs + delta).coerceIn(0L, dur)
                             true
                         }
-                        event.type == KeyEventType.KeyDown &&
-                            (event.key == Key.DirectionCenter || event.key == Key.Enter) -> {
-                            if (scrubbing) { p.seekTo(scrubTargetMs); scrubbing = false; rampPresses = 0; onScrubbingChange(false) }
-                            else onTogglePlayPause()
+                        (isLeft || isRight) && event.type == KeyEventType.KeyUp -> {
+                            // Release of the active direction -> coast at the speed reached.
+                            if (scrubbing && dir == (if (isRight) 1 else -1)) held = false
+                            true
+                        }
+                        isCenter && event.type == KeyEventType.KeyDown -> {
+                            if (scrubbing) commit() else onTogglePlayPause()
+                            true
+                        }
+                        // Any other key while scrubbing (Up/Down/Back/…) stops the coast and commits.
+                        event.type == KeyEventType.KeyDown && scrubbing -> {
+                            commit()
                             true
                         }
                         else -> false
@@ -1024,24 +1037,85 @@ private fun fmtTime(ms: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }
 
-private val TV_FILM_FRAME_W = 248.dp
-private val TV_FILM_FRAME_H = 140.dp
-private val TV_FILM_PITCH = 200.dp
-private const val TV_FILM_SIDE_SCALE = 0.6f
-private const val TV_FILM_SPAN = 3
+// Scrub transport tuning (hold-to-accelerate).
+private const val SCRUB_TICK_MS = 33L      // drive-loop cadence (~30 fps)
+private const val SCRUB_GRACE_MS = 500L    // hold this long before any movement (just shows the strip)
+private const val SCRUB_DOUBLE_MS = 500L   // every further 500 ms held, double the speed
+private const val SCRUB_MAX_LEVEL = 7      // cap at 2^7 = 128×
+
+// Film-strip tuning: how many frames fit across the full width, how far to draw beyond the edges (so
+// the ribbon stays filled as it glides), the minute spacing of the frame grid, and the side-frame
+// scale (subtle, so all ~6 read as a row rather than one big frame + tiny neighbours).
+private const val TV_FILM_VISIBLE = 6
+private const val TV_FILM_SPAN = 4
 private const val TV_FILMSTRIP_STEP_MS = 60_000L
+private const val TV_FILM_SIDE_SCALE = 0.82f
+private val TV_FILM_STRIP_H = 168.dp
+
+/**
+ * Wide film-strip: ~[TV_FILM_VISIBLE] frames edge-to-edge around [centerMs] on a whole-minute grid,
+ * the centre frame full-size + cyan border, neighbours slightly smaller and fading toward the edges.
+ * The ribbon glides as the target moves (eased animation on the centre). Off-timeline slots dropped.
+ */
+@Composable
+private fun TvFilmstrip(
+    centerMs: Long,
+    durationMs: Long,
+    thumbnailAt: (Long) -> android.graphics.Bitmap?,
+) {
+    val dur = durationMs.takeIf { it > 0 } ?: 0L
+    val animatedCenter by animateFloatAsState(
+        targetValue = centerMs.toFloat(),
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "filmstrip-slide",
+    )
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth().height(TV_FILM_STRIP_H).clipToBounds(),
+        contentAlignment = Alignment.Center,
+    ) {
+        val pitchPx = with(LocalDensity.current) { maxWidth.toPx() } / TV_FILM_VISIBLE
+        val frameW = with(LocalDensity.current) { (pitchPx * 0.94f).toDp() }
+        val frameH = frameW * 9f / 16f
+        val step = TV_FILMSTRIP_STEP_MS
+        val centerK = Math.round(animatedCenter / step).toInt()
+        // Draw far → near so the swollen centre frame lands on top of its shrunk neighbours.
+        for (k in (centerK - TV_FILM_SPAN..centerK + TV_FILM_SPAN)
+                .sortedByDescending { kotlin.math.abs(it.toLong() * step - animatedCenter.toLong()) }) {
+            val posMs = k.toLong() * step
+            if (dur > 0L && posMs !in 0L..dur) continue
+            val distSteps = (posMs - animatedCenter) / step
+            val near = (1f - kotlin.math.abs(distSteps)).coerceIn(0f, 1f)
+            val scale = TV_FILM_SIDE_SCALE + (1f - TV_FILM_SIDE_SCALE) * near
+            val edgeFade = (1f - kotlin.math.abs(distSteps) / (TV_FILM_SPAN + 1)).coerceIn(0.35f, 1f)
+            TvFilmstripFrame(
+                thumbnail = thumbnailAt(posMs.coerceAtLeast(0L)),
+                center = kotlin.math.abs(distSteps) < 0.5f,
+                width = frameW,
+                height = frameH,
+                modifier = Modifier.graphicsLayer {
+                    translationX = distSteps * pitchPx
+                    scaleX = scale
+                    scaleY = scale
+                    alpha = edgeFade
+                },
+            )
+        }
+    }
+}
 
 @Composable
 private fun TvFilmstripFrame(
     thumbnail: android.graphics.Bitmap?,
     center: Boolean,
+    width: Dp,
+    height: Dp,
     modifier: Modifier = Modifier,
 ) {
     val shape = RoundedCornerShape(10.dp)
-    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.45f)
+    val borderColor = if (center) Brand.Cyan else Color.White.copy(alpha = 0.40f)
     Box(
         modifier = modifier
-            .size(TV_FILM_FRAME_W, TV_FILM_FRAME_H)
+            .size(width, height)
             .clip(shape)
             .background(Color.Black.copy(alpha = 0.55f))
             .border(if (center) 3.dp else 1.dp, borderColor, shape),

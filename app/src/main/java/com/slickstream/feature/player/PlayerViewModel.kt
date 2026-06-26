@@ -1139,7 +1139,7 @@ class PlayerViewModel @Inject constructor(
         val hash = activeInfoHash ?: return
         val url = currentMediaUrl ?: return
         val dur = player.duration.takeIf { it > 0 } ?: return
-        thumbnails.start(url, hash, dur, torrentStreamer.fileLength(hash))
+        thumbnails.start(url, hash, dur, torrentStreamer.fileLength(hash), torrentStreamer.filePath(hash))
     }
 
     private fun startProgressTicker() {
