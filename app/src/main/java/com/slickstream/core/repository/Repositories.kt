@@ -108,7 +108,7 @@ interface ProfileRepository {
 
     suspend fun currentProfileId(): String
     suspend fun setActiveProfile(profileId: String)
-    suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int): Profile
+    suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int = 0): Profile
     suspend fun updateProfile(profile: Profile)
     suspend fun deleteProfile(profileId: String)
 

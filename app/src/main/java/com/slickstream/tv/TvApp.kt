@@ -43,15 +43,6 @@ import com.slickstream.ui.theme.Brand
  * player routes (which hide the rail). Everything is reachable with a D-pad only. Existing
  * feature ViewModels are reused on every screen — no data logic is duplicated here.
  */
-/**
- * Process-scoped latch: the launch profile picker shows at most ONCE per app launch and can never be
- * re-triggered by a recomposition or a full rebuild of [TvApp]. A rememberSaveable here used to reset
- * when the whole TV app was torn down and rebuilt (the old calibration wrapper did exactly that on the
- * first slider nudge), which re-fired the gate mid-session and yanked the user to the profile picker. A
- * top-level flag survives recomposition AND a TvApp rebuild, resetting only on a fresh process.
- */
-private var launchProfileGateConsumed = false
-
 @Composable
 fun TvApp() {
     SlickStreamTvTheme {
@@ -59,20 +50,8 @@ fun TvApp() {
         val backStack by navController.currentBackStackEntryAsState()
         val currentRoute = backStack?.destination?.route
 
-        // Conservative launch gate (mirrors phone): keep startDestination = HOME. On a single cold
-        // launch, if MORE THAN ONE profile exists, route to the picker once. With just the default
-        // profile, launch straight to Home as before.
-        val profileViewModel: com.slickstream.feature.profile.ProfileViewModel =
-            androidx.hilt.navigation.compose.hiltViewModel()
-        val profiles by profileViewModel.profiles.collectAsStateWithLifecycle()
-        androidx.compose.runtime.LaunchedEffect(profiles.size) {
-            if (!launchProfileGateConsumed && profiles.size > 1) {
-                launchProfileGateConsumed = true
-                navController.navigate(Routes.PROFILE_PICKER) {
-                    launchSingleTop = true
-                }
-            }
-        }
+        // No launch picker: the app reopens straight into the last-used profile (ProfileRepository
+        // persists activeProfileId across launches). Switch via Profile → Switch profile.
 
         // The rail is shown for the four top-level sections; details + player are immersive.
         val showRail = currentRoute == null ||

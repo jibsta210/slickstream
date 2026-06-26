@@ -27,6 +27,9 @@ object LocalModule {
     @Singleton
     fun provideSlickDatabase(@ApplicationContext context: Context): SlickDatabase =
         Room.databaseBuilder(context, SlickDatabase::class.java, SlickDatabase.NAME)
+            // Preserve profiles/favourites/history across the avatarIndex addition; fall back to a
+            // wipe only for version steps without an explicit migration.
+            .addMigrations(SlickDatabase.MIGRATION_3_4)
             .fallbackToDestructiveMigration()
             .build()
 

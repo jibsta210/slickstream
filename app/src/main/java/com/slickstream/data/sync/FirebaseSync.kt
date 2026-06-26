@@ -226,6 +226,7 @@ class FirebaseSync @Inject constructor(
         "name" to name,
         "isKids" to isKids,
         "colorIndex" to colorIndex,
+        "avatarIndex" to avatarIndex,
         "createdAt" to createdAt,
     )
 
@@ -236,6 +237,7 @@ class FirebaseSync @Inject constructor(
             name = this["name"] as? String ?: "",
             isKids = this["isKids"] as? Boolean ?: false,
             colorIndex = (this["colorIndex"] as? Number)?.toInt() ?: 0,
+            avatarIndex = (this["avatarIndex"] as? Number)?.toInt() ?: 0,
             createdAt = (this["createdAt"] as? Number)?.toLong() ?: 0L,
         )
     }

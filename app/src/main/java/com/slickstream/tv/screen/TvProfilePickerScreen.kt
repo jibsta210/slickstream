@@ -131,8 +131,8 @@ fun TvProfilePickerScreen(
             initialIsKids = false,
             initialColorIndex = viewModel.nextColorIndex(),
             confirmLabel = "Create",
-            onSave = { name, isKids, colorIndex ->
-                viewModel.create(name, isKids, colorIndex)
+            onSave = { name, isKids, colorIndex, avatarIndex ->
+                viewModel.create(name, isKids, colorIndex, avatarIndex)
                 showCreate = false
                 onProfileChosen()
             },
@@ -147,9 +147,10 @@ fun TvProfilePickerScreen(
             initialName = profile.name,
             initialIsKids = profile.isKids,
             initialColorIndex = profile.colorIndex,
+            initialAvatarIndex = profile.avatarIndex,
             confirmLabel = "Save",
-            onSave = { name, isKids, colorIndex ->
-                viewModel.update(profile.copy(name = name, isKids = isKids, colorIndex = colorIndex))
+            onSave = { name, isKids, colorIndex, avatarIndex ->
+                viewModel.update(profile.copy(name = name, isKids = isKids, colorIndex = colorIndex, avatarIndex = avatarIndex))
                 editing = null
             },
             onDelete = if (isDefault) null else {
@@ -207,6 +208,7 @@ private fun TvProfileTile(
                     name = profile.name,
                     colorIndex = profile.colorIndex,
                     isKids = profile.isKids,
+                    avatarIndex = profile.avatarIndex,
                     size = 132.dp,
                 )
                 if (managing) {

@@ -76,12 +76,13 @@ class ProfileRepositoryImpl @Inject constructor(
         dataStore.edit { it[KEY_ACTIVE_PROFILE] = profileId }
     }
 
-    override suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int): Profile {
+    override suspend fun createProfile(name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int): Profile {
         val profile = Profile(
             id = UUID.randomUUID().toString(),
             name = name,
             isKids = isKids,
             colorIndex = colorIndex,
+            avatarIndex = avatarIndex,
             createdAt = System.currentTimeMillis(),
         )
         dao.upsert(ProfileEntity.from(profile))

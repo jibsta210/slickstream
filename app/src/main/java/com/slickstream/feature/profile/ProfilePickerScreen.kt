@@ -135,8 +135,8 @@ fun ProfilePickerScreen(
             initialIsKids = false,
             initialColorIndex = viewModel.nextColorIndex(),
             confirmLabel = "Create",
-            onSave = { name, isKids, colorIndex ->
-                viewModel.create(name, isKids, colorIndex)
+            onSave = { name, isKids, colorIndex, avatarIndex ->
+                viewModel.create(name, isKids, colorIndex, avatarIndex)
                 showCreate = false
                 onProfileChosen()
             },
@@ -149,8 +149,8 @@ fun ProfilePickerScreen(
         ProfileManageDialog(
             profile = profile,
             canDelete = !isDefault,
-            onSave = { name, isKids, colorIndex ->
-                viewModel.update(profile.copy(name = name, isKids = isKids, colorIndex = colorIndex))
+            onSave = { name, isKids, colorIndex, avatarIndex ->
+                viewModel.update(profile.copy(name = name, isKids = isKids, colorIndex = colorIndex, avatarIndex = avatarIndex))
                 editing = null
             },
             onDelete = {
@@ -184,7 +184,7 @@ fun ProfilePickerScreen(
 private fun ProfileManageDialog(
     profile: Profile,
     canDelete: Boolean,
-    onSave: (name: String, isKids: Boolean, colorIndex: Int) -> Unit,
+    onSave: (name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int) -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -193,6 +193,7 @@ private fun ProfileManageDialog(
         initialName = profile.name,
         initialIsKids = profile.isKids,
         initialColorIndex = profile.colorIndex,
+        initialAvatarIndex = profile.avatarIndex,
         confirmLabel = "Save",
         onSave = onSave,
         onDismiss = onDismiss,
@@ -228,6 +229,7 @@ private fun ProfileTile(
                 name = profile.name,
                 colorIndex = profile.colorIndex,
                 isKids = profile.isKids,
+                avatarIndex = profile.avatarIndex,
                 size = 84.dp,
             )
             if (managing) {

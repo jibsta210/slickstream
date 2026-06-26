@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -36,10 +38,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.slickstream.ui.components.ProfileAvatarColors
 import com.slickstream.ui.components.profileAvatarColor
+import com.slickstream.ui.components.profileAvatarEmoji
+import com.slickstream.ui.components.profileAvatarOptionCount
 import com.slickstream.ui.theme.Brand
 
 /**
@@ -57,14 +62,16 @@ fun ProfileEditDialog(
     initialName: String,
     initialIsKids: Boolean,
     initialColorIndex: Int,
-    onSave: (name: String, isKids: Boolean, colorIndex: Int) -> Unit,
+    onSave: (name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int) -> Unit,
     onDismiss: () -> Unit,
     confirmLabel: String = "Save",
     extraAction: (@Composable () -> Unit)? = null,
+    initialAvatarIndex: Int = 0,
 ) {
     var name by remember { mutableStateOf(initialName) }
     var isKids by remember { mutableStateOf(initialIsKids) }
     var colorIndex by remember { mutableIntStateOf(initialColorIndex) }
+    var avatarIndex by remember { mutableIntStateOf(initialAvatarIndex) }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -163,6 +170,33 @@ fun ProfileEditDialog(
                     }
                 }
 
+                Text("Avatar", style = MaterialTheme.typography.titleMedium, color = Brand.OnSurface)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    items((0 until profileAvatarOptionCount).toList()) { idx ->
+                        val emoji = profileAvatarEmoji(idx)
+                        val selected = idx == avatarIndex
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .background(profileAvatarColor(colorIndex))
+                                .then(if (selected) Modifier.border(3.dp, Color.White, CircleShape) else Modifier)
+                                .clickable { avatarIndex = idx },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (emoji != null) {
+                                Text(emoji, fontSize = 22.sp)
+                            } else {
+                                Text(
+                                    name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "A",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                            }
+                        }
+                    }
+                }
+
                 extraAction?.let {
                     Row(modifier = Modifier.fillMaxWidth()) { it() }
                 }
@@ -180,7 +214,7 @@ fun ProfileEditDialog(
                         Text("Cancel", style = MaterialTheme.typography.labelLarge)
                     }
                     Button(
-                        onClick = { onSave(name.trim(), isKids, colorIndex) },
+                        onClick = { onSave(name.trim(), isKids, colorIndex, avatarIndex) },
                         enabled = name.isNotBlank(),
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(

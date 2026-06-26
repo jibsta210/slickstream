@@ -139,16 +139,8 @@ fun PhoneApp() {
     val profiles by profileViewModel.profiles.collectAsStateWithLifecycle()
     val activeProfile by profileViewModel.activeProfile.collectAsStateWithLifecycle()
 
-    // Conservative launch gate: keep startDestination = HOME. On a single cold launch, if MORE
-    // THAN ONE profile exists, route to the picker once. With just the default profile, go straight
-    // to Home exactly as before. rememberSaveable survives config changes so it fires at most once.
-    var profileGateShown by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
-    LaunchedEffect(profiles.size) {
-        if (!profileGateShown && profiles.size > 1) {
-            profileGateShown = true
-            navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true }
-        }
-    }
+    // No launch picker: reopen straight into the last-used profile (activeProfileId is persisted).
+    // Switch from the Profile screen → Switch profile.
 
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -448,6 +440,7 @@ private fun TopBarAvatar(profile: Profile?, onClick: () -> Unit) {
                 name = profile.name,
                 colorIndex = profile.colorIndex,
                 isKids = profile.isKids,
+                avatarIndex = profile.avatarIndex,
                 size = 36.dp,
             )
         } else {

@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -43,6 +45,8 @@ import androidx.tv.material3.Switch
 import androidx.tv.material3.Text
 import com.slickstream.ui.components.ProfileAvatarColors
 import com.slickstream.ui.components.profileAvatarColor
+import com.slickstream.ui.components.profileAvatarEmoji
+import com.slickstream.ui.components.profileAvatarOptionCount
 import com.slickstream.ui.theme.Brand
 
 /**
@@ -59,13 +63,15 @@ fun TvProfileEditDialog(
     initialIsKids: Boolean,
     initialColorIndex: Int,
     confirmLabel: String,
-    onSave: (name: String, isKids: Boolean, colorIndex: Int) -> Unit,
+    onSave: (name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int) -> Unit,
     onDismiss: () -> Unit,
     onDelete: (() -> Unit)? = null,
+    initialAvatarIndex: Int = 0,
 ) {
     var name by remember { mutableStateOf(initialName) }
     var isKids by remember { mutableStateOf(initialIsKids) }
     var colorIndex by remember { mutableIntStateOf(initialColorIndex) }
+    var avatarIndex by remember { mutableIntStateOf(initialAvatarIndex) }
     val nameFocus = remember { FocusRequester() }
 
     LaunchedEffect(Unit) {
@@ -146,6 +152,21 @@ fun TvProfileEditDialog(
                         }
                     }
 
+                    // Avatar picker — the name's initial (index 0) plus a row of emoji faces. D-pad
+                    // scrolls the row; the chosen face shows on the selected colour.
+                    Text("Avatar", style = MaterialTheme.typography.titleMedium, color = Brand.OnSurface)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        items((0 until profileAvatarOptionCount).toList()) { idx ->
+                            AvatarSwatch(
+                                emoji = profileAvatarEmoji(idx),
+                                initial = name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "A",
+                                tint = profileAvatarColor(colorIndex),
+                                selected = idx == avatarIndex,
+                                onClick = { avatarIndex = idx },
+                            )
+                        }
+                    }
+
                     // Actions
                     Row(
                         modifier = Modifier.padding(top = 8.dp),
@@ -169,7 +190,7 @@ fun TvProfileEditDialog(
                         )
                         DialogButton(
                             label = confirmLabel,
-                            onClick = { if (name.isNotBlank()) onSave(name.trim(), isKids, colorIndex) },
+                            onClick = { if (name.isNotBlank()) onSave(name.trim(), isKids, colorIndex, avatarIndex) },
                             container = Brand.Violet,
                             ring = Color.White,
                         )
@@ -215,6 +236,40 @@ private fun ColorSwatch(
                         modifier = Modifier.size(22.dp),
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AvatarSwatch(
+    emoji: String?,
+    initial: String,
+    tint: Color,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val shape = CircleShape
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(containerColor = tint, focusedContainerColor = tint),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(BorderStroke(3.dp, Color.White), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.14f),
+        modifier = Modifier.size(56.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(if (selected) Modifier.border(3.dp, Color.White, shape) else Modifier),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (emoji != null) {
+                Text(emoji, fontSize = 26.sp)
+            } else {
+                Text(initial, color = Color.White, fontSize = 22.sp, style = MaterialTheme.typography.titleLarge)
             }
         }
     }

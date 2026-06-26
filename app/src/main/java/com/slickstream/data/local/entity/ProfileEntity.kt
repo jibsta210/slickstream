@@ -1,5 +1,6 @@
 package com.slickstream.data.local.entity
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import com.slickstream.core.model.Profile
@@ -14,6 +15,8 @@ data class ProfileEntity(
     val name: String,
     val isKids: Boolean,
     val colorIndex: Int,
+    // Default matches MIGRATION_3_4's ADD COLUMN ... DEFAULT 0 so Room's schema validation is exact.
+    @ColumnInfo(defaultValue = "0") val avatarIndex: Int = 0,
     val createdAt: Long,
 ) {
     fun toProfile(): Profile = Profile(
@@ -21,6 +24,7 @@ data class ProfileEntity(
         name = name,
         isKids = isKids,
         colorIndex = colorIndex,
+        avatarIndex = avatarIndex,
         createdAt = createdAt,
     )
 
@@ -33,6 +37,7 @@ data class ProfileEntity(
             name = profile.name,
             isKids = profile.isKids,
             colorIndex = profile.colorIndex,
+            avatarIndex = profile.avatarIndex,
             createdAt = profile.createdAt,
         )
     }

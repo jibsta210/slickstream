@@ -42,12 +42,13 @@ class ProfileViewModel @Inject constructor(
     }
 
     /** Create a profile, then immediately switch to it. */
-    fun create(name: String, isKids: Boolean, colorIndex: Int) {
+    fun create(name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int = 0) {
         viewModelScope.launch {
             val created = profileRepository.createProfile(
                 name = name.trim(),
                 isKids = isKids,
                 colorIndex = colorIndex,
+                avatarIndex = avatarIndex,
             )
             profileRepository.setActiveProfile(created.id)
         }

@@ -36,6 +36,23 @@ val ProfileAvatarColors: List<Color> = listOf(
 /** How many distinct avatar tints exist — used to cycle the palette when adding a profile. */
 val profileAvatarColorCount: Int get() = ProfileAvatarColors.size
 
+/**
+ * Pickable emoji "faces" for a profile. [Profile.avatarIndex] of 0 means "use the name's initial";
+ * 1..N maps to ProfileAvatarEmojis[index-1]. Emoji avatars need no image assets and render crisply
+ * on a TV at any size.
+ */
+val ProfileAvatarEmojis: List<String> = listOf(
+    "🦊", "🐼", "🐯", "🦁", "🐸", "🐵", "🐧", "🐶", "🐱", "🐰",
+    "🐨", "🐻", "🦄", "🐲", "👾", "🤖", "👻", "🦖", "🌟", "🍿",
+)
+
+/** Total avatar options offered in the picker: the initial-letter face plus every emoji. */
+val profileAvatarOptionCount: Int get() = ProfileAvatarEmojis.size + 1
+
+/** The emoji for an [avatarIndex], or null when the index selects the name-initial face (0 / OOB). */
+fun profileAvatarEmoji(avatarIndex: Int): String? =
+    if (avatarIndex in 1..ProfileAvatarEmojis.size) ProfileAvatarEmojis[avatarIndex - 1] else null
+
 /** Resolve a profile colour from its index, wrapping safely for any (even negative) index. */
 fun profileAvatarColor(colorIndex: Int): Color {
     val n = ProfileAvatarColors.size
@@ -56,8 +73,10 @@ fun ProfileAvatar(
     isKids: Boolean,
     modifier: Modifier = Modifier,
     size: Dp = 56.dp,
+    avatarIndex: Int = 0,
 ) {
     val tint = profileAvatarColor(colorIndex)
+    val emoji = profileAvatarEmoji(avatarIndex)
     val initial = name.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "?"
 
     Box(modifier = modifier.size(size), contentAlignment = Alignment.Center) {
@@ -72,12 +91,16 @@ fun ProfileAvatar(
                 ),
             contentAlignment = Alignment.Center,
         ) {
-            Text(
-                text = initial,
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = (size.value * 0.42f).sp,
-            )
+            if (emoji != null) {
+                Text(text = emoji, fontSize = (size.value * 0.52f).sp)
+            } else {
+                Text(
+                    text = initial,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = (size.value * 0.42f).sp,
+                )
+            }
         }
 
         if (isKids) {
