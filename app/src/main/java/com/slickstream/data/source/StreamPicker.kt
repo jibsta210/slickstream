@@ -97,15 +97,31 @@ object StreamPicker {
     private val ENGLISH = Regex("(?i)\\b(eng|english)\\b")
     // A pair of regional-indicator symbols = a country flag emoji. Torrentio tags foreign releases
     // with one (🇵🇱 🇪🇸 🇲🇽 …); any flag that isn't 🇬🇧/🇺🇸 is a strong non-English signal.
-    private val FLAG = Regex("\\uD83C[\\uDDE6-\\uDDFF]\\uD83C[\\uDDE6-\\uDDFF]")
+    // NB: match by CODE POINT (\x{1F1E6}-\x{1F1FF}), not surrogate code units — Java/Kotlin regex runs
+    // over code points, so the old "\uD83C[\uDDE6-\uDDFF]" form never matched a real flag emoji.
+    private val FLAG = Regex("[\\x{1F1E6}-\\x{1F1FF}]{2}")
     private const val FLAG_GB = "🇬🇧"
     private const val FLAG_US = "🇺🇸"
 
-    /** True unless the torrent text clearly signals a non-English language (with no English tag). */
-    fun looksEnglish(text: String): Boolean {
+    /**
+     * True unless the torrent text clearly signals a non-English language. The movie's OWN title words
+     * are stripped FIRST so a language name that's part of the title ("The French Dispatch", "The
+     * Italian Job") isn't read as a foreign-audio tag. Non-Latin script or a non-GB/US country flag is
+     * an immediate reject; otherwise a surviving foreign CODE *or bare NAME* ([FOREIGN]/[LANG_NAME])
+     * counts as English only if it ALSO carries an explicit English tag (so a dual-audio "ITA+ENG"
+     * release is still English-watchable, but a bare ".FRENCH." dub is not).
+     *
+     * Bare language NAMES (french/spanish/italian/russian…) MUST be checked here, not just in
+     * [noForeignTag]: they're the single most common release tag, and the picker trusts this flag
+     * directly — leaving them out (as it briefly did) makes every foreign release read as English.
+     */
+    fun looksEnglish(text: String, movieTitle: String): Boolean {
         if (NON_LATIN.containsMatchIn(text)) return false
         if (FLAG.containsMatchIn(text) && !text.contains(FLAG_GB) && !text.contains(FLAG_US)) return false
-        if (FOREIGN.containsMatchIn(text)) return ENGLISH.containsMatchIn(text)
+        val rest = stripTitleWords(text, movieTitle)
+        if (FOREIGN.containsMatchIn(rest) || LANG_NAME.containsMatchIn(rest)) {
+            return ENGLISH.containsMatchIn(rest)
+        }
         return true
     }
 
@@ -130,9 +146,15 @@ object StreamPicker {
      * Italian). Pairs with [looksEnglish]/[hasNonLatin] for the full English-only decision.
      */
     fun noForeignTag(sourceText: String, movieTitle: String): Boolean {
-        val titleWords = movieTitle.lowercase().split(NON_WORD).filter { it.length >= 3 }.toSet()
-        val rest = sourceText.split(NON_WORD).filterNot { it.lowercase() in titleWords }.joinToString(" ")
+        val rest = stripTitleWords(sourceText, movieTitle)
         return !FOREIGN.containsMatchIn(rest) && !LANG_NAME.containsMatchIn(rest)
+    }
+
+    /** Drop the movie's own title words (3+ chars) from [text] so a language name that's part of the
+     *  title isn't mistaken for a foreign-audio tag. Shared by [looksEnglish] and [noForeignTag]. */
+    private fun stripTitleWords(text: String, movieTitle: String): String {
+        val titleWords = movieTitle.lowercase().split(NON_WORD).filter { it.length >= 3 }.toSet()
+        return text.split(NON_WORD).filterNot { it.lowercase() in titleWords }.joinToString(" ")
     }
 
     // Codecs/containers Android's ExoPlayer cannot decode without the FFmpeg extension: XviD/DivX

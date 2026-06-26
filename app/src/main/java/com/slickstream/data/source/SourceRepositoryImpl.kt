@@ -57,9 +57,12 @@ class SourceRepositoryImpl @Inject constructor(
             if (ok.isEmpty()) {
                 return DataResult.Error("Failed to resolve sources for \"${details.item.title}\"")
             }
+            // Title-aware language detection needs the title at MAP time so a language name that's part
+            // of the title ("The French Dispatch") isn't read as a foreign-audio tag.
+            val movieTitle = details.item.title
             val sources = ok
                 .flatMap { it.streams }
-                .mapNotNull { it.toStreamSource() }
+                .mapNotNull { it.toStreamSource(movieTitle) }
                 .groupBy { it.infoHash }
                 .map { (_, rows) -> rows.maxByOrNull { it.seeders ?: 0 }!! }
                 .sortedByDescending { it.rank }
@@ -67,7 +70,6 @@ class SourceRepositoryImpl @Inject constructor(
             // hitting random Spanish/Chinese). Prefer English; if a title genuinely has no English
             // release, still NEVER surface an unreadable non-Latin name — fall back to Latin-script
             // (e.g. a Spanish-only foreign film), and only to the raw list if even that is empty.
-            val movieTitle = details.item.title
             val english = sources.filter {
                 it.englishLikely && StreamPicker.noForeignTag(it.title, movieTitle)
             }
@@ -96,7 +98,7 @@ class SourceRepositoryImpl @Inject constructor(
         .ifEmpty { listOf("https://torrentio.strem.fun/") }
 
     /** Map one indexer row to a [StreamSource], or null if it has no usable info-hash. */
-    private fun StreamDto.toStreamSource(): StreamSource? {
+    private fun StreamDto.toStreamSource(movieTitle: String): StreamSource? {
         val hash = infoHash?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() } ?: return null
 
         // Pool every text field that may carry quality / seeders / size / codec metadata (the codec
@@ -122,7 +124,7 @@ class SourceRepositoryImpl @Inject constructor(
             isPack = StreamPicker.looksLikePack(haystack, fileIdx),
             // Detect language from the FULL text (filename + Torrentio title/description), not just
             // the short label — so a Russian/foreign release is de-prioritized in favour of English.
-            englishLikely = StreamPicker.looksEnglish(haystack),
+            englishLikely = StreamPicker.looksEnglish(haystack, movieTitle),
             // Detect the codec/container so an undecodable XviD/AVI release is never auto-picked over
             // a playable x264 (the "valid torrent, black screen" bug).
             playable = StreamPicker.looksPlayable(haystack),
