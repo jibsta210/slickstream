@@ -20,6 +20,7 @@ import com.slickstream.data.source.StreamPicker
 import com.slickstream.navigation.NavArg
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -192,9 +193,18 @@ class DetailsViewModel @Inject constructor(
                     )
                     // Now that seasons (with episode counts) are known, derive where Play should go.
                     updateResumeTarget()
-                    // Default-select the first season for TV shows and eagerly load it.
+                    // Default-select the season you were LAST WATCHING (so reopening a show you're deep
+                    // into doesn't dump you back on Season 1), falling back to the first season. Read a
+                    // history snapshot here because the parallel observeHistory() collector may not have
+                    // populated latestHistory yet.
                     if (details.item.mediaType == MediaType.TV) {
-                        playableSeasons.firstOrNull()?.let { selectSeason(it.seasonNumber) }
+                        val lastWatchedSeason = runCatching {
+                            libraryRepository.observeHistory().first()
+                                .firstOrNull { it.media.id == mediaId && it.media.mediaType == mediaType }
+                                ?.progress?.season
+                        }.getOrNull()?.takeIf { s -> playableSeasons.any { it.seasonNumber == s } }
+                        val initialSeason = lastWatchedSeason ?: playableSeasons.firstOrNull()?.seasonNumber
+                        initialSeason?.let { selectSeason(it) }
                     } else {
                         // Movie: reflect any saved watched state, then prewarm the torrent NOW (while
                         // the user reads the synopsis) so Play hits a metadata-cache + 2MB head

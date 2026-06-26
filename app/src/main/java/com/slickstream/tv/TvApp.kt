@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavType
@@ -49,6 +50,17 @@ fun TvApp() {
         val navController = rememberNavController()
         val backStack by navController.currentBackStackEntryAsState()
         val currentRoute = backStack?.destination?.route
+
+        // On app launch, land focus on the nav rail (the selected/Home item) so it's obvious you're in
+        // the menu — otherwise focus went to the home hero and a RIGHT press scrolled the carousel when
+        // the user expected to move through the menu. Fires once; the retry rides past first layout.
+        val railFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            repeat(15) {
+                kotlinx.coroutines.delay(40)
+                if (runCatching { railFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
 
         // No launch picker: the app reopens straight into the last-used profile (ProfileRepository
         // persists activeProfileId across launches). Switch via Profile → Switch profile.
@@ -96,6 +108,7 @@ fun TvApp() {
                     TvNavRail(
                         selectedRoute = selectedRoute,
                         onSelect = { dest -> navigateTopLevel(navController, dest) },
+                        selectedItemFocus = railFocus,
                     )
                 }
 

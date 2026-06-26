@@ -149,17 +149,11 @@ private fun HomeContent(
         { item -> newEpisodeById[item.id]?.let(onResume) }
     }
 
-    // Land focus on the hero Play button on entry (it was unfocused, so Play looked inert until you
-    // pressed Enter). Focusing it also pauses the carousel auto-advance — the right 10-ft behavior.
+    // The hero Play button keeps a focus requester so D-pad RIGHT from the nav rail lands on it, but we
+    // DON'T auto-focus it on entry any more: on app launch the nav rail owns focus (so it's clear you're
+    // in the menu — see TvApp), and grabbing the hero here stole that focus and made a RIGHT press scroll
+    // the carousel instead of moving through the menu.
     val heroPlayFocus = remember { FocusRequester() }
-    LaunchedEffect(carouselItems.isNotEmpty()) {
-        if (carouselItems.isNotEmpty()) {
-            repeat(16) {
-                kotlinx.coroutines.delay(60)
-                if (runCatching { heroPlayFocus.requestFocus() }.isSuccess) return@LaunchedEffect
-            }
-        }
-    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -207,6 +201,49 @@ private fun HomeContent(
                 items = row.items,
                 onItemClick = onMediaClick,
             )
+        }
+    }
+}
+
+/**
+ * Hero Play / Details button with UNMISTAKABLE 10-foot focus feedback (matches the nav rail + dialog
+ * buttons): both jump to a solid violet fill, a 3dp white ring, and scale up when focused — the plain
+ * Material3 Button only changed colour faintly, so you couldn't tell it was focused.
+ */
+@Composable
+private fun HeroActionButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    primary: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(10.dp)
+    androidx.tv.material3.Surface(
+        onClick = onClick,
+        shape = androidx.tv.material3.ClickableSurfaceDefaults.shape(shape = shape),
+        colors = androidx.tv.material3.ClickableSurfaceDefaults.colors(
+            containerColor = if (primary) Brand.Violet else Brand.SurfaceVariant,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Color.White,
+            focusedContentColor = Color.White,
+        ),
+        border = androidx.tv.material3.ClickableSurfaceDefaults.border(
+            focusedBorder = androidx.tv.material3.Border(
+                androidx.compose.foundation.BorderStroke(3.dp, Color.White),
+                shape = shape,
+            ),
+        ),
+        scale = androidx.tv.material3.ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.08f),
+        modifier = modifier,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(imageVector = icon, contentDescription = null, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(label, style = MaterialTheme.typography.labelLarge)
         }
     }
 }
@@ -324,27 +361,19 @@ private fun FeaturedSlide(
             )
             Spacer(Modifier.height(20.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                Button(
+                HeroActionButton(
+                    icon = Icons.Rounded.PlayArrow,
+                    label = "Play",
+                    primary = true,
                     onClick = { onPlay(item) },
                     modifier = if (playFocus != null) Modifier.focusRequester(playFocus) else Modifier,
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.PlayArrow,
-                        contentDescription = null,
-                        modifier = Modifier.size(22.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("Play", style = MaterialTheme.typography.labelLarge)
-                }
-                Button(onClick = { onDetails(item) }) {
-                    Icon(
-                        imageVector = Icons.Rounded.Info,
-                        contentDescription = null,
-                        modifier = Modifier.size(22.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("Details", style = MaterialTheme.typography.labelLarge)
-                }
+                )
+                HeroActionButton(
+                    icon = Icons.Rounded.Info,
+                    label = "Details",
+                    primary = false,
+                    onClick = { onDetails(item) },
+                )
             }
         }
     }

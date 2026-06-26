@@ -30,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -65,6 +66,9 @@ fun TvNavRail(
     selectedRoute: String,
     onSelect: (TvDestination) -> Unit,
     modifier: Modifier = Modifier,
+    /** Attached to the SELECTED item so the shell can land initial app-launch focus on the rail (so it's
+     *  obvious you're in the menu) rather than on the home content. */
+    selectedItemFocus: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     Column(
         modifier = modifier
@@ -95,6 +99,7 @@ fun TvNavRail(
                 destination = dest,
                 selected = dest.route == selectedRoute,
                 onSelect = { onSelect(dest) },
+                focusRequester = if (dest.route == selectedRoute) selectedItemFocus else null,
             )
         }
 
@@ -107,6 +112,7 @@ private fun TvNavItem(
     destination: TvDestination,
     selected: Boolean,
     onSelect: () -> Unit,
+    focusRequester: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -134,7 +140,9 @@ private fun TvNavItem(
             focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier),
     ) {
         Box(
             modifier = Modifier
