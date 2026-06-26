@@ -258,9 +258,11 @@ fun TvPlayerScreen(
     }
 
     // Auto-hide the transport overlay after a few seconds of no interaction (never while a panel is
-    // open or a scrub is in progress).
-    LaunchedEffect(controlsVisible, anyPanelOpen, scrubbing) {
-        if (controlsVisible && !anyPanelOpen && !scrubbing) {
+    // open or a scrub is in progress). ONLY while Playing — during Buffering/Error there is no
+    // transport, and letting controlsVisible churn there would steal focus from the overlay's own
+    // buttons (Back / Switch source) via the root-focus effect below.
+    LaunchedEffect(controlsVisible, anyPanelOpen, scrubbing, uiState) {
+        if (uiState is PlayerUiState.Playing && controlsVisible && !anyPanelOpen && !scrubbing) {
             kotlinx.coroutines.delay(5_000)
             controlsVisible = false
         }
@@ -268,9 +270,12 @@ fun TvPlayerScreen(
 
     // When the controls are hidden (and no panel is open) there is no focusable
     // overlay target, so pull focus back to the root Box. Its onPreviewKeyEvent then
-    // receives any D-pad press and re-shows the transport.
-    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showSimilarBar) {
-        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showSimilarBar) {
+    // receives any D-pad press and re-shows the transport. ONLY while Playing — the Buffering/Error
+    // overlays own their own focus (Back / Switch source / Retry); stealing it to the invisible root
+    // Box is exactly what left the loading screen unfocused with a dead D-pad.
+    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showSimilarBar, uiState) {
+        if (uiState is PlayerUiState.Playing &&
+            !controlsVisible && !anyPanelOpen && !showUpNext && !showSimilarBar) {
             rootFocus.requestFocus()
         }
     }
@@ -295,7 +300,11 @@ fun TvPlayerScreen(
             .fillMaxSize()
             .background(Color.Black)
             .focusRequester(rootFocus)
-            .focusable()
+            // Focusable only while Playing — it's the off-screen target the D-pad lands on to re-show
+            // the transport. During Buffering/Error it must NOT be a focus target, or it competes with
+            // the overlay's own Back / Switch-source buttons for initial focus. onPreviewKeyEvent still
+            // fires here via the focused overlay button, so the remote's media keys keep working.
+            .focusable(enabled = uiState is PlayerUiState.Playing)
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 val p = player
