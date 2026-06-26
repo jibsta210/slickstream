@@ -341,6 +341,34 @@ fun TvPlayerScreen(
             }
         }
 
+        // Torrent chunk bar pinned to the very bottom edge, shown with the transport. Lets the viewer
+        // watch the file fill in (downloaded slices vs the playhead). Polled ~1/s.
+        if (uiState is PlayerUiState.Playing) {
+            var pieceMap by remember { mutableStateOf(FloatArray(0)) }
+            var playheadFrac by remember { mutableStateOf(0f) }
+            LaunchedEffect(player) {
+                while (true) {
+                    pieceMap = viewModel.pieceMap(com.slickstream.feature.player.PIECE_BAR_BUCKETS)
+                    val p = player
+                    playheadFrac = if (p != null && p.duration > 0)
+                        (p.currentPosition.toFloat() / p.duration).coerceIn(0f, 1f) else 0f
+                    kotlinx.coroutines.delay(1000)
+                }
+            }
+            AnimatedVisibility(
+                visible = controlsVisible,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.BottomCenter),
+            ) {
+                com.slickstream.feature.player.PieceBar(
+                    map = pieceMap,
+                    playheadFraction = playheadFrac,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+                )
+            }
+        }
+
         // Focusable sources side-panel for quality switching.
         AnimatedVisibility(
             visible = panelOpen,

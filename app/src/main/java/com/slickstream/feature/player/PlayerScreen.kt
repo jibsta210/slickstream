@@ -385,6 +385,33 @@ fun PlayerScreen(
             if (rebuf != null && !isCasting && scrubPreviewMs == null) {
                 RebufferBadge(rebuf, modifier = Modifier.align(Alignment.Center))
             }
+
+            // Torrent chunk bar at the bottom, shown with the controls — watch the file fill in. Polled ~1/s.
+            if (uiState is PlayerUiState.Playing && !isCasting) {
+                var pieceMap by remember { mutableStateOf(FloatArray(0)) }
+                var playheadFrac by remember { mutableStateOf(0f) }
+                LaunchedEffect(activePlayer) {
+                    while (true) {
+                        pieceMap = viewModel.pieceMap(PIECE_BAR_BUCKETS)
+                        val p = activePlayer
+                        playheadFrac = if (p != null && p.duration > 0)
+                            (p.currentPosition.toFloat() / p.duration).coerceIn(0f, 1f) else 0f
+                        delay(1000)
+                    }
+                }
+                AnimatedVisibility(
+                    visible = overlayVisible,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                ) {
+                    PieceBar(
+                        map = pieceMap,
+                        playheadFraction = playheadFrac,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                }
+            }
         }
     }
 

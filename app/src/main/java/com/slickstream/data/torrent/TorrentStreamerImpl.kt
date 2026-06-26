@@ -287,6 +287,9 @@ class TorrentStreamerImpl @Inject constructor(
     override fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean =
         engine.isByteAvailable(infoHash, byteOffset)
 
+    override fun pieceMap(infoHash: String, buckets: Int): FloatArray =
+        engine.pieceMap(infoHash, buckets)
+
     // --- internals -------------------------------------------------------------------------
 
     @Synchronized

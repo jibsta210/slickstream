@@ -106,19 +106,17 @@ class TorrentEngine @Inject constructor(
         readaheadBytes = if (lowPower) LOW_POWER_READAHEAD_BYTES else READAHEAD_BYTES
         val sp = SettingsPack().apply {
             // --- Peer / socket load -----------------------------------------------------------------
-            // Balance: enough peers to keep the download alive (and recover from swarm churn — too few
-            // and a popular torrent can still stall to 0 B/s mid-stream when its current peers drop),
-            // but FAR below the old 800 that exhausted a consumer router's NAT/conntrack table and tanked
-            // the whole home connection. The real anti-tank lever is the DOWNLOAD-RATE CAP below (bounds
-            // bandwidth regardless of socket count); 200/80 sockets with a capped rate won't saturate a
-            // router. A healthy connect ramp also lets a stalled download re-find peers instead of sitting
-            // at 0.
-            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 80 else 200)
-            setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 3 else 6)
-            setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 2 else 3)
-            setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 6 else 12)
-            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 40 else 80)
-            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 40 else 120)
+            // High connection budget so we actually grab a big slice of the swarm (an "80 seeder"
+            // torrent connecting to only 7 is just too few sockets), AND a download-rate cap below as
+            // the SOLE anti-tank lever: with bandwidth bounded, a large idle/choked socket count doesn't
+            // saturate a gigabit link. 1000 on capable; the TV (lowPower) stays a bit lower (600) only to
+            // bound per-peer crypto on a weak SoC, not for bandwidth.
+            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 600 else 1000)
+            setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 4 else 8)
+            setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 2 else 4)
+            setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 8 else 16)
+            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 80 else 200)
+            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 80 else 300)
             // Announce to only the first working tier on low-power (less inbound peer flood to crypt).
             setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), !lowPower)
@@ -150,7 +148,7 @@ class TorrentEngine @Inject constructor(
             // gigabit link free. TV stays 8 MB/s (also bounds SHA-1 hashing / eMMC write pressure).
             setInteger(
                 settings_pack.int_types.download_rate_limit.swigValue(),
-                if (lowPower) 8 * 1024 * 1024 else 12 * 1024 * 1024,
+                if (lowPower) 12 * 1024 * 1024 else 16 * 1024 * 1024,
             )
 
             // Pin the disk/hash worker pools to 1 on low-power — libtorrent otherwise scales them to
@@ -707,6 +705,37 @@ class TorrentEngine @Inject constructor(
                     }
                 }
             }.onFailure { Log.w(TAG, "prefetchByteOffsets failed", it) }
+        }
+    }
+
+    /**
+     * Downsample the selected file's piece bitfield into [buckets] fill fractions (0f..1f) spanning the
+     * file start→end — the data behind the player's "chunk bar". Empty array until pieces exist.
+     */
+    fun pieceMap(infoHash: String, buckets: Int): FloatArray = synchronized(nativeLock) {
+        if (buckets <= 0) return@synchronized FloatArray(0)
+        val active = torrents[infoHash] ?: return@synchronized FloatArray(0)
+        val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized FloatArray(0)
+        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
+            ?: return@synchronized FloatArray(0)
+        val pieces = status.pieces()
+        val pieceCount = pieces.size()
+        if (pieceCount == 0) return@synchronized FloatArray(0)
+        val first = active.firstPiece
+        val last = active.lastPiece
+        val total = (last - first + 1).coerceAtLeast(1)
+        FloatArray(buckets) { b ->
+            val start = first + (b.toLong() * total / buckets).toInt()
+            val end = first + ((b + 1).toLong() * total / buckets).toInt() - 1
+            var present = 0
+            var count = 0
+            var p = start
+            while (p <= end && p in first..last) {
+                count++
+                if (p < pieceCount && runCatching { pieces.getBit(p) }.getOrDefault(false)) present++
+                p++
+            }
+            if (count > 0) present.toFloat() / count else 0f
         }
     }
 

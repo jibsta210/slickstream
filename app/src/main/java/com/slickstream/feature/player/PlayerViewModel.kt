@@ -253,6 +253,10 @@ class PlayerViewModel @Inject constructor(
     /** Nearest decoded preview frame to [positionMs], or null when that slice isn't sampled yet. */
     fun thumbnailAt(positionMs: Long): android.graphics.Bitmap? = thumbnails.thumbnailAt(positionMs)
 
+    /** Per-bucket download fill (0f..1f) across the file for the player's chunk bar; empty when N/A. */
+    fun pieceMap(buckets: Int): FloatArray =
+        activeInfoHash?.let { torrentStreamer.pieceMap(it, buckets) } ?: FloatArray(0)
+
     // --- Subtitles ---
     private val _subtitles = MutableStateFlow<List<SubtitleTrack>>(emptyList())
     val subtitles: StateFlow<List<SubtitleTrack>> = _subtitles.asStateFlow()

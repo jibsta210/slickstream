@@ -168,6 +168,10 @@ interface TorrentStreamer {
 
     /** Non-blocking: is the slice covering this file byte-offset on disk yet? */
     fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean
+
+    /** Downsample the file's downloaded-piece state into [buckets] fill fractions (0f..1f), start→end,
+     *  for the player's chunk/piece bar. Empty until pieces exist. */
+    fun pieceMap(infoHash: String, buckets: Int): FloatArray
 }
 
 /** Google OAuth via Credential Manager. Implemented by feature/auth. */
