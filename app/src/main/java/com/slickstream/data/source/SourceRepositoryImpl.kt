@@ -63,7 +63,18 @@ class SourceRepositoryImpl @Inject constructor(
                 .groupBy { it.infoHash }
                 .map { (_, rows) -> rows.maxByOrNull { it.seeders ?: 0 }!! }
                 .sortedByDescending { it.rank }
-            DataResult.Success(sources)
+            // English-only by default — foreign releases shouldn't even be an OPTION (the user keeps
+            // hitting random Spanish/Chinese). Prefer English; if a title genuinely has no English
+            // release, still NEVER surface an unreadable non-Latin name — fall back to Latin-script
+            // (e.g. a Spanish-only foreign film), and only to the raw list if even that is empty.
+            val movieTitle = details.item.title
+            val english = sources.filter {
+                it.englishLikely && StreamPicker.noForeignLanguageTag(it.title, movieTitle)
+            }
+            val filtered = english.ifEmpty {
+                sources.filterNot { StreamPicker.hasNonLatin(it.title) }.ifEmpty { sources }
+            }
+            DataResult.Success(filtered)
         } catch (t: Throwable) {
             DataResult.Error(
                 "Failed to resolve sources for \"${details.item.title}\": ${t.message ?: "unknown error"}",

@@ -77,13 +77,22 @@ object StreamPicker {
         return picked ?: list.first()
     }
 
-    // Cyrillic + CJK (hiragana/katakana/CJK ideographs) — a hard non-English signal in a torrent name.
-    private val NON_LATIN = Regex("[\\u0400-\\u04FF\\u3040-\\u30FF\\u4E00-\\u9FFF]")
-    // Common language tags torrents use. 3-letter codes are bounded to avoid matching 'challenge' etc.
+    // Any non-Latin script in a torrent name is a hard non-English signal: Cyrillic, Greek, Hebrew,
+    // Arabic, Devanagari (Hindi), Thai, Hangul (Korean), Hiragana/Katakana + CJK (Chinese/Japanese).
+    private val NON_LATIN = Regex(
+        "[\\u0370-\\u03FF\\u0400-\\u052F\\u0590-\\u05FF\\u0600-\\u06FF\\u0900-\\u097F\\u0E00-\\u0E7F" +
+            "\\u1100-\\u11FF\\u3040-\\u30FF\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uAC00-\\uD7AF\\uF900-\\uFAFF]",
+    )
+    // Foreign-language markers torrents use. Deliberately NO bare English language-names (french,
+    // spanish, italian, chinese…) — those appear in real English titles ("The French Dispatch", "The
+    // Italian Job", "Tai Chi") and we now FILTER on this, so a collision would hide the movie. Instead:
+    // word-bounded language CODES, foreign-NATIVE words, and release JARGON that never appears in an
+    // English title (temporada/capitulo/doblado/vostfr/castellano…).
     private val FOREIGN = Regex(
-        "(?i)\\b(rus|russian|ita|italian|ger|german|deutsch|fre|french|vostfr|truefrench|spa|spanish|" +
-            "castellano|latino|hindi|tamil|telugu|kor|korean|jpn|japanese|chi|chinese|" +
-            "pol|polish|plsub|plsubbed|ofdub|dublado|legendado)\\b",
+        "(?i)\\b(rus|ita|ger|deutsch|fre|francais|vostfr|vff|truefrench|spa|espanol|castellano|latino|" +
+            "temporada|capitulo|capitulos|subtitulad[oa]|doblad[oa]|doblaje|vose|hindi|tamil|telugu|" +
+            "kor|jpn|cantonese|mandarin|pol|plsub|plsubbed|ofdub|dublado|dublagem|legendado|" +
+            "portugues|swesub)\\b",
     )
     private val ENGLISH = Regex("(?i)\\b(eng|english)\\b")
     // A pair of regional-indicator symbols = a country flag emoji. Torrentio tags foreign releases
@@ -98,6 +107,30 @@ object StreamPicker {
         if (FLAG.containsMatchIn(text) && !text.contains(FLAG_GB) && !text.contains(FLAG_US)) return false
         if (FOREIGN.containsMatchIn(text)) return ENGLISH.containsMatchIn(text)
         return true
+    }
+
+    /** True if the text contains any non-Latin script (CJK/Cyrillic/Arabic/…) — an unreadable name we
+     *  never want to surface as a pickable source. */
+    fun hasNonLatin(text: String): Boolean = NON_LATIN.containsMatchIn(text)
+
+    // Bare English language-NAMES. Kept OUT of FOREIGN (they collide with real English titles) and only
+    // applied with the movie's own title words stripped — see [noForeignLanguageTag].
+    private val LANG_NAME = Regex(
+        "(?i)\\b(spanish|french|italian|german|chinese|japanese|korean|russian|polish|portuguese|" +
+            "dutch|swedish|danish|norwegian|finnish|turkish|arabic|thai|vietnamese|greek|hebrew)\\b",
+    )
+    private val NON_WORD = Regex("[^\\p{L}0-9]+")
+
+    /**
+     * True unless a bare foreign language-NAME survives once the movie's OWN title words are removed.
+     * So "The French Dispatch" keeps 'french' (a title word → stripped → fine), but a ".SPANISH." dub
+     * of an English film leaves 'spanish' behind → rejected. Pairs with [looksEnglish] (which handles
+     * non-Latin scripts, flags, native words and codes) for the full English-only decision.
+     */
+    fun noForeignLanguageTag(sourceText: String, movieTitle: String): Boolean {
+        val titleWords = movieTitle.lowercase().split(NON_WORD).filter { it.length >= 3 }.toSet()
+        val rest = sourceText.split(NON_WORD).filterNot { it.lowercase() in titleWords }.joinToString(" ")
+        return !LANG_NAME.containsMatchIn(rest)
     }
 
     // Codecs/containers Android's ExoPlayer cannot decode without the FFmpeg extension: XviD/DivX
