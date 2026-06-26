@@ -9,7 +9,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -52,6 +54,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -82,6 +85,7 @@ import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.slickstream.data.vlc.VlcPlayer
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.tv.material3.Border
@@ -91,6 +95,7 @@ import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.slickstream.core.model.Episode
+import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.data.settings.SubtitleSize
@@ -112,6 +117,7 @@ import com.slickstream.ui.theme.Brand
 fun TvPlayerScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    onPlayMedia: (com.slickstream.core.model.MediaType, Int) -> Unit = { _, _ -> },
     viewModel: PlayerViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -132,6 +138,7 @@ fun TvPlayerScreen(
     val rebuffering by viewModel.rebuffering.collectAsStateWithLifecycle()
     val backdropUrl by viewModel.backdropUrl.collectAsStateWithLifecycle()
     val upNext by viewModel.upNextEpisode.collectAsStateWithLifecycle()
+    val similarMovies by viewModel.similarMovies.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -144,11 +151,18 @@ fun TvPlayerScreen(
     // "Up next" card near the end of an episode; dismissal resets whenever the episode changes.
     var nearEnd by remember { mutableStateOf(false) }
     var upNextDismissed by remember(currentSeasonNumber, currentEpisodeNumber) { mutableStateOf(false) }
+    // End-of-movie "similar titles" bar.
+    var movieBarDismissed by remember { mutableStateOf(false) }
+    var movieBarFocused by remember { mutableStateOf(0) }     // which similar card autoplays
+    var movieBarTouched by remember { mutableStateOf(false) } // user browsed -> stop the autoplay clock
+    var movieAutoplaySecs by remember { mutableStateOf(MOVIE_AUTOPLAY_SECS) }
+    var endingSoon by remember { mutableStateOf(false) }      // within the last seconds -> arm autoplay
 
     val rootFocus = remember { FocusRequester() }
     val playPauseFocus = remember { FocusRequester() }
     val scrubFocus = remember { FocusRequester() }
     val upNextFocus = remember { FocusRequester() }
+    val movieBarFocus = remember { FocusRequester() }
 
     // Track play state for the toggle icon.
     DisposableEffect(player) {
@@ -168,6 +182,25 @@ fun TvPlayerScreen(
     val showUpNext = nearEnd && hasNext && upNext != null && !upNextDismissed &&
         !controlsVisible && uiState is PlayerUiState.Playing
 
+    // End-of-movie: a bottom bar of similar titles that autoplays the most-related (Prime-style).
+    val showMovieBar = viewModel.isMovie && nearEnd && similarMovies.isNotEmpty() &&
+        !movieBarDismissed && !controlsVisible && uiState is PlayerUiState.Playing
+
+    // Autoplay countdown: ARMS only in the final stretch (so a movie isn't cut off at 93%), and ticks
+    // only until the user browses the row — then it waits for an explicit OK.
+    LaunchedEffect(showMovieBar, movieBarTouched, endingSoon) {
+        if (!showMovieBar || movieBarTouched || !endingSoon) return@LaunchedEffect
+        movieAutoplaySecs = MOVIE_AUTOPLAY_SECS
+        while (movieAutoplaySecs > 0) {
+            kotlinx.coroutines.delay(1000)
+            movieAutoplaySecs--
+        }
+        similarMovies.getOrNull(movieBarFocused)?.let { onPlayMedia(it.mediaType, it.id) }
+    }
+    LaunchedEffect(showMovieBar) {
+        if (showMovieBar) runCatching { movieBarFocus.requestFocus() }
+    }
+
     // Poll position ~1/s to learn when we've crossed UP_NEXT_PCT. Movies / no-next never qualify.
     LaunchedEffect(player, uiState) {
         if (uiState !is PlayerUiState.Playing) {
@@ -176,8 +209,13 @@ fun TvPlayerScreen(
         }
         while (true) {
             val p = player
-            nearEnd = p != null && p.duration > 0 &&
-                p.currentPosition.toFloat() / p.duration >= UP_NEXT_PCT
+            if (p != null && p.duration > 0) {
+                nearEnd = p.currentPosition.toFloat() / p.duration >= UP_NEXT_PCT
+                endingSoon = (p.duration - p.currentPosition) in 0..MOVIE_AUTOPLAY_LEAD_MS
+            } else {
+                nearEnd = false
+                endingSoon = false
+            }
             kotlinx.coroutines.delay(1000)
         }
     }
@@ -211,8 +249,8 @@ fun TvPlayerScreen(
     // When the controls are hidden (and no panel is open) there is no focusable
     // overlay target, so pull focus back to the root Box. Its onPreviewKeyEvent then
     // receives any D-pad press and re-shows the transport.
-    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext) {
-        if (!controlsVisible && !anyPanelOpen && !showUpNext) {
+    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showMovieBar) {
+        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showMovieBar) {
             rootFocus.requestFocus()
         }
     }
@@ -222,8 +260,9 @@ fun TvPlayerScreen(
             episodesPanelOpen -> episodesPanelOpen = false
             subsPanelOpen -> subsPanelOpen = false
             panelOpen -> panelOpen = false
-            // Back on the Up-next card just hides it (keep watching the tail of the episode).
+            // Back on the Up-next card / movie bar just hides it (keep watching the tail).
             showUpNext -> upNextDismissed = true
+            showMovieBar -> movieBarDismissed = true
             // While buffering/fetching or errored there's no transport to dismiss — leave at once.
             uiState !is PlayerUiState.Playing -> onBack()
             controlsVisible -> controlsVisible = false
@@ -254,7 +293,7 @@ fun TvPlayerScreen(
                     else -> {
                         // Any other D-pad press just re-shows the transport (while playing) — UNLESS the
                         // Up-next card is up, in which case the press belongs to the card's buttons.
-                        if (!controlsVisible && !anyPanelOpen && !showUpNext && uiState is PlayerUiState.Playing) {
+                        if (!controlsVisible && !anyPanelOpen && !showUpNext && !showMovieBar && uiState is PlayerUiState.Playing) {
                             controlsVisible = true
                             true
                         } else {
@@ -433,6 +472,25 @@ fun TvPlayerScreen(
                     onDismiss = { upNextDismissed = true },
                 )
             }
+        }
+
+        // End-of-movie "similar titles" bar — autoplays the most-related; ◀▶ to pick another.
+        AnimatedVisibility(
+            visible = showMovieBar,
+            enter = slideInVertically { it } + fadeIn(),
+            exit = slideOutVertically { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
+            TvSimilarMoviesBar(
+                movies = similarMovies,
+                autoplaySecs = if (movieBarTouched || !endingSoon) null else movieAutoplaySecs,
+                firstFocus = movieBarFocus,
+                onFocusIndex = { idx ->
+                    movieBarFocused = idx
+                    if (idx != 0) movieBarTouched = true   // browsed off the default -> stop the clock
+                },
+                onPlay = { item -> onPlayMedia(item.mediaType, item.id) },
+            )
         }
 
         // Focusable sources side-panel for quality switching.
@@ -657,6 +715,100 @@ private const val UP_NEXT_PCT = 0.93f
 
 /** After dismissing the Up-next card, bring it back this long later (it nags gently, like Netflix). */
 private const val UP_NEXT_REDISPLAY_MS = 30_000L
+
+/** Seconds before the end-of-movie bar autoplays the most-related title (unless the user browses). */
+private const val MOVIE_AUTOPLAY_SECS = 12
+
+/** Only ARM the movie autoplay countdown inside the final stretch, so a long movie isn't cut off at
+ *  93%. The bar is still browsable from 93%; the countdown just doesn't run until here. */
+private const val MOVIE_AUTOPLAY_LEAD_MS = 35_000L
+
+/**
+ * End-of-movie "similar titles" bar (Prime-style): a header with the autoplay countdown over a
+ * horizontal rail of poster cards. The first (most-related) autoplays when the countdown expires; the
+ * user can D-pad ◀▶ to pick another (which stops the clock) and press OK to play it, or Back to dismiss.
+ */
+@Composable
+private fun TvSimilarMoviesBar(
+    movies: List<MediaItem>,
+    autoplaySecs: Int?,
+    firstFocus: FocusRequester,
+    onFocusIndex: (Int) -> Unit,
+    onPlay: (MediaItem) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                Brush.verticalGradient(0f to Color.Transparent, 0.5f to Color(0xCC000000), 1f to Color(0xF2000000)),
+            )
+            .padding(start = 48.dp, end = 48.dp, top = 48.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        val first = movies.firstOrNull()
+        Text(
+            text = if (autoplaySecs != null && first != null) "Up next  ·  ${first.title}  ·  playing in ${autoplaySecs}s"
+            else "Similar movies  ·  pick one to play",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            itemsIndexed(movies, key = { _, m -> m.id }) { index, movie ->
+                TvSimilarCard(
+                    movie = movie,
+                    onFocused = { onFocusIndex(index) },
+                    onClick = { onPlay(movie) },
+                    modifier = if (index == 0) Modifier.focusRequester(firstFocus) else Modifier,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TvSimilarCard(
+    movie: MediaItem,
+    onFocused: () -> Unit,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Brand.Surface,
+            focusedContainerColor = Brand.Surface,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.08f),
+        modifier = modifier
+            .width(124.dp)
+            .onFocusChanged { if (it.isFocused) onFocused() },
+    ) {
+        Column {
+            AsyncImage(
+                model = movie.posterUrl,
+                contentDescription = movie.title,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.width(124.dp).height(186.dp).clip(shape),
+            )
+            Text(
+                text = movie.title,
+                style = MaterialTheme.typography.labelMedium,
+                color = Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.width(124.dp).padding(horizontal = 6.dp, vertical = 6.dp),
+            )
+        }
+    }
+}
 
 /**
  * "Up next" card: the next episode's still + title with a focusable "Play now" / "Dismiss". Shown near

@@ -210,6 +210,14 @@ class PlayerViewModel @Inject constructor(
     private val _upNextEpisode = MutableStateFlow<Episode?>(null)
     val upNextEpisode: StateFlow<Episode?> = _upNextEpisode.asStateFlow()
 
+    /** True for a movie (no episodes) — drives the end-of-movie "similar titles" bar instead of the
+     *  next-episode card. */
+    val isMovie: Boolean get() = mediaType == MediaType.MOVIE
+
+    /** Similar movies (TMDB) for the end-of-movie autoplay bar; empty for TV or until loaded. */
+    private val _similarMovies = MutableStateFlow<List<MediaItem>>(emptyList())
+    val similarMovies: StateFlow<List<MediaItem>> = _similarMovies.asStateFlow()
+
     // --- Internal -----------------------------------------------------------
     private var details: MediaDetails? = null
     private var streamJob: Job? = null
@@ -330,6 +338,14 @@ class PlayerViewModel @Inject constructor(
      *  callback (wired in ensureCastPlayer) drives transferToLocal() at the cast position. */
     fun stopCasting() = castManager.stopCasting(stopReceiver = true)
 
+    /** Fetch TMDB "similar" titles for the end-of-movie autoplay bar (non-critical; ignore failures). */
+    private suspend fun loadSimilarMovies() {
+        when (val r = catalogRepository.getSimilar(mediaId, mediaType)) {
+            is DataResult.Success -> _similarMovies.value = r.data.filter { it.posterUrl != null }.take(12)
+            is DataResult.Error -> Unit
+        }
+    }
+
     private fun load() {
         viewModelScope.launch {
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Fetching details…")
@@ -345,6 +361,7 @@ class PlayerViewModel @Inject constructor(
             _backdropUrl.value = d.item.backdropUrl ?: d.item.posterUrl
             viewModelScope.launch { loadSubtitles(d) }
             viewModelScope.launch { loadEpisodeList() }
+            if (isMovie) viewModelScope.launch { loadSimilarMovies() }
 
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
             val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {

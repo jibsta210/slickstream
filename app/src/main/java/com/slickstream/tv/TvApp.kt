@@ -243,7 +243,17 @@ fun TvApp() {
                                 },
                             ),
                         ) {
-                            TvPlayerScreen(onBack = { navController.popBackStack() })
+                            TvPlayerScreen(
+                                onBack = { navController.popBackStack() },
+                                // End-of-movie autoplay: replace the current player on the back stack so
+                                // back returns to where the user started, not a chain of finished movies.
+                                onPlayMedia = { type, id ->
+                                    navController.navigate(Routes.player(type, id)) {
+                                        popUpTo(Routes.PLAYER) { inclusive = true }
+                                        launchSingleTop = true
+                                    }
+                                },
+                            )
                         }
                     }
                 }
