@@ -100,6 +100,10 @@ class TorrentStreamerImpl @Inject constructor(
         val server = ensureServer()
         val streamUrl = server.urlFor(infoHash)
 
+        // Only mp4/m4v/mov MUST have the EOF moov atom present before ExoPlayer can parse a frame. mkv/
+        // webm/avi keep their index near the front, so they can START on the head alone — no tail wait.
+        val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS
+
         // BUFFERING phase.
         trySend(buildStatus(source, infoHash, StreamState.BUFFERING, streamUrl = null))
 
@@ -109,6 +113,7 @@ class TorrentStreamerImpl @Inject constructor(
             var headReadySince = 0L
             var zeroRateSince = 0L
             var lastReannounce = 0L
+            val streamStartMs = System.currentTimeMillis()
             while (isActive) {
                 val snap = engine.snapshot(infoHash)
                 if (snap == null) {
@@ -141,19 +146,21 @@ class TorrentStreamerImpl @Inject constructor(
 
                 val headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= READY_HEAD_BYTES
-                if (headReady && headReadySince == 0L) headReadySince = System.currentTimeMillis()
-                // Gate READY on head + tail for EVERY container. ExoPlayer reads the EOF tail (mp4 moov
-                // OR mkv cues) during prepare, so starting before it's in just moves the wait into a
-                // ~15s "Almost ready" stall AFTER the countdown hit zero. Waiting for it (the engine now
-                // fetches it in parallel with the head) makes the byte countdown actually cover the time
-                // to first frame. Hard-capped so a genuinely-absent/slow tail still starts eventually and
-                // lets the player's retries + failover take over instead of blocking forever.
-                val tailReady = engine.tailAvailable(infoHash)
-                val tailGraceElapsed = headReadySince > 0L &&
-                    System.currentTimeMillis() - headReadySince > TAIL_HARD_CAP_MS
-                val canStart = headReady && (tailReady || tailGraceElapsed)
+                if (headReady && headReadySince == 0L) headReadySince = now
+                // Tail gate is now CONTAINER-AWARE: mkv/webm start on head alone; only mp4 waits for the
+                // moov (so prepare() never ranges into an absent EOF atom). Three escape hatches make
+                // sure the gate can NEVER stick: tail-grace once the head is in, AND a head-INDEPENDENT
+                // overall hard cap — the real "3MB/s for 60s, never plays" trap was that the contiguous
+                // head can stay pinned below the gate (one slow early piece) so the head-keyed grace
+                // clock never even armed. After OVERALL_HARD_CAP_MS we start with whatever head exists
+                // and let the player's retries + the buffering watchdog take over.
+                val tailReady = !needsTail || engine.tailAvailable(infoHash)
+                val tailGraceElapsed = headReadySince > 0L && now - headReadySince > TAIL_HARD_CAP_MS
+                val overallGrace = now - streamStartMs > OVERALL_HARD_CAP_MS
+                val canStart = (headReady || (overallGrace && headBytes > 0L)) &&
+                    (tailReady || tailGraceElapsed || overallGrace)
 
-                // ETA to first frame, against the real gate (head + tail), refreshed each poll.
+                // ETA to first frame, against the real gate (head + tail-when-needed), refreshed each poll.
                 val eta = estimateEta(snap, headBytes, tailReady)
 
                 if (pollCount++ % DIAG_EVERY == 0) {
@@ -440,6 +447,15 @@ class TorrentStreamerImpl @Inject constructor(
          *  (fetched in parallel) is in well before this, so the gate rarely waits; this just bounds the
          *  worst case so a slow/absent tail starts head-only and lets player retries + failover handle it. */
         private const val TAIL_HARD_CAP_MS = 15_000L
+
+        /** Head-INDEPENDENT hard cap: the gate can never sit BUFFERING longer than this, even if the
+         *  contiguous head is pinned below READY by a slow early piece (the "fast download, never plays"
+         *  trap). After it, we start with whatever head exists and let player retries + failover work. */
+        private const val OVERALL_HARD_CAP_MS = 25_000L
+
+        /** Containers whose index (moov atom) lives at EOF and MUST be present before the first frame.
+         *  Everything else (mkv/webm/avi…) starts on the head alone. */
+        private val MOOV_CONTAINERS = setOf("mp4", "m4v", "mov")
 
         /** Emit a diagnostic log line every Nth poll (~2 s at a 500 ms interval). */
         private const val DIAG_EVERY = 4

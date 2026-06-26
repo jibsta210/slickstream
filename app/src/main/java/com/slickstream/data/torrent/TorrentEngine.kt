@@ -477,7 +477,17 @@ class TorrentEngine @Inject constructor(
                     .or_(TorrentFlags.PAUSED)
                     .or_(TorrentFlags.AUTO_MANAGED),
             )
-            handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+            // Park the sequential cursor AT THE SELECTED FILE'S first piece, not torrent piece 0. In a
+            // season pack the wanted episode sits at a big fileOffset (firstPiece is hundreds of pieces
+            // in); the torrent-wide SEQUENTIAL_DOWNLOAD flag aims libtorrent's "lowest piece" cursor at
+            // piece 0, so the selected file's contiguous head filled only as far as the few deadlined
+            // pieces and then stalled (contiguousHeadBytes pinned below the READY gate → "3 MB/s for 60s,
+            // never plays"). setSequentialRange makes the file's head the lowest eligible piece, so the
+            // bulk in-order requests actually fill E5's head. Fall back to the global flag if unavailable.
+            val ranged = runCatching {
+                handle.setSequentialRange(active.firstPiece, active.lastPiece)
+            }.isSuccess
+            if (!ranged) handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
             handle.resume()
         }.onFailure { Log.w(TAG, "set streaming flags failed", it) }
         prioritizeHeadAndTail(active)
@@ -572,7 +582,10 @@ class TorrentEngine @Inject constructor(
         // forward one 1 MB chunk at a time, each chunk racing the head cursor, and stalls for >1 min.
         // set_piece_deadline marks these "time critical" and libtorrent fetches them AHEAD of the
         // sequential cursor, so the whole moov arrives promptly and the moov gate never deadlocks.
-        val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
+        // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
+        // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
+        // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
+        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
         val tailFrom = active.lastPiece - tailPieces + 1
         val deadlineLast = if (lastNeeded >= tailFrom) active.lastPiece else lastNeeded
 
@@ -666,7 +679,10 @@ class TorrentEngine @Inject constructor(
         val active = torrents[infoHash] ?: return@synchronized false
         val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized false
         if (active.pieceLength <= 0) return@synchronized false
-        val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
+        // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
+        // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
+        // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
+        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
         val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
             ?: return@synchronized false
         val pieces = status.pieces()
@@ -900,7 +916,10 @@ class TorrentEngine @Inject constructor(
         // (at EOF) on every seek; if a forward-walking read head reset those pieces, a later seek
         // would have to re-fetch the moov against the sequential cursor and stall again. Keep the
         // tail permanently time-critical.
-        val tailPieces = (TAIL_PRIORITY_BYTES / active.pieceLength + 1)
+        // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
+        // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
+        // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
+        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
         val tailFrom = active.lastPiece - tailPieces + 1
         synchronized(nativeLock) { runCatching {
             if (prev >= 0) {
