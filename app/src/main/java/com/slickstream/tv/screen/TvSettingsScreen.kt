@@ -45,6 +45,7 @@ import com.slickstream.ui.theme.Brand
 @Composable
 fun TvSettingsScreen(
     modifier: Modifier = Modifier,
+    onOpenCalibration: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel(),
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
@@ -83,6 +84,27 @@ fun TvSettingsScreen(
         item {
             TvSettingSection("Display") {
                 TvOptionRow("Interface density", UiDensity.entries, settings.density, { it.label }, viewModel::setDensity)
+                val calShape = RoundedCornerShape(50)
+                Surface(
+                    onClick = onOpenCalibration,
+                    shape = ClickableSurfaceDefaults.shape(shape = calShape),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor = Brand.Surface,
+                        focusedContainerColor = Brand.Violet,
+                        contentColor = Brand.OnSurface,
+                        focusedContentColor = Color.White,
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet), shape = calShape),
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
+                ) {
+                    Text(
+                        "Screen calibration (fit to your TV)",
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                    )
+                }
             }
         }
 

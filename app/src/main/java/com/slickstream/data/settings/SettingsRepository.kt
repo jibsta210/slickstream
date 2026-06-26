@@ -4,6 +4,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -121,6 +122,11 @@ data class AppSettings(
     val subtitleStyle: SubtitleStyle = SubtitleStyle.DEFAULT,
     val streamSize: StreamSizePreference = StreamSizePreference.DEFAULT,
     val maxCacheSize: CacheSize = CacheSize.DEFAULT,
+    /** Screen calibration (TV overscan/underscan fit): uniform scale of the whole app (1f = none) and
+     *  a positional nudge in dp. Lets the user grow/shrink + center the picture to their panel. */
+    val screenScale: Float = 1f,
+    val screenOffsetX: Float = 0f,
+    val screenOffsetY: Float = 0f,
 )
 
 /**
@@ -148,6 +154,9 @@ class SettingsRepository @Inject constructor(
                 ?: StreamSizePreference.DEFAULT,
             maxCacheSize = p[KEY_MAX_CACHE]?.let { runCatching { CacheSize.valueOf(it) }.getOrNull() }
                 ?: CacheSize.DEFAULT,
+            screenScale = (p[KEY_SCREEN_SCALE] ?: 1f).coerceIn(0.80f, 1.20f),
+            screenOffsetX = (p[KEY_SCREEN_OFF_X] ?: 0f).coerceIn(-200f, 200f),
+            screenOffsetY = (p[KEY_SCREEN_OFF_Y] ?: 0f).coerceIn(-200f, 200f),
         )
     }
 
@@ -162,6 +171,11 @@ class SettingsRepository @Inject constructor(
     suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name }
     suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
+    suspend fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) = dataStore.edit {
+        it[KEY_SCREEN_SCALE] = scale.coerceIn(0.80f, 1.20f)
+        it[KEY_SCREEN_OFF_X] = offsetX.coerceIn(-200f, 200f)
+        it[KEY_SCREEN_OFF_Y] = offsetY.coerceIn(-200f, 200f)
+    }
 
     private fun String?.toQuality(default: QualityPreference): QualityPreference =
         this?.let { runCatching { QualityPreference.valueOf(it) }.getOrNull() } ?: default
@@ -176,5 +190,8 @@ class SettingsRepository @Inject constructor(
         val KEY_SUB_STYLE = stringPreferencesKey("sub_style")
         val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
+        val KEY_SCREEN_SCALE = floatPreferencesKey("screen_scale")
+        val KEY_SCREEN_OFF_X = floatPreferencesKey("screen_offset_x")
+        val KEY_SCREEN_OFF_Y = floatPreferencesKey("screen_offset_y")
     }
 }

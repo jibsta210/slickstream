@@ -126,7 +126,14 @@ class MainActivity : ComponentActivity() {
             ) {
                 SlickStreamTheme {
                     Box(Modifier.fillMaxSize()) {
-                        if (onTv) TvApp() else PhoneApp()
+                        // Screen calibration fits the whole app (UI + video) to the user's TV.
+                        com.slickstream.ui.ScreenCalibrated(
+                            scale = settings.screenScale,
+                            offsetX = settings.screenOffsetX,
+                            offsetY = settings.screenOffsetY,
+                        ) {
+                            if (onTv) TvApp() else PhoneApp()
+                        }
                         // Overlays both shells; checks for a self-hosted update on launch.
                         UpdateGate()
                     }

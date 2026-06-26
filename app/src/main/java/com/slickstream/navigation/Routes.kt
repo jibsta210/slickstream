@@ -16,6 +16,7 @@ object Routes {
     const val PROFILE = "profile"
     const val PROFILE_PICKER = "profile_picker"
     const val SETTINGS = "settings"
+    const val SCREEN_CALIBRATION = "screen_calibration"
     const val LOGIN = "login"
 
     // details/{mediaType}/{mediaId}

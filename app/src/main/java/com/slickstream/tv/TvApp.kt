@@ -24,6 +24,7 @@ import com.slickstream.tv.components.TvNavRail
 import com.slickstream.feature.live.LivePlayerScreen
 import com.slickstream.tv.screen.TvCatalogScreen
 import com.slickstream.tv.screen.TvCategoryScreen
+import com.slickstream.tv.screen.TvScreenCalibrationScreen
 import com.slickstream.tv.screen.TvSettingsScreen
 import com.slickstream.tv.screen.TvSportsScreen
 import com.slickstream.tv.screen.TvDetailsScreen
@@ -220,7 +221,13 @@ fun TvApp() {
                         }
 
                         composable(Routes.SETTINGS) {
-                            TvSettingsScreen()
+                            TvSettingsScreen(
+                                onOpenCalibration = { navController.navigate(Routes.SCREEN_CALIBRATION) },
+                            )
+                        }
+
+                        composable(Routes.SCREEN_CALIBRATION) {
+                            TvScreenCalibrationScreen(onBack = { navController.popBackStack() })
                         }
 
                         composable(

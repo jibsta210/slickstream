@@ -75,4 +75,8 @@ class SettingsViewModel @Inject constructor(
     fun setSubtitleStyle(style: SubtitleStyle) = viewModelScope.launch { repo.setSubtitleStyle(style) }
     fun setStreamSize(s: com.slickstream.data.settings.StreamSizePreference) =
         viewModelScope.launch { repo.setStreamSize(s) }
+
+    /** Screen calibration (TV fit). Saved live so the whole app re-fits as the user adjusts. */
+    fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) =
+        viewModelScope.launch { repo.setScreenCalibration(scale, offsetX, offsetY) }
 }
