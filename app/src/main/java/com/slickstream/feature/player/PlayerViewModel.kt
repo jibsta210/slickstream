@@ -505,13 +505,14 @@ class PlayerViewModel @Inject constructor(
         // Keep the just-failed partial in cache, then tear the poisoned player down so ensurePlayer()
         // rebuilds a clean one on the new URL. startSource() re-arms failoverInFlight = false.
         stopActiveStream(removeFiles = false)
-        teardownPlayerForFailover()
+        releaseLocalPlayer()
         startSource(next)
         return true
     }
 
-    /** Release the current (dead-ended) ExoPlayer so the next [ensurePlayer] builds a clean one. */
-    private fun teardownPlayerForFailover() {
+    /** Release the current ExoPlayer so the next [ensurePlayer] builds a clean one (failover + episode
+     *  switch both need a FRESH player, never the old one's leftover position/state). */
+    private fun releaseLocalPlayer() {
         bufferWatchdogJob?.cancel()
         progressTickJob?.cancel()
         val exo = _player.value
@@ -1202,9 +1203,10 @@ class PlayerViewModel @Inject constructor(
     /** Warm the next episode when within [PREFETCH_LEAD_MS] / [PREFETCH_PCT] of the end. */
     private fun maybeWarmNextEpisode() {
         if (mediaType != MediaType.TV) return
-        // No concurrent second-torrent download on a weak TV SoC — a full hash+disk+peer load during
-        // playback is a direct freeze trigger. Cost is only a buffering spinner between episodes.
-        if (deviceProfile.isLowPower) return
+        // Precache the next episode's head even on low-power TV — the user wants instant next-episode
+        // starts. It's a BOUNDED warm (a small head, then the torrent is parked/paused), and start()
+        // self-heals a parked torrent on play, so it never strands the next episode. If a weak TV ever
+        // hitches in the last few minutes of an episode, this gate is where to throttle it.
         if (prefetchTriggeredForEpisode) return
         if (_isCasting.value) return                 // remote playback: a phone-side head buffer is useless
         if (!isOnUnmeteredNetwork()) return
@@ -1334,10 +1336,19 @@ class PlayerViewModel @Inject constructor(
         if (season == currentSeason && episode == currentEpisode) return
 
         viewModelScope.launch {
-            // Persist where we are in the OUTGOING episode before switching coords.
+            // Persist where we are in the OUTGOING episode (coords are still the old ones here).
             saveProgressNow()
             bufferWatchdogJob?.cancel()
             stopActiveStream(removeFiles = false)
+            // Build a FRESH player for the next episode instead of reusing the old one. Two real bugs
+            // came from the reuse: (1) the old player kept the outgoing episode loaded at its ~90%
+            // position until the new media item arrived, and the progress ticker / pause callbacks could
+            // save THAT stale position under the NEW episode's key — so the next episode opened on the
+            // end credits; (2) a reused player sometimes never re-reached READY on the new source, so it
+            // buffered forever at full download speed while exiting + re-entering started it instantly.
+            // Releasing now (before the coord change, so no save can land on the new key) and letting
+            // ensurePlayer rebuild matches the clean fresh-entry path exactly.
+            releaseLocalPlayer()
             prefetchJob?.cancel()
             prefetchedInfoHash = null
 

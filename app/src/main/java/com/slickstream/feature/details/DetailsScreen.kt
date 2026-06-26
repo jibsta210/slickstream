@@ -255,12 +255,16 @@ private fun DetailsContent(
                     modifier = Modifier.padding(top = 20.dp),
                 )
             }
-            item("season-selector") {
-                SeasonSelector(
-                    seasons = state.seasons,
-                    selected = state.selectedSeasonNumber,
-                    onSelect = onSelectSeason,
-                )
+            // Only show the season picker when there's an actual choice — a single-season show (a
+            // limited series / miniseries) rendered one pointless chip labelled with the season's name.
+            if (state.seasons.size > 1) {
+                item("season-selector") {
+                    SeasonSelector(
+                        seasons = state.seasons,
+                        selected = state.selectedSeasonNumber,
+                        onSelect = onSelectSeason,
+                    )
+                }
             }
 
             when {

@@ -169,12 +169,17 @@ private fun DetailsContent(
             }
 
             if (state.isTv && state.seasons.isNotEmpty()) {
-                item(key = "seasons") {
-                    SeasonSelector(
-                        seasons = state.seasons,
-                        selected = state.selectedSeasonNumber,
-                        onSelect = onSelectSeason,
-                    )
+                // Only show the season picker when there's an actual choice. A single-season show (a
+                // limited series / miniseries) rendered one pointless focusable chip labelled with the
+                // season's name ("Limited Series", "Miniseries"…) that selected the only season.
+                if (state.seasons.size > 1) {
+                    item(key = "seasons") {
+                        SeasonSelector(
+                            seasons = state.seasons,
+                            selected = state.selectedSeasonNumber,
+                            onSelect = onSelectSeason,
+                        )
+                    }
                 }
                 item(key = "episodes") {
                     EpisodeList(
