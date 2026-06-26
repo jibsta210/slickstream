@@ -211,7 +211,36 @@ class FirebaseSync @Inject constructor(
         }.getOrDefault(emptyList())
     }
 
+    // --- Settings (account-level, device-agnostic) --------------------------
+    // A single doc per account holding the device-AGNOSTIC preferences (quality, subtitles, stream
+    // size, up-next thresholds, density). Screen calibration + cache size are per-device and are NOT
+    // synced — the coordinator simply never puts them in the map. "updatedAt" drives last-write-wins.
+
+    suspend fun pushSettings(map: Map<String, Any?>) {
+        val doc = settingsDoc() ?: return
+        runCatching { doc.set(map).await() }
+    }
+
+    suspend fun pullSettings(): Map<String, Any?>? {
+        val doc = settingsDoc() ?: return null
+        return runCatching {
+            val snap = doc.get().await()
+            if (snap.exists()) snap.data else null
+        }.getOrNull()
+    }
+
+    /** Live listener: settings changed on another device (whole-doc, last-write-wins). */
+    fun listenSettings(onChange: (Map<String, Any?>) -> Unit): ListenerRegistration? {
+        val doc = settingsDoc() ?: return null
+        return doc.addSnapshotListener { snap, _ ->
+            if (snap != null && snap.exists()) snap.data?.let(onChange)
+        }
+    }
+
     // --- helpers ------------------------------------------------------------
+
+    private fun settingsDoc() =
+        uid()?.let { db?.collection("users")?.document(it)?.collection("meta")?.document("settings") }
 
     private fun profileCol() = uid()?.let { db?.collection("users")?.document(it)?.collection("profiles") }
     private fun favCol() = uid()?.let { db?.collection("users")?.document(it)?.collection("favorites") }

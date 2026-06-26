@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -220,6 +221,61 @@ class SettingsRepository @Inject constructor(
         it[KEY_SCREEN_OFF_Y] = offsetY.coerceIn(OFFSET_MIN, OFFSET_MAX)
     }
 
+    // --- Cloud sync surface (device-AGNOSTIC subset) ----------------------------------------------
+    // The cloud mirrors only these account-level preferences. Screen calibration (panel overscan) and
+    // cache size (per-device storage) are deliberately EXCLUDED — they're physically device-specific.
+    // [SYNC_UPDATED_KEY] is a last-write-wins clock so the freshest change wins on sign-in.
+
+    /** The synced fields as a flat map (enum NAMEs for stability). No timestamp — the coordinator
+     *  stamps "updatedAt" at push time. */
+    suspend fun syncedSettingsMap(): Map<String, Any?> {
+        val s = current()
+        return mapOf(
+            "wifiQuality" to s.wifiQuality.name,
+            "cellularQuality" to s.cellularQuality.name,
+            "density" to s.density.name,
+            "subtitlesEnabled" to s.subtitlesEnabled,
+            "subtitleLanguage" to s.subtitleLanguage.name,
+            "subtitleSize" to s.subtitleSize.name,
+            "subtitleStyle" to s.subtitleStyle.name,
+            "streamSize" to s.streamSize.name,
+            "upNextPercent" to s.upNextPercent,
+            "movieBarPercent" to s.movieBarPercent,
+        )
+    }
+
+    /** A stable content signature over the synced fields (ignores updatedAt) — lets the coordinator
+     *  skip echo-pushes when a write merely reflects a value we just applied from the cloud. */
+    fun syncedSignature(map: Map<String, Any?>): String =
+        SYNCED_KEYS.joinToString("|") { "${it}=${map[it]}" }
+
+    /** When the local synced settings were last changed (ms). 0 = never (defaults). */
+    suspend fun syncedUpdatedAt(): Long = dataStore.data.first()[KEY_SYNC_UPDATED] ?: 0L
+
+    suspend fun stampSyncedUpdated(ts: Long) = dataStore.edit { it[KEY_SYNC_UPDATED] = ts }
+
+    /** Apply a settings doc pulled from the cloud, writing only the synced fields (unknown/garbage
+     *  values are ignored, keeping the current local value). Stamps the local LWW clock to the
+     *  remote's updatedAt so we don't immediately re-push. */
+    suspend fun applySyncedSettings(remote: Map<String, Any?>) {
+        val ts = (remote["updatedAt"] as? Number)?.toLong() ?: System.currentTimeMillis()
+        dataStore.edit { p ->
+            (remote["wifiQuality"] as? String)?.let { if (it.isQuality()) p[KEY_WIFI] = it }
+            (remote["cellularQuality"] as? String)?.let { if (it.isQuality()) p[KEY_CELL] = it }
+            (remote["density"] as? String)?.let { v -> if (runCatching { UiDensity.valueOf(v) }.isSuccess) p[KEY_DENSITY] = v }
+            (remote["subtitlesEnabled"] as? Boolean)?.let { p[KEY_SUBS_ON] = it }
+            (remote["subtitleLanguage"] as? String)?.let { v -> if (runCatching { SubtitleLanguage.valueOf(v) }.isSuccess) p[KEY_SUB_LANG] = v }
+            (remote["subtitleSize"] as? String)?.let { v -> if (runCatching { SubtitleSize.valueOf(v) }.isSuccess) p[KEY_SUB_SIZE] = v }
+            (remote["subtitleStyle"] as? String)?.let { v -> if (runCatching { SubtitleStyle.valueOf(v) }.isSuccess) p[KEY_SUB_STYLE] = v }
+            (remote["streamSize"] as? String)?.let { v -> if (runCatching { StreamSizePreference.valueOf(v) }.isSuccess) p[KEY_STREAM_SIZE] = v }
+            (remote["upNextPercent"] as? Number)?.toInt()?.let { p[KEY_UP_NEXT_PCT] = it.coerceIn(PCT_MIN, PCT_MAX) }
+            (remote["movieBarPercent"] as? Number)?.toInt()?.let { p[KEY_MOVIE_BAR_PCT] = it.coerceIn(PCT_MIN, PCT_MAX) }
+            p[KEY_SYNC_UPDATED] = ts
+        }
+    }
+
+    private fun String.isQuality(): Boolean = runCatching { QualityPreference.valueOf(this) }.isSuccess
+
     private fun String?.toQuality(default: QualityPreference): QualityPreference =
         this?.let { runCatching { QualityPreference.valueOf(it) }.getOrNull() } ?: default
 
@@ -238,6 +294,13 @@ class SettingsRepository @Inject constructor(
         val KEY_SCREEN_SCALE = floatPreferencesKey("screen_scale")
         val KEY_SCREEN_OFF_X = floatPreferencesKey("screen_offset_x")
         val KEY_SCREEN_OFF_Y = floatPreferencesKey("screen_offset_y")
+        val KEY_SYNC_UPDATED = longPreferencesKey("settings_sync_updated_at")
+
+        /** Field order for [syncedSignature] — keep in sync with [syncedSettingsMap]'s keys. */
+        val SYNCED_KEYS = listOf(
+            "wifiQuality", "cellularQuality", "density", "subtitlesEnabled", "subtitleLanguage",
+            "subtitleSize", "subtitleStyle", "streamSize", "upNextPercent", "movieBarPercent",
+        )
 
         // Calibration bounds (shared by the persisted read/write and the live in-memory preview).
         const val SCALE_MIN = 0.80f

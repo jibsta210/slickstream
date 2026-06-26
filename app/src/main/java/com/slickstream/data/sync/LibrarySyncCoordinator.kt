@@ -4,6 +4,7 @@ import android.util.Log
 import com.google.firebase.firestore.ListenerRegistration
 import com.slickstream.core.repository.LibraryRepository
 import com.slickstream.core.repository.ProfileRepository
+import com.slickstream.data.settings.SettingsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -37,6 +38,7 @@ import javax.inject.Singleton
 class LibrarySyncCoordinator @Inject constructor(
     private val library: LibraryRepository,
     private val profiles: ProfileRepository,
+    private val settings: SettingsRepository,
     private val sync: FirebaseSync,
 ) {
 
@@ -44,8 +46,10 @@ class LibrarySyncCoordinator @Inject constructor(
     private val jobs = mutableListOf<Job>()
     private var favListener: ListenerRegistration? = null
     private var profileListener: ListenerRegistration? = null
+    private var settingsListener: ListenerRegistration? = null
     private var lastFavKeys: Set<String> = emptySet()
     private var lastProfileIds: Set<String> = emptySet()
+    private var lastSettingsSig: String? = null
     @Volatile private var running = false
 
     /** Called after a successful sign-in (Google → Firebase) and on session restore. */
@@ -54,6 +58,7 @@ class LibrarySyncCoordinator @Inject constructor(
         running = true
         jobs += scope.launch {
             runCatching { syncProfiles() }.onFailure { Log.w(TAG, "profile sync failed", it) }
+            runCatching { syncSettings() }.onFailure { Log.w(TAG, "settings sync failed", it) }
             runCatching { initialMerge() }.onFailure { Log.w(TAG, "initial sync failed", it) }
             startFavoritePush()
             startHistoryPush()
@@ -126,6 +131,55 @@ class LibrarySyncCoordinator @Inject constructor(
         }
     }
 
+    /**
+     * Device-AGNOSTIC settings sync (quality, subtitles, stream size, up-next thresholds, density).
+     * Screen calibration + cache size are per-device and never travel. Last-write-wins by updatedAt:
+     * on sign-in the fresher of {local, cloud} prevails; thereafter a content-signature guard makes it
+     * loop-free (applying a remote value sets the signature so the resulting DataStore emit doesn't
+     * echo a push back up).
+     */
+    private suspend fun syncSettings() {
+        val remote = sync.pullSettings()
+        val remoteTs = (remote?.get("updatedAt") as? Number)?.toLong() ?: -1L
+        if (remote != null && remoteTs > settings.syncedUpdatedAt()) {
+            settings.applySyncedSettings(remote)
+            lastSettingsSig = settings.syncedSignature(remote)
+        } else {
+            pushSettingsNow()
+        }
+        startSettingsPush()
+        settingsListener = sync.listenSettings { remoteMap ->
+            scope.launch {
+                val rTs = (remoteMap["updatedAt"] as? Number)?.toLong() ?: -1L
+                val sig = settings.syncedSignature(remoteMap)
+                if (sig != lastSettingsSig && rTs > settings.syncedUpdatedAt()) {
+                    settings.applySyncedSettings(remoteMap)
+                    lastSettingsSig = sig
+                }
+            }
+        }
+    }
+
+    /** Push the local synced settings up, stamping a fresh updatedAt. */
+    private suspend fun pushSettingsNow() {
+        val map = settings.syncedSettingsMap()
+        val ts = System.currentTimeMillis()
+        settings.stampSyncedUpdated(ts)
+        sync.pushSettings(map + ("updatedAt" to ts))
+        lastSettingsSig = settings.syncedSignature(map)
+    }
+
+    /** Watch local settings; push when the synced fields actually change (signature guard skips
+     *  echoes of a value we just pulled). Debounced — option toggles can tick quickly. */
+    private fun startSettingsPush() {
+        jobs += scope.launch {
+            settings.settings.debounce(SETTINGS_DEBOUNCE_MS).collectLatest {
+                val map = settings.syncedSettingsMap()
+                if (settings.syncedSignature(map) != lastSettingsSig) pushSettingsNow()
+            }
+        }
+    }
+
     private suspend fun initialMerge() {
         // Remote → local, each item re-attached to its origin profile.
         // Favourites: add-if-missing in that profile.
@@ -176,10 +230,13 @@ class LibrarySyncCoordinator @Inject constructor(
         favListener = null
         profileListener?.remove()
         profileListener = null
+        settingsListener?.remove()
+        settingsListener = null
         jobs.forEach { it.cancel() }
         jobs.clear()
         lastFavKeys = emptySet()
         lastProfileIds = emptySet()
+        lastSettingsSig = null
     }
 
     private fun favKey(profileId: String, id: Int, type: com.slickstream.core.model.MediaType) =
@@ -188,5 +245,6 @@ class LibrarySyncCoordinator @Inject constructor(
     private companion object {
         const val TAG = "LibrarySync"
         const val HISTORY_DEBOUNCE_MS = 15_000L
+        const val SETTINGS_DEBOUNCE_MS = 2_000L
     }
 }
