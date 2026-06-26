@@ -88,7 +88,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
-import com.slickstream.core.model.resumePoint
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.WatchHistoryItem
@@ -545,15 +544,14 @@ private fun NavHostController.navigateToPlayer(item: MediaItem) {
 }
 
 private fun NavHostController.navigateToPlayer(history: WatchHistoryItem) {
-    // Resume a continue-watching entry at the same place its tile points (resumePoint): a FINISHED show
-    // episode advances to the NEXT one so a series continues forward instead of replaying the last one.
-    val r = history.resumePoint()
+    // continueWatching is pre-resolved in HomeViewModel (the finished->next-episode roll happens there),
+    // so resume exactly the episode the tile shows.
     navigate(
         Routes.player(
             history.media.mediaType,
             history.media.id,
-            r.season,
-            r.episode,
+            history.progress.season,
+            history.progress.episode,
         )
     )
 }

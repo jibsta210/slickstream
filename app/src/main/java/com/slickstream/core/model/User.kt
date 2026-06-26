@@ -13,25 +13,13 @@ data class FavoriteItem(
     val addedAt: Long,
 )
 
-/** A "Continue watching" entry: a media item plus its resume point. */
+/**
+ * A "Continue watching" entry: a media item plus its resume point. NOTE: the Home rail RESOLVES these in
+ * HomeViewModel before display — a finished TV episode is already rolled forward to the next aired one
+ * (progress points at it, 0%), and a finished/last episode is dropped — so the UI + nav can read
+ * [progress] directly and the tile, its progress bar, and the play target always agree.
+ */
 data class WatchHistoryItem(
     val media: MediaItem,
     val progress: PlaybackProgress,
 )
-
-/** Where a Continue-Watching row should actually point. */
-data class ResumePoint(val season: Int?, val episode: Int?, val percent: Float)
-
-/**
- * The (season, episode, progress) a Continue-Watching tile should both DISPLAY and RESUME — derived in
- * ONE place so the tile label, its progress bar, and the play action can never disagree (the home rail
- * used to show "S1E1 · 98%" while tapping it actually started S1E2). A FINISHED TV episode rolls forward
- * to the next one as a fresh start (0%), matching how a series naturally continues; everything else
- * stays exactly where it was left.
- */
-fun WatchHistoryItem.resumePoint(): ResumePoint =
-    if (media.mediaType == MediaType.TV && progress.isFinished) {
-        ResumePoint(progress.season, (progress.episode ?: 1) + 1, 0f)
-    } else {
-        ResumePoint(progress.season, progress.episode, progress.percent)
-    }

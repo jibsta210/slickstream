@@ -49,7 +49,6 @@ import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Scale
-import com.slickstream.core.model.resumePoint
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.feature.home.HomeUiState
@@ -107,22 +106,20 @@ private fun HomeContent(
             ?.take(8)
             ?: listOfNotNull(state.featured)
     }
-    // Display the SAME thing the tile will play (see resumePoint): once you finish an episode the tile
-    // rolls forward to the next one at 0%, instead of showing the just-finished episode at ~98%.
+    // continueWatching is already RESOLVED in HomeViewModel (a finished episode points at the next aired
+    // one at 0%; a finished/last episode is gone), so read progress directly — the tile, its bar, and the
+    // play action all agree.
     val progressByMediaId: Map<Int, Float> = remember(state.continueWatching) {
-        state.continueWatching.associate { it.media.id to it.resumePoint().percent }
+        state.continueWatching.associate { it.media.id to it.progress.percent }
     }
     val continueItems: List<MediaItem> = remember(state.continueWatching) {
         // Surface the specific episode on the tile (e.g. "Game of Thrones · S1E3") instead of just the
         // show name, so a resumed series tile tells you what's actually queued. id is unchanged, so the
         // progress + resume lookups below still match.
         state.continueWatching.map { h ->
-            val r = h.resumePoint()
-            if (r.season != null && r.episode != null) {
-                h.media.copy(title = "${h.media.title} · S${r.season}E${r.episode}")
-            } else {
-                h.media
-            }
+            val s = h.progress.season
+            val e = h.progress.episode
+            if (s != null && e != null) h.media.copy(title = "${h.media.title} · S${s}E$e") else h.media
         }
     }
     // Resume a continue-watching tile at its SAVED episode. Tapping a TV-show tile must carry the
