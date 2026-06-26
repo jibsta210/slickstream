@@ -1417,11 +1417,16 @@ private fun SourcesSheetContent(
             fontSize = 13.sp,
             modifier = Modifier.padding(start = 20.dp, bottom = 12.dp),
         )
+        // Anchor the currently-playing source at the top so it's obvious which torrent you're on.
+        val ordered = remember(sources, current) {
+            val cur = current?.let { c -> sources.firstOrNull { it.infoHash == c.infoHash && it.fileIndex == c.fileIndex } }
+            if (cur == null) sources else listOf(cur) + sources.filter { it !== cur }
+        }
         LazyColumn {
-            items(sources, key = { it.infoHash + (it.fileIndex ?: 0) }) { source ->
+            items(ordered, key = { it.infoHash + (it.fileIndex ?: 0) }) { source ->
                 SourceRow(
                     source = source,
-                    selected = source.infoHash == current?.infoHash,
+                    selected = source.infoHash == current?.infoHash && source.fileIndex == current?.fileIndex,
                     onClick = { onSelect(source) },
                 )
             }

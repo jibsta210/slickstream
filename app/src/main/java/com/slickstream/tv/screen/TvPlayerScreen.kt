@@ -1462,14 +1462,20 @@ private fun SourcesPanel(
             style = MaterialTheme.typography.bodyMedium,
             color = Brand.OnSurfaceDim,
         )
+        // Anchor the source you're CURRENTLY on at the very top (and land focus there), so it's obvious
+        // which torrent is playing — otherwise you can't tell whether you're re-selecting the same one.
+        val ordered = remember(sources, current) {
+            val cur = current?.let { c -> sources.firstOrNull { it.infoHash == c.infoHash && it.fileIndex == c.fileIndex } }
+            if (cur == null) sources else listOf(cur) + sources.filter { it !== cur }
+        }
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
         ) {
-            itemsIndexed(sources, key = { _, s -> s.infoHash + (s.fileIndex ?: 0) }) { index, source ->
+            itemsIndexed(ordered, key = { _, s -> s.infoHash + (s.fileIndex ?: 0) }) { index, source ->
                 SourceRow(
                     source = source,
-                    selected = source.infoHash == current?.infoHash,
+                    selected = source.infoHash == current?.infoHash && source.fileIndex == current?.fileIndex,
                     onClick = { onSelect(source) },
                     modifier = if (index == 0) Modifier.focusRequester(firstFocus) else Modifier,
                 )
@@ -1496,6 +1502,13 @@ private fun SourceRow(
             focusedContentColor = Color.White,
         ),
         border = ClickableSurfaceDefaults.border(
+            // A cyan accent on the currently-playing row so it stands out in the list even when it isn't
+            // the focused one.
+            border = if (selected) {
+                Border(androidx.compose.foundation.BorderStroke(2.dp, Brand.Cyan), shape = shape)
+            } else {
+                Border.None
+            },
             focusedBorder = Border(
                 border = androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet),
                 shape = shape,
@@ -1508,6 +1521,14 @@ private fun SourceRow(
             modifier = Modifier.fillMaxWidth().padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            if (selected) {
+                Text(
+                    text = "▶  NOW PLAYING",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Brand.Cyan,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 QualityChip(text = source.quality)
                 Spacer(Modifier.width(10.dp))
