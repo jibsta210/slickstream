@@ -89,8 +89,10 @@ fun TvScreenCalibrationScreen(
     fun adjust(dir: Int) {
         when (sel) {
             0 -> scale = (scale + dir * 0.005f).coerceIn(0.80f, 1.20f)
-            1 -> offX = (offX + dir * 4f).coerceIn(-200f, 200f)
-            2 -> offY = (offY + dir * 4f).coerceIn(-200f, 200f)
+            // Horizontal/Vertical move ONE PIXEL per press — fine enough to perfectly centre against an
+            // asymmetric-overscan panel (the value is raw pixels; see ScreenCalibrated).
+            1 -> offX = (offX + dir * 1f).coerceIn(-200f, 200f)
+            2 -> offY = (offY + dir * 1f).coerceIn(-200f, 200f)
         }
         preview()
     }
@@ -153,8 +155,8 @@ fun TvScreenCalibrationScreen(
             )
             Spacer(Modifier.height(6.dp))
             CalibRow("Size", "${(scale * 100).roundToInt()}%", sel == 0)
-            CalibRow("Horizontal", offX.roundToInt().toString(), sel == 1)
-            CalibRow("Vertical", offY.roundToInt().toString(), sel == 2)
+            CalibRow("Horizontal", "${offX.roundToInt()} px", sel == 1)
+            CalibRow("Vertical", "${offY.roundToInt()} px", sel == 2)
             CalibRow("Reset to default", "", sel == 3)
             CalibRow("Done", "", sel == 4)
             Spacer(Modifier.height(6.dp))

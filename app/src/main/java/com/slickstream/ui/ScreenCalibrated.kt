@@ -8,7 +8,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.unit.Constraints
-import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 
 /**
@@ -42,12 +41,16 @@ fun ScreenCalibrated(
                     val w = (constraints.maxWidth * scale).roundToInt().coerceAtLeast(1)
                     val h = (constraints.maxHeight * scale).roundToInt().coerceAtLeast(1)
                     val placeable = measurable.measure(Constraints.fixed(w, h))
-                    val dx = offsetX.dp.roundToPx()
-                    val dy = offsetY.dp.roundToPx()
+                    // offsetX/offsetY are RAW PIXELS (not dp) so each calibration step shifts the picture
+                    // by exactly one panel pixel — needed to centre against an asymmetric-overscan panel.
+                    val dx = offsetX.roundToInt()
+                    val dy = offsetY.roundToInt()
+                    // Float division (not Int /2, which truncates toward zero and biased the picture
+                    // ~0.5px right when scaled up) so the scale is exactly symmetric about centre.
                     layout(constraints.maxWidth, constraints.maxHeight) {
                         placeable.place(
-                            x = (constraints.maxWidth - w) / 2 + dx,
-                            y = (constraints.maxHeight - h) / 2 + dy,
+                            x = ((constraints.maxWidth - w).toFloat() / 2f).roundToInt() + dx,
+                            y = ((constraints.maxHeight - h).toFloat() / 2f).roundToInt() + dy,
                         )
                     }
                 },
