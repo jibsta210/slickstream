@@ -48,7 +48,9 @@ import androidx.compose.ui.platform.LocalContext
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Scale
+import androidx.compose.ui.draw.clip
 import com.slickstream.core.model.Episode
+import com.slickstream.core.model.hasAired
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.Season
@@ -469,12 +471,17 @@ private fun EpisodeCard(
     val shape = RoundedCornerShape(12.dp)
     // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode shows a check.
     val isWatched = (progress ?: 0f) >= 0.92f
+    // A future/unreleased episode is shown (info + air date) but can't be played — disabling the
+    // Surface makes it non-clickable so the D-pad lands on the last AIRED episode instead.
+    val aired = episode.hasAired()
     Surface(
         onClick = onClick,
+        enabled = aired,
         shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Brand.Surface,
             focusedContainerColor = Brand.Surface,
+            disabledContainerColor = Brand.Surface,
         ),
         border = ClickableSurfaceDefaults.border(
             focusedBorder = Border(
@@ -517,17 +524,36 @@ private fun EpisodeCard(
                             ),
                         ),
                 )
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(8.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.PlayArrow,
-                        contentDescription = null,
-                        tint = Color.White,
-                        modifier = Modifier.size(28.dp),
-                    )
+                if (aired) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(8.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.PlayArrow,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(28.dp),
+                        )
+                    }
+                } else {
+                    // Upcoming episode: an "Airs <date>" pill instead of a play affordance.
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(8.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(Color(0xE6000000))
+                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                    ) {
+                        Text(
+                            text = formatAirDate(episode.airDate)?.let { "Airs $it" } ?: "Coming soon",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Brand.Star,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
                 }
 
                 // Watched check sits in the top-end corner once the episode is essentially done.

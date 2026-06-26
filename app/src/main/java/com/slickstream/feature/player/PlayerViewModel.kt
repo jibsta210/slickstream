@@ -26,6 +26,7 @@ import com.slickstream.cast.CastManager
 import com.slickstream.core.common.DeviceProfile
 import com.slickstream.core.model.DataResult
 import com.slickstream.core.model.Episode
+import com.slickstream.core.model.hasAired
 import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
@@ -1308,22 +1309,29 @@ class PlayerViewModel @Inject constructor(
         curSeason: Int,
         curEpisode: Int,
     ): Pair<Int, Int>? {
-        val curCount = when (val r = catalogRepository.getEpisodes(mediaId, curSeason)) {
-            is DataResult.Success -> r.data.size
+        val today = com.slickstream.core.model.isoToday()
+        // Next episode in THIS season — but only if it has AIRED. A future/unreleased episode (TMDB
+        // lists it with a later air date, but no torrent exists) must NOT be the "next": it would
+        // auto-advance into a "No streams" error. An unaired next episode = end of the available series.
+        val curEps = when (val r = catalogRepository.getEpisodes(mediaId, curSeason)) {
+            is DataResult.Success -> r.data
             is DataResult.Error -> return null
         }
-        if (curEpisode < curCount) return curSeason to (curEpisode + 1)
+        curEps.firstOrNull { it.episodeNumber == curEpisode + 1 }?.let { next ->
+            return if (next.hasAired(today)) curSeason to next.episodeNumber else null
+        }
 
+        // End of this season → episode 1 of the next real season, if it has aired.
         val nextSeason = d.seasons
             .map { it.seasonNumber }
             .filter { it > curSeason && it >= 1 }
             .minOrNull() ?: return null
-        val nextCount = when (val r = catalogRepository.getEpisodes(mediaId, nextSeason)) {
-            is DataResult.Success -> r.data.size
+        val nextEps = when (val r = catalogRepository.getEpisodes(mediaId, nextSeason)) {
+            is DataResult.Success -> r.data
             is DataResult.Error -> return null
         }
-        if (nextCount <= 0) return null
-        return nextSeason to 1
+        val ep1 = nextEps.firstOrNull { it.episodeNumber == 1 } ?: return null
+        return if (ep1.hasAired(today)) nextSeason to ep1.episodeNumber else null
     }
 
     /** Previous-episode coordinates: same-season -1, else the last episode of the previous real season. */

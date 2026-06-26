@@ -63,6 +63,14 @@ data class Episode(
     val runtimeMinutes: Int?,
 )
 
+/** ISO air dates ("YYYY-MM-DD") compare lexicographically, so a date string <= today means "aired".
+ *  An episode with NO date (or a future date) has NOT aired — there's nothing to stream yet. */
+fun Episode.hasAired(today: String = isoToday()): Boolean = airDate?.let { it <= today } ?: false
+
+/** Today as "YYYY-MM-DD" in local time — no java.time needed (works on every API level). */
+fun isoToday(): String =
+    java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+
 /** Full detail payload for a details screen. */
 data class MediaDetails(
     val item: MediaItem,
