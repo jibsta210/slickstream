@@ -99,6 +99,8 @@ class TorrentStreamerImpl @Inject constructor(
         val pollJob = launch {
             var pollCount = 0
             var headReadySince = 0L
+            var zeroRateSince = 0L
+            var lastReannounce = 0L
             while (isActive) {
                 val snap = engine.snapshot(infoHash)
                 if (snap == null) {
@@ -110,6 +112,23 @@ class TorrentStreamerImpl @Inject constructor(
                 // actively streaming (the >1min "stuck buffering" bug). If we see it paused mid-stream,
                 // resume it so the download is never silently killed.
                 if (snap.isPaused) runCatching { engine.resume(infoHash) }
+
+                // Stall recovery: if the download has been at 0 B/s for a few seconds while the file
+                // isn't complete (its peers dropped — the "buffers mid-stream, 0 KB/s, never finishes"
+                // case), force a fresh tracker + DHT announce to re-find peers instead of sitting dead
+                // until libtorrent's next scheduled announce (which can be ~30 min away). Rate-limited.
+                val now = System.currentTimeMillis()
+                if (!snap.isFinished && !snap.isPaused && snap.downloadRate == 0) {
+                    if (zeroRateSince == 0L) zeroRateSince = now
+                    if (now - zeroRateSince >= STALL_REANNOUNCE_AFTER_MS &&
+                        now - lastReannounce >= REANNOUNCE_INTERVAL_MS
+                    ) {
+                        runCatching { engine.reannounce(infoHash) }
+                        lastReannounce = now
+                    }
+                } else {
+                    zeroRateSince = 0L
+                }
 
                 val headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= READY_HEAD_BYTES
@@ -413,6 +432,12 @@ class TorrentStreamerImpl @Inject constructor(
 
         /** Emit a diagnostic log line every Nth poll (~2 s at a 500 ms interval). */
         private const val DIAG_EVERY = 4
+
+        /** After this long at 0 B/s on an incomplete torrent, force a re-announce to re-find peers. */
+        private const val STALL_REANNOUNCE_AFTER_MS = 5_000L
+
+        /** Don't force a re-announce more often than this (trackers rate-limit / ban abusive clients). */
+        private const val REANNOUNCE_INTERVAL_MS = 20_000L
 
         /** Head bytes to pre-buffer when warming the next episode (~2 MB — cheap, just enough). */
         private const val PREFETCH_HEAD_BYTES = 2L * 1024L * 1024L

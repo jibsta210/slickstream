@@ -106,18 +106,19 @@ class TorrentEngine @Inject constructor(
         readaheadBytes = if (lowPower) LOW_POWER_READAHEAD_BYTES else READAHEAD_BYTES
         val sp = SettingsPack().apply {
             // --- Peer / socket load -----------------------------------------------------------------
-            // A high connection count doesn't just stress a weak SoC — it exhausts a consumer router's
-            // NAT/conntrack table, which tanks the WHOLE home connection (new web requests can't open)
-            // even when bandwidth is fine. 800 was wildly more than streaming needs. ~50-100 peers
-            // already saturate any video bitrate, so cap modestly: 100 capable, 40 TV. Same logic for the
-            // connect ramp — a 500/sec connection churn hammers the router; 60/40 still finds head-bearing
-            // peers in a couple seconds.
-            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 40 else 100)
-            setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 2 else 4)
-            setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 1 else 2)
-            setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 4 else 8)
-            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 24 else 40)
-            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 24 else 60)
+            // Balance: enough peers to keep the download alive (and recover from swarm churn — too few
+            // and a popular torrent can still stall to 0 B/s mid-stream when its current peers drop),
+            // but FAR below the old 800 that exhausted a consumer router's NAT/conntrack table and tanked
+            // the whole home connection. The real anti-tank lever is the DOWNLOAD-RATE CAP below (bounds
+            // bandwidth regardless of socket count); 200/80 sockets with a capped rate won't saturate a
+            // router. A healthy connect ramp also lets a stalled download re-find peers instead of sitting
+            // at 0.
+            setInteger(settings_pack.int_types.connections_limit.swigValue(), if (lowPower) 80 else 200)
+            setInteger(settings_pack.int_types.active_downloads.swigValue(), if (lowPower) 3 else 6)
+            setInteger(settings_pack.int_types.active_seeds.swigValue(), if (lowPower) 2 else 3)
+            setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 6 else 12)
+            setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 40 else 80)
+            setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 40 else 120)
             // Announce to only the first working tier on low-power (less inbound peer flood to crypt).
             setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), !lowPower)
             setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), !lowPower)
@@ -646,6 +647,21 @@ class TorrentEngine @Inject constructor(
         // The first piece may begin before the file (shared with the previous file).
         val headOffsetInFirstPiece = active.fileOffset % active.pieceLength
         (bytesFromPieceStart - headOffsetInFirstPiece).coerceIn(0L, active.fileLength)
+    }
+
+    /**
+     * Force a fresh tracker + DHT announce to re-discover peers. Used to recover a download that
+     * stalled to 0 B/s mid-stream because its current peers dropped — instead of sitting dead until
+     * libtorrent's next scheduled (up to ~30 min) announce.
+     */
+    fun reannounce(infoHash: String) {
+        val handle = torrents[infoHash]?.handle?.takeIf { it.isValid } ?: return
+        synchronized(nativeLock) {
+            runCatching {
+                handle.forceReannounce()
+                handle.forceDHTAnnounce()
+            }.onFailure { Log.w(TAG, "reannounce failed for $infoHash", it) }
+        }
     }
 
     /** True if the tail pieces (needed for mp4 moov atoms) are present. */
