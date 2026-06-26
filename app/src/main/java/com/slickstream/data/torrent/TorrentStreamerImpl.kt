@@ -110,8 +110,9 @@ class TorrentStreamerImpl @Inject constructor(
 
                 // Self-heal: a still-running Details prewarm can race in and pause the torrent we're
                 // actively streaming (the >1min "stuck buffering" bug). If we see it paused mid-stream,
-                // resume it so the download is never silently killed.
-                if (snap.isPaused) runCatching { engine.resume(infoHash) }
+                // resume it so the download is never silently killed — UNLESS it's already 100% complete,
+                // in which case it's paused on purpose (below) to stop all up/down, and must stay paused.
+                if (snap.isPaused && !snap.isFinished) runCatching { engine.resume(infoHash) }
 
                 // Stall recovery: if the download has been at 0 B/s for a few seconds while the file
                 // isn't complete (its peers dropped — the "buffers mid-stream, 0 KB/s, never finishes"
@@ -158,6 +159,12 @@ class TorrentStreamerImpl @Inject constructor(
 
                 when {
                     snap.isFinished -> {
+                        // 100% downloaded: stop ALL network activity on this file — nothing left to
+                        // download, and (the point) no more seeding/upload. The HTTP server keeps serving
+                        // playback straight off the finished file on disk, so this is invisible to the
+                        // viewer; it just stops eating up/down bandwidth, freeing it for the next-episode
+                        // precache. Idempotent — pausing an already-paused torrent is a no-op.
+                        if (!snap.isPaused) runCatching { engine.pause(infoHash) }
                         trySend(
                             buildStatus(
                                 source, infoHash, StreamState.COMPLETED,
