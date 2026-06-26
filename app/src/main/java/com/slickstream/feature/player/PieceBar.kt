@@ -98,7 +98,11 @@ fun PieceBarPanel(
                         append("${stats.seeders} seeders")
                         if (stats.peers > stats.seeders) append(" · ${stats.peers} peers")
                         append(" · ${formatRate(stats.downloadRateBytes)}")
-                        append(" · ${(stats.progress * 100).roundToInt()}% downloaded")
+                        if (stats.progress >= 0.999f) append(" · ✓ fully downloaded")
+                        else append(" · ${(stats.progress * 100).roundToInt()}% downloaded")
+                        // Once the current file is in, surface the next-episode precache so the user can
+                        // see it warming (instead of the bar just reading a static 100%).
+                        if (stats.precaching) append(" · caching next episode")
                     } else {
                         append("Downloading…")
                     }

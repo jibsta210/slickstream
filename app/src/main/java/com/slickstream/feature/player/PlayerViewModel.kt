@@ -98,7 +98,13 @@ data class RebufferState(
 data class CaptionPrefs(val size: SubtitleSize, val style: SubtitleStyle)
 
 /** Live swarm/transfer snapshot shown under the player's chunk bar. */
-data class StreamStats(val seeders: Int, val peers: Int, val downloadRateBytes: Int, val progress: Float)
+data class StreamStats(
+    val seeders: Int,
+    val peers: Int,
+    val downloadRateBytes: Int,
+    val progress: Float,
+    val precaching: Boolean = false,
+)
 
 @HiltViewModel
 class PlayerViewModel @Inject constructor(
@@ -210,6 +216,10 @@ class PlayerViewModel @Inject constructor(
     private var progressTickJob: Job? = null
     private var activeInfoHash: String? = null
     private var hasSeekedToResume = false
+    /** True while hopping episodes: suppresses progress saves so the OUTGOING episode's position can't
+     *  be written under the INCOMING episode's key (the "next episode opens on the end credits" bug).
+     *  Cleared once the new media item is bound to the (reused) player. */
+    @Volatile private var switchingEpisode = false
     /** Consecutive transient source-error re-prepares; reset on a fresh source or once playing. */
     private var sourceErrorRetries = 0
     private var playerListener: Player.Listener? = null
@@ -267,7 +277,13 @@ class PlayerViewModel @Inject constructor(
 
     /** Live swarm/transfer stats for the chunk-bar info row, or null when not torrent-backed. */
     fun streamStats(): StreamStats? = latestStatus?.let {
-        StreamStats(seeders = it.seeders, peers = it.peers, downloadRateBytes = it.downloadRateBytes, progress = it.progress)
+        StreamStats(
+            seeders = it.seeders,
+            peers = it.peers,
+            downloadRateBytes = it.downloadRateBytes,
+            progress = it.progress,
+            precaching = prefetchJob?.isActive == true,
+        )
     }
 
     // --- Subtitles ---
@@ -686,15 +702,24 @@ class PlayerViewModel @Inject constructor(
         }
         val existing = _player.value
         if (existing != null) {
-            // Only reload on a genuine URL change (source switch); steady-state
+            // Only reload on a genuine URL change (source switch / episode hop); steady-state
             // READY re-emissions carry the same URL and must be no-ops.
             if (currentMediaUrl == url) return
+            // Full reset, NOT just setMediaItem: stop()+clearMediaItems() wipe any leftover ENDED/error
+            // state from the previous episode that otherwise wedged the new one in a permanent buffer
+            // ("play next never starts but re-entry plays instantly"). Crucially we REUSE the same
+            // ExoPlayer + PlayerView surface, so the video doesn't black out on the hand-off (releasing
+            // and rebuilding tore the surface down -> audio-only black screen on the next episode).
+            existing.stop()
+            existing.clearMediaItems()
             existing.setMediaItem(buildMediaItem(url))
             existing.prepare()
             // While casting, keep the local surface paused and push the new source to the TV.
             existing.playWhenReady = !_isCasting.value
             sourceErrorRetries = 0
             currentMediaUrl = url
+            switchingEpisode = false   // new media bound -> resume progress saves (for the new episode)
+            startProgressTicker()      // restart the ticker we cancelled for the hop
             if (_isCasting.value) loadCastMedia(fromPositionMs = 0L)
             return
         }
@@ -740,6 +765,7 @@ class PlayerViewModel @Inject constructor(
             }
         sourceErrorRetries = 0
         currentMediaUrl = url
+        switchingEpisode = false   // new media bound (fresh player) -> resume progress saves
 
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -898,6 +924,7 @@ class PlayerViewModel @Inject constructor(
         vlc.prepare()
         vlc.playWhenReady = !_isCasting.value
         currentMediaUrl = url
+        switchingEpisode = false   // new media bound (VLC) -> resume progress saves
         if (!_isCasting.value) _currentPlayer.value = vlc
         startProgressTicker()
     }
@@ -1154,6 +1181,9 @@ class PlayerViewModel @Inject constructor(
     }
 
     private fun saveProgressNow() {
+        // While hopping episodes the (reused) player still holds the OUTGOING episode's position until
+        // the new media item is bound — never persist in that window, or it lands under the new key.
+        if (switchingEpisode) return
         // Read from whichever local backend is active — ExoPlayer or the VLC fallback (both Media3
         // [Player]s). Keep using _player while casting so we persist the local position, not the TV's.
         val p: Player = _player.value ?: vlcPlayer ?: return
@@ -1338,17 +1368,12 @@ class PlayerViewModel @Inject constructor(
         viewModelScope.launch {
             // Persist where we are in the OUTGOING episode (coords are still the old ones here).
             saveProgressNow()
+            // Suppress saves + stop the ticker for the duration of the hop so the outgoing position
+            // can't be written under the incoming key; cleared once ensurePlayer binds the new media.
+            switchingEpisode = true
+            progressTickJob?.cancel()
             bufferWatchdogJob?.cancel()
             stopActiveStream(removeFiles = false)
-            // Build a FRESH player for the next episode instead of reusing the old one. Two real bugs
-            // came from the reuse: (1) the old player kept the outgoing episode loaded at its ~90%
-            // position until the new media item arrived, and the progress ticker / pause callbacks could
-            // save THAT stale position under the NEW episode's key — so the next episode opened on the
-            // end credits; (2) a reused player sometimes never re-reached READY on the new source, so it
-            // buffered forever at full download speed while exiting + re-entering started it instantly.
-            // Releasing now (before the coord change, so no save can land on the new key) and letting
-            // ensurePlayer rebuild matches the clean fresh-entry path exactly.
-            releaseLocalPlayer()
             prefetchJob?.cancel()
             prefetchedInfoHash = null
 
@@ -1375,11 +1400,13 @@ class PlayerViewModel @Inject constructor(
             val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {
                 is DataResult.Success -> r.data
                 is DataResult.Error -> {
+                    switchingEpisode = false   // hop aborted — don't leave saves suppressed
                     _uiState.value = PlayerUiState.Error(r.message)
                     return@launch
                 }
             }
             if (list.isEmpty()) {
+                switchingEpisode = false       // hop aborted — don't leave saves suppressed
                 _uiState.value = PlayerUiState.Error("No streamable sources found.")
                 return@launch
             }

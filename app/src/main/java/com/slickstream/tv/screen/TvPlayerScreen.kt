@@ -181,6 +181,13 @@ fun TvPlayerScreen(
             kotlinx.coroutines.delay(1000)
         }
     }
+    // A dismiss is temporary — bring the card back ~30s later (unless the episode changed meanwhile).
+    LaunchedEffect(upNextDismissed) {
+        if (upNextDismissed) {
+            kotlinx.coroutines.delay(UP_NEXT_REDISPLAY_MS)
+            upNextDismissed = false
+        }
+    }
     // Land focus on the card's "Play now" the moment it appears so it's immediately D-pad operable.
     // Retry past the slide-in animation — a single requestFocus can fire before the button is attached.
     LaunchedEffect(showUpNext) {
@@ -645,8 +652,11 @@ private fun ErrorOverlay(
     }
 }
 
-/** Fraction of the runtime after which the "Up next" card appears (the user's "~90% played"). */
-private const val UP_NEXT_PCT = 0.90f
+/** Fraction of the runtime after which the "Up next" card appears. */
+private const val UP_NEXT_PCT = 0.93f
+
+/** After dismissing the Up-next card, bring it back this long later (it nags gently, like Netflix). */
+private const val UP_NEXT_REDISPLAY_MS = 30_000L
 
 /**
  * "Up next" card: the next episode's still + title with a focusable "Play now" / "Dismiss". Shown near

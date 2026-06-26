@@ -284,6 +284,14 @@ fun PlayerScreen(
         // mirrors its visibility back into `overlayVisible` — so the custom overlays hide/show in lockstep
         // with the built-in controls instead of on a separate timer that drifted out of sync.
 
+        // A dismiss is temporary — bring the card back ~30s later (unless the episode changed meanwhile).
+        LaunchedEffect(upNextDismissed) {
+            if (upNextDismissed) {
+                delay(UP_NEXT_REDISPLAY_MS)
+                upNextDismissed = false
+            }
+        }
+
         // Poll position ~1/s to learn when we're near the end (movies / no-next never qualify).
         LaunchedEffect(player, uiState) {
             if (uiState !is PlayerUiState.Playing) {
@@ -527,8 +535,11 @@ fun PlayerScreen(
     }
 }
 
-/** Fraction of the runtime after which the "Up next" card appears (the user's "~90% played"). */
-private const val UP_NEXT_PCT = 0.90f
+/** Fraction of the runtime after which the "Up next" card appears. */
+private const val UP_NEXT_PCT = 0.93f
+
+/** After dismissing the Up-next card, bring it back this long later (gentle nag, like Netflix). */
+private const val UP_NEXT_REDISPLAY_MS = 30_000L
 
 /**
  * Phone "Up next" card: the next episode's still + title with tappable Play now / Dismiss. Shown near

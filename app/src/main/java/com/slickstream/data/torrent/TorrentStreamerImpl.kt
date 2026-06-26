@@ -56,6 +56,10 @@ class TorrentStreamerImpl @Inject constructor(
     /** infoHashes currently being STREAMED by a player — a prefetch must never pause these. */
     private val streamingHashes = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
+    /** The most recently warmed (next-episode) info-hash. Protected from cache eviction so a long
+     *  current episode can't evict the precache before the user advances. Cleared once it streams. */
+    @Volatile private var warmedHash: String? = null
+
     override fun start(source: StreamSource): Flow<StreamStatus> = callbackFlow {
         sources[source.infoHash] = source
 
@@ -84,10 +88,14 @@ class TorrentStreamerImpl @Inject constructor(
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
         streamingHashes.add(infoHash)
+        // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
+        if (infoHash == warmedHash) warmedHash = null
 
         cache.touch(infoHash)
-        // Make room if we're over budget (never evict the one we just added).
-        runCatching { cache.enforceBudget(protectedHash = infoHash) }
+        // Make room if we're over budget — but protect the active stream(s) AND the warmed next-episode
+        // torrent. The warm is PAUSED (not active), so without this it was the first thing evicted while
+        // the current episode kept downloading, which is why "precache did nothing" after a long episode.
+        runCatching { cache.enforceBudget(streamingHashes + setOfNotNull(infoHash, warmedHash)) }
 
         val server = ensureServer()
         val streamUrl = server.urlFor(infoHash)
@@ -264,6 +272,7 @@ class TorrentStreamerImpl @Inject constructor(
         // during the warm), or we'd pause the live stream out from under the player.
         if (infoHash !in streamingHashes) runCatching { engine.pause(infoHash) }
         cache.touch(infoHash)
+        warmedHash = infoHash   // protect it from eviction until the user advances to it
         infoHash
     }
 
@@ -442,9 +451,9 @@ class TorrentStreamerImpl @Inject constructor(
         private const val REANNOUNCE_INTERVAL_MS = 20_000L
 
         /** Head bytes to pre-buffer when warming the next episode (~2 MB — cheap, just enough). */
-        private const val PREFETCH_HEAD_BYTES = 2L * 1024L * 1024L
+        private const val PREFETCH_HEAD_BYTES = 8L * 1024L * 1024L
 
         /** Hard wall-clock cap on one warm attempt so a dead swarm can't tie up a coroutine. */
-        private const val PREFETCH_BUDGET_MS = 45_000L
+        private const val PREFETCH_BUDGET_MS = 90_000L
     }
 }
