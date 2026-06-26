@@ -259,6 +259,11 @@ class PlayerViewModel @Inject constructor(
     // --- "Stuck buffering -> try a smaller stream" hint ---
     /** When the current continuous buffer began (uptime ms); 0 while not buffering. */
     private var bufferingSinceMs: Long = 0L
+    /** When the streamer first emitted READY for THIS source (uptime ms); 0 until then. Marks the point
+     *  after which the player HAS a URL and is trying to reach first frame — so a long buffer past it,
+     *  while the torrent is still alive, means the source can't decode (e.g. missing mp4 moov) and we
+     *  should fail over rather than grind tens-of-% into the download. Reset on every fresh source. */
+    @Volatile private var firstReadyAtMs: Long = 0L
     /** Already shown the smaller-stream hint for this source — don't nag again. */
     private var suggestedSmallerForSource = false
     /** Effective quality cap from the last auto-pick — reused by the synchronous smaller-source scan. */
@@ -391,8 +396,9 @@ class PlayerViewModel @Inject constructor(
             triedInfoHashes.clear()
             failoverCount = 0
 
-            // Auto-pick the best source within the user's per-network quality cap.
-            val best = pickPreferred(list, networkQualityPreference())
+            // Resume the SAME torrent if we have one cached for this episode; else auto-pick the best
+            // source within the user's per-network quality cap.
+            val best = pickResumeOrPreferred(list, currentSeason, currentEpisode)
             startSource(best)
         }
     }
@@ -443,6 +449,20 @@ class PlayerViewModel @Inject constructor(
         return StreamPicker.pick(list, pref.maxTier, sizePref, deviceProfile.isLowPower) ?: list.first()
     }
 
+    /**
+     * Resume-aware pick: if we already started this exact episode before, reuse the SAME torrent
+     * (its infoHash was saved with the progress and its partial download is still in the on-disk cache)
+     * instead of re-ranking from scratch — otherwise a shift in seeder counts between sessions picks a
+     * DIFFERENT release and restarts the download from 0% (the "I was at 40%, came back, it started
+     * over" bug). Falls back to the normal auto-pick when there's no saved progress, or the saved
+     * release is no longer in the indexer's results.
+     */
+    private suspend fun pickResumeOrPreferred(list: List<StreamSource>, season: Int?, episode: Int?): StreamSource {
+        val savedHash = libraryRepository.getProgress(mediaId, mediaType, season, episode)?.infoHash
+        val resume = savedHash?.let { h -> list.firstOrNull { it.infoHash == h } }
+        return resume ?: pickPreferred(list, networkQualityPreference())
+    }
+
     private fun isOnUnmeteredNetwork(): Boolean {
         val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return true
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return true
@@ -475,6 +495,7 @@ class PlayerViewModel @Inject constructor(
         _suggestSmaller.value = false
         _rebuffering.value = null
         latestStatus = null
+        firstReadyAtMs = 0L
         bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
@@ -510,7 +531,18 @@ class PlayerViewModel @Inject constructor(
                 }
                 val sinceStart = now - bufferingSinceMs
                 val stalled = now - lastProgressAt
-                if (sinceStart >= FAILOVER_BUFFER_BUDGET_MS && stalled >= WATCHDOG_STALL_MS) {
+                // (a) Dead/fake swarm: budget elapsed AND the head stopped growing.
+                val deadSwarm = sinceStart >= FAILOVER_BUFFER_BUDGET_MS && stalled >= WATCHDOG_STALL_MS
+                // (b) Can't-decode source: the streamer handed us a URL (READY) but the player still hasn't
+                //     reached first frame a good while later, WHILE bytes keep flowing. That's the missing-
+                //     mp4-moov / scattered-head trap — the head-flat check above never catches it because
+                //     the overall download is progressing. Bail to another release instead of grinding
+                //     tens-of-% in. head>lastHead (above) tells us the torrent is alive.
+                val playerStuck = _player.value?.playbackState == Player.STATE_BUFFERING
+                val readyButNotPlaying = firstReadyAtMs > 0L &&
+                    now - firstReadyAtMs >= STARTUP_PLAY_TIMEOUT_MS &&
+                    playerStuck && head > 0L
+                if (deadSwarm || readyButNotPlaying) {
                     if (!failoverToNext()) {
                         _uiState.value = PlayerUiState.Error("Couldn't start any source for this title.")
                     }
@@ -572,6 +604,11 @@ class PlayerViewModel @Inject constructor(
     private fun handleStatus(status: StreamStatus, source: StreamSource) {
         // Feed the buffering watchdog's head-progress signal on every emission.
         lastEmittedDownloadedBytes = status.downloadedBytes
+        // Mark when the source first became READY (a URL exists). The startup watchdog uses this to tell
+        // "player can't reach first frame" (e.g. missing mp4 moov) apart from "still filling the head".
+        if (status.streamUrl != null && firstReadyAtMs == 0L) {
+            firstReadyAtMs = android.os.SystemClock.elapsedRealtime()
+        }
         // Keep the latest status around even once we're Playing (the early-returns below skip the rest
         // of this function then) so a mid-playback stall has a live rate to estimate the wait from. If
         // a rebuffer is currently showing, refresh its ETA on every emission so the badge counts down.
@@ -1455,7 +1492,8 @@ class PlayerViewModel @Inject constructor(
             // Fresh episode -> fresh failover budget over the new candidate list.
             triedInfoHashes.clear()
             failoverCount = 0
-            val best = pickPreferred(list, networkQualityPreference())
+            // Reuse the SAME torrent if this episode was already partly downloaded; else auto-pick.
+            val best = pickResumeOrPreferred(list, currentSeason, currentEpisode)
             startSource(best)
         }
     }
@@ -1527,6 +1565,9 @@ class PlayerViewModel @Inject constructor(
         const val WATCHDOG_TICK_MS = 3_000L
         /** Head bytes flat this long (while still not playing) = stalled swarm -> fail over. */
         const val WATCHDOG_STALL_MS = 20_000L
+        /** READY emitted (player has a URL) but still hasn't reached first frame this long, while bytes
+         *  keep flowing = a can't-decode source (missing mp4 moov / scattered head) -> fail over. */
+        const val STARTUP_PLAY_TIMEOUT_MS = 18_000L
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L

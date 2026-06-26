@@ -406,12 +406,14 @@ fun TvPlayerScreen(
                 exit = fadeOut(),
                 modifier = Modifier.fillMaxSize(),
             ) {
-                // Whenever the overlay (re)appears, move focus onto the play/pause button so
-                // it is immediately D-pad controllable.
-                // Don't yank focus back to play/pause while a side-panel (sources/subtitles) is
-                // open — that's what kept the CC menu un-navigable.
+                // Whenever the overlay (re)appears, land focus on the PLAY/PAUSE button (the control row),
+                // NOT the scrub bar — otherwise every time the controls re-appeared the user was dropped
+                // onto the scrubber, where LEFT/RIGHT seeks, so they "couldn't reach the buttons". From
+                // play/pause, ◀▶ walk the control row and UP reaches the scrubber when they want to seek.
+                // Don't yank focus while a side-panel (sources/subtitles) is open — that kept the CC menu
+                // un-navigable.
                 LaunchedEffect(controlsVisible, anyPanelOpen) {
-                    if (controlsVisible && !anyPanelOpen) runCatching { scrubFocus.requestFocus() }
+                    if (controlsVisible && !anyPanelOpen) runCatching { playPauseFocus.requestFocus() }
                 }
                 TransportOverlay(
                     title = title,
@@ -1193,7 +1195,10 @@ private fun ScrubBar(
                     val isRight = event.key == Key.DirectionRight
                     val isCenter = event.key == Key.DirectionCenter || event.key == Key.Enter
                     when {
-                        (isLeft || isRight) && event.type == KeyEventType.KeyDown -> {
+                        // LEFT/RIGHT only seek when the SCRUB BAR itself holds focus. Without this guard
+                        // the bar consumed ◀▶ even after focus moved to the control row, so play/pause and
+                        // the other buttons "fought" the scrubber and some were unreachable.
+                        (isLeft || isRight) && event.type == KeyEventType.KeyDown && focused -> {
                             val d = if (isRight) 1 else -1
                             when {
                                 !scrubbing -> startScrub(d)
@@ -1202,7 +1207,7 @@ private fun ScrubBar(
                             }
                             true
                         }
-                        (isLeft || isRight) && event.type == KeyEventType.KeyUp -> {
+                        (isLeft || isRight) && event.type == KeyEventType.KeyUp && focused -> {
                             // Release of the active direction -> coast at the speed reached.
                             if (scrubbing && dir == (if (isRight) 1 else -1)) held = false
                             true

@@ -112,7 +112,6 @@ class TorrentStreamerImpl @Inject constructor(
         // Poll until enough head (+tail) is buffered, then flip to READY and keep emitting.
         val pollJob = launch {
             var pollCount = 0
-            var headReadySince = 0L
             var zeroRateSince = 0L
             var lastReannounce = 0L
             val streamStartMs = System.currentTimeMillis()
@@ -148,21 +147,22 @@ class TorrentStreamerImpl @Inject constructor(
 
                 val headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= READY_HEAD_BYTES
-                if (headReady && headReadySince == 0L) headReadySince = now
-                // Tail gate is now CONTAINER-AWARE: mkv/webm start on head alone; only mp4 waits for the
-                // moov (so prepare() never ranges into an absent EOF atom). Three escape hatches make
-                // sure the gate can NEVER stick: tail-grace once the head is in, AND a head-INDEPENDENT
-                // overall hard cap — the real "3MB/s for 60s, never plays" trap was that the contiguous
-                // head can stay pinned below the gate (one slow early piece) so the head-keyed grace
-                // clock never even armed. After OVERALL_HARD_CAP_MS we start with whatever head exists
-                // and let the player's retries + the buffering watchdog take over.
-                // mp4 needs the EOF moov ONLY when it's not faststart (moov already up front in the head).
+                // Tail gate is CONTAINER-AWARE: mkv/webm start on head alone; only mp4 waits for the EOF
+                // moov (so prepare() never ranges into an absent atom). mp4 needs the moov ONLY when it's
+                // not faststart (moov already up front in the head).
+                //
+                // There is deliberately NO per-tail "grace" hatch any more. The old 15s tail-grace emitted
+                // READY before the moov was actually on disk; ExoPlayer then got a file it can't decode and
+                // sat in STATE_BUFFERING forever ("100% · Almost ready…" that never plays, or only starts
+                // tens-of-% into the download once the moov happens to arrive). The head-only watchdog never
+                // caught it because the overall download kept progressing. READY now requires the moov to be
+                // GENUINELY present — OR the head-independent overall hard cap as a true last resort, which
+                // the VM's startup-failover ceiling then backs up (bail to another source if the player
+                // still can't reach first frame).
                 val needsTail = containerNeedsTail && engine.mp4MoovInHead(infoHash) != true
                 val tailReady = !needsTail || engine.tailAvailable(infoHash)
-                val tailGraceElapsed = headReadySince > 0L && now - headReadySince > TAIL_HARD_CAP_MS
                 val overallGrace = now - streamStartMs > OVERALL_HARD_CAP_MS
-                val canStart = (headReady || (overallGrace && headBytes > 0L)) &&
-                    (tailReady || tailGraceElapsed || overallGrace)
+                val canStart = (headReady && tailReady) || (overallGrace && headBytes > 0L)
 
                 // ETA to first frame, against the real gate (head + tail-when-needed), refreshed each poll.
                 val eta = estimateEta(snap, headBytes, tailReady)
@@ -446,11 +446,6 @@ class TorrentStreamerImpl @Inject constructor(
         /** Fixed seconds added to the byte ETA for the player's own prepare/first-frame after the
          *  bytes are present (container parse, decoder init, initial buffer fill). */
         private const val PREPARE_MARGIN_SECONDS = 4L
-
-        /** Hard cap for the EOF tail (moov/cues) after the head is ready: on a healthy swarm the tail
-         *  (fetched in parallel) is in well before this, so the gate rarely waits; this just bounds the
-         *  worst case so a slow/absent tail starts head-only and lets player retries + failover handle it. */
-        private const val TAIL_HARD_CAP_MS = 15_000L
 
         /** Head-INDEPENDENT hard cap: the gate can never sit BUFFERING longer than this, even if the
          *  contiguous head is pinned below READY by a slow early piece (the "fast download, never plays"
