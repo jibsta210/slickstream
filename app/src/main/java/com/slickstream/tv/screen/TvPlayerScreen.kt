@@ -139,6 +139,7 @@ fun TvPlayerScreen(
     val backdropUrl by viewModel.backdropUrl.collectAsStateWithLifecycle()
     val upNext by viewModel.upNextEpisode.collectAsStateWithLifecycle()
     val similarMovies by viewModel.similarMovies.collectAsStateWithLifecycle()
+    val endThresholds by viewModel.endThresholds.collectAsStateWithLifecycle()
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
@@ -150,6 +151,7 @@ fun TvPlayerScreen(
     var zoomFill by remember { mutableStateOf(false) }
     // "Up next" card near the end of an episode; dismissal resets whenever the episode changes.
     var nearEnd by remember { mutableStateOf(false) }
+    var movieNearEnd by remember { mutableStateOf(false) }
     var upNextDismissed by remember(currentSeasonNumber, currentEpisodeNumber) { mutableStateOf(false) }
     // End-of-movie "similar titles" bar.
     var movieBarDismissed by remember { mutableStateOf(false) }
@@ -183,7 +185,8 @@ fun TvPlayerScreen(
         !controlsVisible && uiState is PlayerUiState.Playing
 
     // End-of-movie: a bottom bar of similar titles that autoplays the most-related (Prime-style).
-    val showMovieBar = viewModel.isMovie && nearEnd && similarMovies.isNotEmpty() &&
+    // Movies use a LATER threshold than episodes — a 2-hour film's last 5% is still ~6 minutes.
+    val showMovieBar = viewModel.isMovie && movieNearEnd && similarMovies.isNotEmpty() &&
         !movieBarDismissed && !controlsVisible && uiState is PlayerUiState.Playing
 
     // Autoplay countdown: ARMS only in the final stretch (so a movie isn't cut off at 93%), and ticks
@@ -210,10 +213,13 @@ fun TvPlayerScreen(
         while (true) {
             val p = player
             if (p != null && p.duration > 0) {
-                nearEnd = p.currentPosition.toFloat() / p.duration >= UP_NEXT_PCT
+                val pct = p.currentPosition.toFloat() / p.duration
+                nearEnd = pct >= endThresholds.first        // episode "Up next" threshold (setting)
+                movieNearEnd = pct >= endThresholds.second  // movie "similar titles" threshold (setting)
                 endingSoon = (p.duration - p.currentPosition) in 0..MOVIE_AUTOPLAY_LEAD_MS
             } else {
                 nearEnd = false
+                movieNearEnd = false
                 endingSoon = false
             }
             kotlinx.coroutines.delay(1000)
@@ -712,9 +718,6 @@ private fun ErrorOverlay(
         }
     }
 }
-
-/** Fraction of the runtime after which the "Up next" card appears. */
-private const val UP_NEXT_PCT = 0.93f
 
 /** After dismissing the Up-next card, bring it back this long later (it nags gently, like Netflix). */
 private const val UP_NEXT_REDISPLAY_MS = 30_000L

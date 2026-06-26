@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -125,6 +126,10 @@ data class AppSettings(
     val subtitleStyle: SubtitleStyle = SubtitleStyle.DEFAULT,
     val streamSize: StreamSizePreference = StreamSizePreference.DEFAULT,
     val maxCacheSize: CacheSize = CacheSize.DEFAULT,
+    /** When (as a % of runtime) the end-of-content prompts appear: the next-EPISODE "Up next" card and
+     *  the end-of-MOVIE "similar titles" bar (movies later — a 2-hour film's last 5% is still ~6 min). */
+    val upNextPercent: Int = 95,
+    val movieBarPercent: Int = 97,
     /** Screen calibration (TV overscan/underscan fit): uniform scale of the whole app (1f = none) and
      *  a positional nudge in dp. Lets the user grow/shrink + center the picture to their panel. */
     val screenScale: Float = 1f,
@@ -188,6 +193,8 @@ class SettingsRepository @Inject constructor(
                 ?: StreamSizePreference.DEFAULT,
             maxCacheSize = p[KEY_MAX_CACHE]?.let { runCatching { CacheSize.valueOf(it) }.getOrNull() }
                 ?: CacheSize.DEFAULT,
+            upNextPercent = (p[KEY_UP_NEXT_PCT] ?: 95).coerceIn(PCT_MIN, PCT_MAX),
+            movieBarPercent = (p[KEY_MOVIE_BAR_PCT] ?: 97).coerceIn(PCT_MIN, PCT_MAX),
             screenScale = (p[KEY_SCREEN_SCALE] ?: 1f).coerceIn(SCALE_MIN, SCALE_MAX),
             screenOffsetX = (p[KEY_SCREEN_OFF_X] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
             screenOffsetY = (p[KEY_SCREEN_OFF_Y] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
@@ -205,6 +212,8 @@ class SettingsRepository @Inject constructor(
     suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name }
     suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
+    suspend fun setUpNextPercent(pct: Int) = dataStore.edit { it[KEY_UP_NEXT_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX) }
+    suspend fun setMovieBarPercent(pct: Int) = dataStore.edit { it[KEY_MOVIE_BAR_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX) }
     suspend fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) = dataStore.edit {
         it[KEY_SCREEN_SCALE] = scale.coerceIn(SCALE_MIN, SCALE_MAX)
         it[KEY_SCREEN_OFF_X] = offsetX.coerceIn(OFFSET_MIN, OFFSET_MAX)
@@ -224,6 +233,8 @@ class SettingsRepository @Inject constructor(
         val KEY_SUB_STYLE = stringPreferencesKey("sub_style")
         val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
+        val KEY_UP_NEXT_PCT = intPreferencesKey("up_next_pct")
+        val KEY_MOVIE_BAR_PCT = intPreferencesKey("movie_bar_pct")
         val KEY_SCREEN_SCALE = floatPreferencesKey("screen_scale")
         val KEY_SCREEN_OFF_X = floatPreferencesKey("screen_offset_x")
         val KEY_SCREEN_OFF_Y = floatPreferencesKey("screen_offset_y")
@@ -233,5 +244,9 @@ class SettingsRepository @Inject constructor(
         const val SCALE_MAX = 1.20f
         const val OFFSET_MIN = -200f
         const val OFFSET_MAX = 200f
+
+        // Up-next / movie-bar threshold bounds (% of runtime).
+        const val PCT_MIN = 80
+        const val PCT_MAX = 99
     }
 }

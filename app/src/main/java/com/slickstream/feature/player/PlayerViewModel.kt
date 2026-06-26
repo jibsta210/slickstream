@@ -311,6 +311,15 @@ class PlayerViewModel @Inject constructor(
             CaptionPrefs(SubtitleSize.DEFAULT, SubtitleStyle.DEFAULT),
         )
 
+    /** End-of-content thresholds (0f..1f): (Up-next card for episodes, similar-titles bar for movies). */
+    val endThresholds: StateFlow<Pair<Float, Float>> = settingsRepository.settings
+        .map { (it.upNextPercent / 100f) to (it.movieBarPercent / 100f) }
+        .stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000),
+            0.95f to 0.97f,
+        )
+
     /** Persist subtitle size system-wide (DataStore) straight from the player's subtitle menu;
      *  [captionPrefs] re-emits and both players re-apply it live, and it sticks for next time. */
     fun setSubtitleSize(size: SubtitleSize) {

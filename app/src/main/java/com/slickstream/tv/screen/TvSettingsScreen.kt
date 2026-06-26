@@ -118,6 +118,13 @@ fun TvSettingsScreen(
         }
 
         item {
+            TvSettingSection("Up next") {
+                TvOptionRow("Next-episode card at", listOf(85, 90, 93, 95, 97), settings.upNextPercent, { "$it%" }, viewModel::setUpNextPercent)
+                TvOptionRow("Movie suggestions at", listOf(90, 93, 95, 97, 99), settings.movieBarPercent, { "$it%" }, viewModel::setMovieBarPercent)
+            }
+        }
+
+        item {
             TvSettingSection("Storage") {
                 TvOptionRow("Max cache size", CacheSize.entries, settings.maxCacheSize, { it.label }, viewModel::setMaxCacheSize)
                 Text(

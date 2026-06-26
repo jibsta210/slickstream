@@ -75,6 +75,8 @@ class SettingsViewModel @Inject constructor(
     fun setSubtitleStyle(style: SubtitleStyle) = viewModelScope.launch { repo.setSubtitleStyle(style) }
     fun setStreamSize(s: com.slickstream.data.settings.StreamSizePreference) =
         viewModelScope.launch { repo.setStreamSize(s) }
+    fun setUpNextPercent(pct: Int) = viewModelScope.launch { repo.setUpNextPercent(pct) }
+    fun setMovieBarPercent(pct: Int) = viewModelScope.launch { repo.setMovieBarPercent(pct) }
 
     /**
      * Screen calibration (TV fit). The live preview updates an in-memory value instantly on every

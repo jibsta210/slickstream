@@ -137,6 +137,7 @@ fun PlayerScreen(
     val rebuffering by viewModel.rebuffering.collectAsState()
     val backdropUrl by viewModel.backdropUrl.collectAsState()
     val upNext by viewModel.upNextEpisode.collectAsState()
+    val endThresholds by viewModel.endThresholds.collectAsState()
     val context = LocalContext.current
 
     // Scrub-preview: the ms position the user is dragging the built-in time bar to (null = not
@@ -301,7 +302,7 @@ fun PlayerScreen(
             while (true) {
                 val p = player
                 nearEnd = p != null && p.duration > 0 &&
-                    p.currentPosition.toFloat() / p.duration >= UP_NEXT_PCT
+                    p.currentPosition.toFloat() / p.duration >= endThresholds.first
                 delay(1000)
             }
         }
@@ -536,7 +537,6 @@ fun PlayerScreen(
 }
 
 /** Fraction of the runtime after which the "Up next" card appears. */
-private const val UP_NEXT_PCT = 0.93f
 
 /** After dismissing the Up-next card, bring it back this long later (gentle nag, like Netflix). */
 private const val UP_NEXT_REDISPLAY_MS = 30_000L
