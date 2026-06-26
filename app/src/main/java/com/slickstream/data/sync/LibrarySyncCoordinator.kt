@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import com.slickstream.data.local.entity.ProfileEntity
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
@@ -44,6 +45,7 @@ class LibrarySyncCoordinator @Inject constructor(
     private var favListener: ListenerRegistration? = null
     private var profileListener: ListenerRegistration? = null
     private var lastFavKeys: Set<String> = emptySet()
+    private var lastProfileIds: Set<String> = emptySet()
     @Volatile private var running = false
 
     /** Called after a successful sign-in (Google → Firebase) and on session restore. */
@@ -70,12 +72,57 @@ class LibrarySyncCoordinator @Inject constructor(
         sync.signOut()
     }
 
-    /** Profiles: pull remote → upsert each; push the local set up; then listen for live changes. */
+    /** Profiles: pull remote → upsert each; reconcile same-named duplicates; push the local set up;
+     *  start a delta push (so a profile created mid-session syncs immediately); then listen live. */
     private suspend fun syncProfiles() {
         sync.pullProfiles().forEach { profiles.upsertFromSync(it) }
+        reconcileDuplicateProfiles()
         profiles.allProfiles().forEach { sync.pushProfileNow(it) }
+        lastProfileIds = profiles.allProfiles().map { it.id }.toSet()
+        startProfilePush()
         profileListener = sync.listenProfiles { p ->
-            scope.launch { profiles.upsertFromSync(p) }
+            scope.launch {
+                lastProfileIds = lastProfileIds + p.id   // pre-mark so the push observer doesn't echo it back
+                profiles.upsertFromSync(p)
+                reconcileDuplicateProfiles()
+            }
+        }
+    }
+
+    /**
+     * THE favourites-sync fix. Two profiles that are the SAME PERSON but were created independently on
+     * different devices get divergent random UUIDs (createProfile mints UUID.randomUUID()), so their
+     * profile-keyed favourites/history never match across devices — only the shared "default" id did.
+     * Here we merge same-(trimmed,lower)-named profiles into ONE canonical id (the earliest-created,
+     * deterministic on every device), re-key favourites/history to it, and drop the loser — WITHOUT a
+     * visible profile switch (if the active profile WAS the loser, we silently retarget it to canonical).
+     * "default" is never reconciled away.
+     */
+    private suspend fun reconcileDuplicateProfiles() {
+        profiles.allProfiles()
+            .groupBy { it.name.trim().lowercase() }
+            .values
+            .filter { it.size > 1 }
+            .forEach { dups ->
+                val canonical = dups.minWithOrNull(compareBy({ it.createdAt }, { it.id })) ?: return@forEach
+                dups.filter { it.id != canonical.id && it.id != ProfileEntity.DEFAULT_PROFILE_ID }
+                    .forEach { loser ->
+                        library.reassignProfile(loser.id, canonical.id)
+                        if (profiles.currentProfileId() == loser.id) profiles.setActiveProfile(canonical.id)
+                        profiles.deleteProfile(loser.id)
+                        sync.removeProfile(loser.id)
+                    }
+            }
+    }
+
+    /** Push a profile to the cloud the moment it's created/edited (delta vs lastProfileIds), so the
+     *  other device adopts the EXISTING id instead of minting a fresh UUID for the same name. */
+    private fun startProfilePush() {
+        jobs += scope.launch {
+            profiles.observeProfiles().collectLatest { list ->
+                list.filter { it.id !in lastProfileIds }.forEach { sync.pushProfile(it) }
+                lastProfileIds = list.map { it.id }.toSet()
+            }
         }
     }
 
@@ -132,6 +179,7 @@ class LibrarySyncCoordinator @Inject constructor(
         jobs.forEach { it.cancel() }
         jobs.clear()
         lastFavKeys = emptySet()
+        lastProfileIds = emptySet()
     }
 
     private fun favKey(profileId: String, id: Int, type: com.slickstream.core.model.MediaType) =

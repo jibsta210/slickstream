@@ -192,6 +192,12 @@ class LibraryRepositoryImpl @Inject constructor(
         )
     }
 
+    override suspend fun reassignProfile(fromId: String, toId: String) {
+        if (fromId == toId) return
+        favoriteDao.reassignProfile(fromId, toId)
+        watchHistoryDao.reassignProfile(fromId, toId)
+    }
+
     private companion object {
         /** position == duration == 1ms -> percent 1.0f, so the row reads as finished/watched. */
         const val WATCHED_SENTINEL_MS = 1L

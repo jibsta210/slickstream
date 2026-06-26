@@ -69,4 +69,9 @@ interface WatchHistoryDao {
     /** Clear only the active profile's history (never the whole table). */
     @Query("DELETE FROM watch_history WHERE profileId = :profileId")
     suspend fun clear(profileId: String)
+
+    /** Move every history row from one profile id to another (profile reconcile). OR REPLACE so a row
+     *  already present under the target id collapses instead of a PK-conflict crash. */
+    @Query("UPDATE OR REPLACE watch_history SET profileId = :toId WHERE profileId = :fromId")
+    suspend fun reassignProfile(fromId: String, toId: String)
 }

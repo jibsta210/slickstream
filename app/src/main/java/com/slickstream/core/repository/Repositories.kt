@@ -90,6 +90,10 @@ interface LibraryRepository {
 
     /** UPSERT [progress] for [item] under [profileId] specifically — used by the initial sync merge. */
     suspend fun saveProgressForProfile(profileId: String, item: MediaItem, progress: PlaybackProgress)
+
+    /** Move every favourite + history row from [fromId] to [toId] — used to reconcile two profile rows
+     *  that are the same person but got divergent ids on different devices. */
+    suspend fun reassignProfile(fromId: String, toId: String)
 }
 
 /**

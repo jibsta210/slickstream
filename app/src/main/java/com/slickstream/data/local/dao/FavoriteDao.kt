@@ -44,4 +44,9 @@ interface FavoriteDao {
 
     @Query("DELETE FROM favorites WHERE id = :id AND mediaType = :type AND profileId = :profileId")
     suspend fun deleteById(id: Int, type: MediaType, profileId: String)
+
+    /** Move every favourite from one profile id to another (profile reconcile). OR REPLACE so a row
+     *  already present under the target id collapses instead of a PK-conflict crash. */
+    @Query("UPDATE OR REPLACE favorites SET profileId = :toId WHERE profileId = :fromId")
+    suspend fun reassignProfile(fromId: String, toId: String)
 }
