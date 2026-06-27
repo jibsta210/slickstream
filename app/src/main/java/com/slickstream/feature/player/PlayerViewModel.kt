@@ -253,6 +253,12 @@ class PlayerViewModel @Inject constructor(
     private var failoverInFlight = false
     /** Watchdog that fails over when a source never reaches playable (dead / fake-seeded swarm). */
     private var bufferWatchdogJob: Job? = null
+    /** Post-playback watchdog: if a mid-stream stall persists (a source whose seeders can't sustain the
+     *  bitrate — the "plays 10 min then buffers forever" case), auto-downshift to a smaller source. */
+    private var rebufferWatchdogJob: Job? = null
+    /** True once this source has actually reached playback — gates the downshift watchdog so it can't
+     *  fight the STARTUP failover watchdog (which owns the pre-first-frame phase). Reset per source. */
+    @Volatile private var hasReachedPlaying = false
     /** Last downloadedBytes the streamer emitted — the watchdog's head-progress signal. */
     @Volatile private var lastEmittedDownloadedBytes: Long = 0L
 
@@ -432,6 +438,33 @@ class PlayerViewModel @Inject constructor(
         _suggestSmaller.value = false
     }
 
+    /**
+     * Arm the post-playback stall watchdog: if we're STILL not playing after a grace window (a mid-stream
+     * rebuffer or a player-handoff that won't start — the "plays a while then buffers forever" case),
+     * auto-downshift to the smallest healthy source below the current one, KEEPING position. Idempotent —
+     * re-arming while already armed is a no-op; it self-cancels on STATE_READY / a fresh source.
+     */
+    private fun armSustainedRebufferWatchdog() {
+        if (!hasReachedPlaying) return   // startup is the failover watchdog's job, not the downshift's
+        if (rebufferWatchdogJob?.isActive == true) return
+        rebufferWatchdogJob = viewModelScope.launch {
+            delay(SUSTAINED_REBUFFER_TIMEOUT_MS)
+            if (_uiState.value !is PlayerUiState.Playing || _rebuffering.value != null) {
+                failoverToSmaller()
+            }
+        }
+    }
+
+    /** Downshift to the smallest healthy source below the current one on a sustained underrun, keeping
+     *  position (selectSource saves progress first; maybeSeekToResume restores on the new player). No-op
+     *  when nothing smaller qualifies — we then just keep waiting on the current source. */
+    private fun failoverToSmaller() {
+        val smaller = findSmallerHealthySource() ?: return
+        rebufferWatchdogJob?.cancel()
+        _rebuffering.value = null
+        selectSource(smaller)
+    }
+
     private suspend fun networkQualityPreference(): QualityPreference {
         val settings = settingsRepository.current()
         return if (isOnUnmeteredNetwork()) settings.wifiQuality else settings.cellularQuality
@@ -494,6 +527,8 @@ class PlayerViewModel @Inject constructor(
         suggestedSmallerForSource = false
         _suggestSmaller.value = false
         _rebuffering.value = null
+        rebufferWatchdogJob?.cancel()   // fresh source -> drop any pending downshift from the old one
+        hasReachedPlaying = false       // new source starts in the STARTUP phase (failover watchdog owns it)
         latestStatus = null
         firstReadyAtMs = 0L
         bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
@@ -578,6 +613,12 @@ class PlayerViewModel @Inject constructor(
             downloadRateBytes = 0,
             label = "Trying another source…",
         )
+        // Persist the LIVE position BEFORE tearing the player down — _player.value still holds the old
+        // player with the real position, so maybeSeekToResume() restores it on the rebuilt player (keyed
+        // by media/season/episode, not infoHash, so it works across a failover to a different release).
+        // Without this, a mid-playback failover restarted the new source at 0:00 (the "10 min in, resets
+        // to 0:00" bug). saveProgressNow() already no-ops on a 0 position, so it can't clobber a resume.
+        saveProgressNow()
         // Keep the just-failed partial in cache, then tear the poisoned player down so ensurePlayer()
         // rebuilds a clean one on the new URL. startSource() re-arms failoverInFlight = false.
         stopActiveStream(removeFiles = false)
@@ -590,6 +631,7 @@ class PlayerViewModel @Inject constructor(
      *  switch both need a FRESH player, never the old one's leftover position/state). */
     private fun releaseLocalPlayer() {
         bufferWatchdogJob?.cancel()
+        rebufferWatchdogJob?.cancel()
         progressTickJob?.cancel()
         val exo = _player.value
         playerListener?.let { exo?.removeListener(it) }
@@ -839,10 +881,12 @@ class PlayerViewModel @Inject constructor(
                         sourceErrorRetries = 0 // recovered / playing — forget transient stalls
                         maybeSeekToResume(exo)
                         // Playing — clear the buffering clock, any pending smaller-stream hint, and any
-                        // mid-playback rebuffer badge (we just recovered).
+                        // mid-playback rebuffer badge + downshift watchdog (we just recovered).
                         bufferingSinceMs = 0L
                         _suggestSmaller.value = false
                         _rebuffering.value = null
+                        rebufferWatchdogJob?.cancel()
+                        hasReachedPlaying = true
                         _uiState.value = PlayerUiState.Playing
                         maybeStartThumbnails(exo)
                     }
@@ -875,6 +919,7 @@ class PlayerViewModel @Inject constructor(
                                 etaSeconds = latestStatus?.let { etaToResume(it) },
                                 downloadRateBytes = latestStatus?.downloadRateBytes ?: 0,
                             )
+                            armSustainedRebufferWatchdog()  // sustained underrun -> downshift (keeps position)
                         }
                     }
                     Player.STATE_ENDED -> {
@@ -1003,6 +1048,8 @@ class PlayerViewModel @Inject constructor(
                     bufferingSinceMs = 0L
                     _suggestSmaller.value = false
                     _rebuffering.value = null
+                    rebufferWatchdogJob?.cancel()
+                    hasReachedPlaying = true
                     _uiState.value = PlayerUiState.Playing
                 }
                 Player.STATE_BUFFERING -> {
@@ -1017,12 +1064,16 @@ class PlayerViewModel @Inject constructor(
                             label = "Almost ready…",
                             etaSeconds = prev?.etaSeconds,
                         )
+                        // A VLC handoff that can't reach first frame (e.g. fell back for a SLOW source,
+                        // which VLC can't fix) should also downshift rather than buffer forever.
+                        armSustainedRebufferWatchdog()
                     } else if (_rebuffering.value == null) {
                         // Mid-playback stall on the VLC backend — same small badge as the ExoPlayer path.
                         _rebuffering.value = RebufferState(
                             etaSeconds = latestStatus?.let { etaToResume(it) },
                             downloadRateBytes = latestStatus?.downloadRateBytes ?: 0,
                         )
+                        armSustainedRebufferWatchdog()
                     }
                 }
                 Player.STATE_ENDED -> {
@@ -1334,11 +1385,12 @@ class PlayerViewModel @Inject constructor(
 
         val playing = activeInfoHash
         if (best.infoHash == playing) return
-        if (best.infoHash in torrentStreamer.cachedTorrents()) {
-            prefetchedInfoHash = best.infoHash
-            return
-        }
-        prefetchedInfoHash = torrentStreamer.prefetch(best, setOfNotNull(playing))
+        // Publish the warm target NOW — BEFORE the blocking head-fill in prefetch() — so an early
+        // next-episode hop can reuse this torrent mid-warm. With the in-session keep (engine stop change),
+        // even a half-warmed torrent is paused-in-session, so startSource() re-attaches + resumes it.
+        prefetchedInfoHash = best.infoHash
+        if (best.infoHash in torrentStreamer.cachedTorrents()) return
+        torrentStreamer.prefetch(best, setOfNotNull(playing))
     }
 
     /** Next-episode coordinates: same-season next, else episode 1 of the next real season. */
@@ -1575,6 +1627,9 @@ class PlayerViewModel @Inject constructor(
         /** READY emitted (player has a URL) but still hasn't reached first frame this long, while bytes
          *  keep flowing = a can't-decode source (missing mp4 moov / scattered head) -> fail over. */
         const val STARTUP_PLAY_TIMEOUT_MS = 18_000L
+        /** A mid-stream stall persisting this long = a source whose swarm can't sustain the bitrate ->
+         *  auto-downshift to a smaller source (keeping position). */
+        const val SUSTAINED_REBUFFER_TIMEOUT_MS = 30_000L
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L

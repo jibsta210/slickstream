@@ -95,8 +95,13 @@ class TorrentCacheManager @Inject constructor(
         var total = cacheSizeBytes()
         if (total <= maxBytes) return 0L
         var freed = 0L
+        // NOTE: do NOT exclude engine.isActive() here. Torrents kept paused-in-session for fast resume
+        // now have valid handles too (engine stop(removeFiles=false) no longer removes them), so an
+        // isActive filter would make the WHOLE cache un-evictable -> unbounded growth/OOM. The active +
+        // warmed streams are protected via [protectedHashes] (the callers pass streamingHashes + the
+        // playing + warmed hash); everything else — including paused-in-session partials — is evictable.
         val candidates = cachedTorrents()
-            .filter { it !in protectedHashes && !engine.isActive(it) }
+            .filter { it !in protectedHashes }
             .sortedBy { lastAccess(it) }
         for (hash in candidates) {
             if (total - freed <= maxBytes) break
@@ -108,9 +113,12 @@ class TorrentCacheManager @Inject constructor(
         return freed
     }
 
-    /** Remove a single cached torrent's files + bookkeeping. */
+    /** Remove a single cached torrent's files + bookkeeping. Tears down the live session handle first
+     *  (paused-in-session partials kept for fast resume must be removed from libtorrent before their
+     *  files are deleted, or the session would keep a handle over deleted files). Idempotent — when the
+     *  caller already removed it from the session (streamer.stop(removeFiles=true)), this is a no-op. */
     fun evict(hash: String) {
-        // Delete via engine if it knows the file (handles session-held files); else best-effort.
+        runCatching { engine.stop(hash, removeFiles = true) }
         engine.filePath(hash)?.let { runCatching { File(it).delete() } }
         deleteTorrentArtifacts(hash)
         prefs.edit().remove(hash).apply()

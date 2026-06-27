@@ -376,6 +376,9 @@ class VlcPlayer(
                 if (sv.width > 0 && sv.height > 0) applyWindowSize(sv.width, sv.height)
             }
             if (width > 0 && height > 0) {
+                // A real frame is decoding now — drop the black backing so VLC's video shows (and any
+                // letterbox region isn't forced black over the picture).
+                currentSurfaceView?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
                 val par = if (sarNum > 0 && sarDen > 0) sarNum.toFloat() / sarDen.toFloat() else 1f
                 videoSize = VideoSize(width, height, par)
                 mainHandler.post { invalidateState() }
@@ -398,6 +401,11 @@ class VlcPlayer(
             vout.attachViews(videoLayoutListener)
             vout.setWindowSize(width.coerceAtLeast(1), height.coerceAtLeast(1))
             voutAttached = true
+            // Black out the SurfaceView buffer until VLC paints its first frame — otherwise the
+            // uninitialised surface buffer shows through as the Android-TV "blue box" while buffering
+            // (a slow source that never decodes a frame left the whole screen blue). Cleared to
+            // transparent in [videoLayoutListener] once real video dimensions arrive (decode has begun).
+            surfaceView.setBackgroundColor(android.graphics.Color.BLACK)
         }.onFailure {
             voutAttached = false
             Log.e(TAG, "doAttach failed", it)

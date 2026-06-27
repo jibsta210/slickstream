@@ -902,12 +902,13 @@ class TorrentEngine @Inject constructor(
             active?.filePath?.let { runCatching { File(it).delete() } }
         } else {
             if (handle != null && handle.isValid) {
-                // Keep the partial file on disk but free the session slot once the resume
-                // blob is durably written. saveResume() queues SAVE_RESUME_DATA; its alert ->
-                // persistResumeBlob -> completeDeferredRemoval frees the slot, and the ensuing
-                // TorrentRemovedAlert clears the torrents map (keeping snapshot()/isActive()
-                // consistent until the blob exists).
-                pendingRemoval.add(infoHash)
+                // KEEP the torrent LIVE in the session (handle stays valid, map entry kept) so re-opening
+                // this title — or advancing to a warmed next episode — re-attaches via addMagnet's
+                // fast-path with the partial INTACT: no metadata refetch, no redownload from 0% (the
+                // "exit and it starts over" + "next-episode warm does nothing" bugs were this branch
+                // freeing the session slot via deferred session.remove). Just pause it and snapshot resume
+                // data as a process-restart backstop. Real eviction (removeFiles=true, above) frees the
+                // slot, bounded by the LRU cache budget, so paused-in-session torrents don't grow unbounded.
                 synchronized(nativeLock) { handle.pause() }
                 saveResume(infoHash)
                 saveSessionState()
