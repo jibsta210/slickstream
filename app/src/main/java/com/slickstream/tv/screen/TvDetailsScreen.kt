@@ -513,6 +513,10 @@ private fun EpisodeCard(
     // A future/unreleased episode is shown (info + air date) but can't be played — disabling the
     // Surface makes it non-clickable so the D-pad lands on the last AIRED episode instead.
     val aired = episode.hasAired()
+    Column(
+        modifier = Modifier.width(300.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
     Surface(
         onClick = onClick,
         enabled = aired,
@@ -529,7 +533,7 @@ private fun EpisodeCard(
             ),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
-        modifier = Modifier.width(300.dp),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Column {
             Box(
@@ -652,43 +656,50 @@ private fun EpisodeCard(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // D-pad focusable Mark watched / unwatched toggle (distinct focus target from the
-                // card's Play click).
-                val toggleShape = RoundedCornerShape(50)
-                Surface(
-                    onClick = { onToggleWatched(isWatched) },
-                    shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
-                    colors = ClickableSurfaceDefaults.colors(
-                        containerColor = Brand.SurfaceVariant,
-                        focusedContainerColor = Brand.Violet,
-                        contentColor = Brand.OnSurface,
-                        focusedContentColor = Color.White,
+            }
+        }
+    }
+        // D-pad focusable Mark watched / unwatched toggle — a SEPARATE focus target placed BELOW the
+        // card. It used to be nested INSIDE the card's clickable Surface, which made it unreachable on TV:
+        // a clickable Surface is a single focus target and the D-pad can't descend into a nested clickable
+        // child, so focus never landed on it ("can't mark watched on TV"; touch on mobile ignores focus,
+        // so it worked there). DOWN from the card now focuses it. Aired episodes only.
+        if (aired) {
+            val toggleShape = RoundedCornerShape(50)
+            Surface(
+                onClick = { onToggleWatched(isWatched) },
+                shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
+                colors = ClickableSurfaceDefaults.colors(
+                    containerColor = Brand.SurfaceVariant,
+                    focusedContainerColor = Brand.Violet,
+                    contentColor = Brand.OnSurface,
+                    focusedContentColor = Color.White,
+                ),
+                border = ClickableSurfaceDefaults.border(
+                    focusedBorder = Border(
+                        border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
+                        shape = toggleShape,
                     ),
-                    border = ClickableSurfaceDefaults.border(
-                        focusedBorder = Border(
-                            border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
-                            shape = toggleShape,
-                        ),
-                    ),
-                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+                ),
+                scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+                modifier = Modifier.padding(start = 4.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
-                            contentDescription = null,
-                            tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = if (isWatched) "Watched" else "Mark watched",
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                        )
-                    }
+                    Icon(
+                        imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                        contentDescription = null,
+                        tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (isWatched) "Watched" else "Mark watched",
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                    )
                 }
             }
         }
