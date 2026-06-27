@@ -50,6 +50,18 @@ fun TvSettingsScreen(
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val cache by viewModel.cacheStats.collectAsStateWithLifecycle()
+    val syncDiag by viewModel.syncDiagnostic.collectAsStateWithLifecycle()
+
+    syncDiag?.let { result ->
+        com.slickstream.tv.components.TvConfirmDialog(
+            title = "Cloud sync",
+            message = result,
+            confirmLabel = "OK",
+            onConfirm = viewModel::dismissSyncDiagnostic,
+            onDismiss = viewModel::dismissSyncDiagnostic,
+            dismissLabel = "Close",
+        )
+    }
 
     // Rail is hidden here — land focus on the first setting so the first D-pad press isn't swallowed.
     val firstFocus = androidx.compose.runtime.remember { androidx.compose.ui.focus.FocusRequester() }
@@ -150,6 +162,35 @@ fun TvSettingsScreen(
                     scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
                 ) {
                     Text("Clear cache", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
+                }
+            }
+        }
+
+        item {
+            TvSettingSection("Cloud sync") {
+                Text(
+                    text = "Favourites, watch history, and profiles sync across your signed-in devices. " +
+                        "If they're not, run the test to see what's wrong.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Brand.OnSurfaceDim,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+                val shape = RoundedCornerShape(50)
+                Surface(
+                    onClick = viewModel::testSync,
+                    shape = ClickableSurfaceDefaults.shape(shape = shape),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor = Brand.Surface,
+                        focusedContainerColor = Brand.Violet,
+                        contentColor = Brand.OnSurface,
+                        focusedContentColor = Color.White,
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet), shape = shape),
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
+                ) {
+                    Text("Test cloud sync", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
                 }
             }
         }

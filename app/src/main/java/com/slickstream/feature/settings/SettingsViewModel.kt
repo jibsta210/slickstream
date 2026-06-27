@@ -3,6 +3,7 @@ package com.slickstream.feature.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.slickstream.core.repository.TorrentStreamer
+import com.slickstream.data.sync.FirebaseSync
 import com.slickstream.data.settings.AppSettings
 import com.slickstream.data.settings.CacheSize
 import com.slickstream.data.settings.QualityPreference
@@ -32,6 +33,7 @@ data class CacheStats(
 class SettingsViewModel @Inject constructor(
     private val repo: SettingsRepository,
     private val torrentStreamer: TorrentStreamer,
+    private val firebaseSync: FirebaseSync,
 ) : ViewModel() {
 
     val settings: StateFlow<AppSettings> = repo.settings.stateIn(
@@ -42,6 +44,18 @@ class SettingsViewModel @Inject constructor(
 
     private val _cacheStats = MutableStateFlow(CacheStats())
     val cacheStats: StateFlow<CacheStats> = _cacheStats.asStateFlow()
+
+    /** Result of the last "Test cloud sync" run (null = not run / dismissed). */
+    private val _syncDiagnostic = MutableStateFlow<String?>(null)
+    val syncDiagnostic: StateFlow<String?> = _syncDiagnostic.asStateFlow()
+
+    /** Run the live sync self-test (auth + Firestore round-trip) and surface the human-readable result. */
+    fun testSync() {
+        _syncDiagnostic.value = "Testing cloud sync…"
+        viewModelScope.launch { _syncDiagnostic.value = firebaseSync.diagnose() }
+    }
+
+    fun dismissSyncDiagnostic() { _syncDiagnostic.value = null }
 
     init { refreshCacheStats() }
 

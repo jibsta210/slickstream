@@ -46,6 +46,40 @@ class FirebaseSync @Inject constructor(
 
     fun uid(): String? = auth?.currentUser?.uid
 
+    /**
+     * Live, user-visible sync self-test — turns the silent runCatching black box into a diagnosable
+     * answer. Reports whether Firebase is configured, whether the Google→Firebase exchange actually
+     * connected us (a uid), and whether Firestore reads/writes are PERMITTED (a real round-trip), with
+     * the precise failure (e.g. PERMISSION_DENIED, or the auth never connecting) when it's broken.
+     */
+    suspend fun diagnose(): String {
+        if (!available) {
+            return "Cloud sync is OFF: this build has no Firebase config (google-services.json). " +
+                "Favourites stay on this device only."
+        }
+        val uid = uid()
+            ?: return "Signed in to Google, but NOT connected to Firebase — the account didn't link " +
+                "for sync. This almost always means Google sign-in isn't enabled for the Firebase " +
+                "project, or this app's signing SHA-1 isn't registered in it. Until that's fixed in the " +
+                "Firebase console, nothing can sync. (On TV, re-pair to retry.)"
+        val d = db ?: return "Connected as $uid, but Firestore is unavailable."
+        return try {
+            val ref = d.collection("users").document(uid).collection("_diag").document("ping")
+            ref.set(mapOf("t" to com.google.firebase.firestore.FieldValue.serverTimestamp())).await()
+            val ok = ref.get().await().exists()
+            runCatching { ref.delete().await() }
+            if (ok) "Sync is working ✓  (connected as $uid; Firestore read + write OK)."
+            else "Connected as $uid, but the test read came back empty (write may be blocked)."
+        } catch (t: Throwable) {
+            val code = (t as? com.google.firebase.firestore.FirebaseFirestoreException)?.code?.name
+            "Connected as $uid, but Firestore is BLOCKED: ${code ?: t.javaClass.simpleName}. " +
+                if (code == "PERMISSION_DENIED")
+                    "Your Firestore security rules deny access — allow read/write on " +
+                        "users/{uid}/** for the signed-in user."
+                else (t.message ?: "")
+        }
+    }
+
     /** Exchange the Google ID token for a Firebase session so Firestore is keyed by uid. */
     suspend fun signInWithGoogle(idToken: String): String? {
         val a = auth ?: return null
