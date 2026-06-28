@@ -121,6 +121,11 @@ fun PlayerScreen(
     val uiState by viewModel.uiState.collectAsState()
     val player by viewModel.currentPlayer.collectAsState()
     val isCasting by viewModel.isCasting.collectAsState()
+
+    // Keep the device awake while playing/loading (not when paused/idle) — replaces the always-on
+    // PlayerView flag and covers the libVLC fallback too. Casting plays on the TV, so don't hold the
+    // phone awake then.
+    KeepScreenOn(enabled = !isCasting && (uiState is PlayerUiState.Playing || uiState is PlayerUiState.Buffering))
     val sources by viewModel.sources.collectAsState()
     val currentSource by viewModel.currentSource.collectAsState()
     val title by viewModel.title.collectAsState()
@@ -192,7 +197,6 @@ fun PlayerScreen(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                         )
                         useController = true
-                        keepScreenOn = true
                         setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
                         // Make the built-in controller the single source of truth for "are controls
                         // showing". Our custom overlays (top bar, chunk/download bar, Up-next) are gated

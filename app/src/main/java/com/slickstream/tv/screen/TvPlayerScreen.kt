@@ -178,6 +178,12 @@ fun TvPlayerScreen(
         onDispose { p?.removeListener(listener) }
     }
 
+    // Keep the TV awake while actively playing or loading (the screensaver was kicking in mid-playback
+    // because nothing held the screen on). A paused/idle player lets the screen sleep normally.
+    com.slickstream.feature.player.KeepScreenOn(
+        enabled = isPlaying || uiState is PlayerUiState.Buffering,
+    )
+
     val anyPanelOpen = panelOpen || subsPanelOpen || episodesPanelOpen
 
     // The "Up next" card shows when we're near the end of a TV episode that has a next one, the user
