@@ -459,6 +459,12 @@ class PlayerViewModel @Inject constructor(
      *  position (selectSource saves progress first; maybeSeekToResume restores on the new player). No-op
      *  when nothing smaller qualifies — we then just keep waiting on the current source. */
     private fun failoverToSmaller() {
+        // NEVER downshift when the file is already (nearly) fully downloaded — the bytes are on disk, so
+        // a stall is a DECODE / transient hiccup, not bandwidth. Switching to a smaller source would
+        // pointlessly restart playback and re-download from scratch (the "Protector: 100% downloaded,
+        // buffers mid-stream, then picks a new stream and starts over" regression). Just keep waiting;
+        // ExoPlayer recovers from local data on its own.
+        if ((latestStatus?.progress ?: 0f) >= NEAR_COMPLETE_FRACTION) return
         val smaller = findSmallerHealthySource() ?: return
         rebufferWatchdogJob?.cancel()
         _rebuffering.value = null
@@ -1630,6 +1636,9 @@ class PlayerViewModel @Inject constructor(
         /** A mid-stream stall persisting this long = a source whose swarm can't sustain the bitrate ->
          *  auto-downshift to a smaller source (keeping position). */
         const val SUSTAINED_REBUFFER_TIMEOUT_MS = 30_000L
+        /** At/above this downloaded fraction the bytes are effectively on disk, so a stall is a decode/
+         *  transient issue, NOT bandwidth — never downshift/switch sources (it would re-download). */
+        const val NEAR_COMPLETE_FRACTION = 0.9f
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L
