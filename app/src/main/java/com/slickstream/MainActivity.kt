@@ -29,6 +29,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import com.slickstream.data.settings.AppSettings
 import com.slickstream.data.settings.ScreenCalibration
 import com.slickstream.data.settings.SettingsRepository
@@ -53,6 +55,9 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var deviceProfile: DeviceProfile
+
+    @Inject
+    lateinit var authRepository: com.slickstream.core.repository.AuthRepository
 
     // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
     private val onTv: Boolean get() = deviceProfile.isTv
@@ -141,6 +146,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         applyTvImmersiveIfNeeded()
+        // Resume cross-device sync on EVERY cold launch. restoreSession() -> onSignedIn() attaches the
+        // favourite/history/profile/settings push + listeners, but it was only ever triggered when the
+        // auth screen or the TV Profile tab was opened — so on the TV (which lands on Home) sync never
+        // started unless you visited Profile, and favourites/settings silently didn't sync. Idempotent
+        // (onSignedIn guards on `running`), so safe to call here unconditionally.
+        lifecycleScope.launch { runCatching { authRepository.restoreSession() } }
         setContent {
             val settings by settingsRepository.settings
                 .collectAsStateWithLifecycle(initialValue = AppSettings())
