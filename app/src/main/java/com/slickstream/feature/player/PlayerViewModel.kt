@@ -562,7 +562,9 @@ class PlayerViewModel @Inject constructor(
         bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
-            seeders = source.seeders ?: 0,
+            // A direct (RD/file-server) source has no swarm — never show a seeder count on its loading
+            // screen (it was carrying the underlying torrent's seeders and looking like a torrent).
+            seeders = if (source.isDirect) 0 else source.seeders ?: 0,
             downloadRateBytes = 0,
             label = if (source.isDirect) "Loading…" else "Connecting to peers…",
         )
@@ -678,7 +680,7 @@ class PlayerViewModel @Inject constructor(
         _suggestSmaller.value = false
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
-            seeders = next.seeders ?: 0,
+            seeders = if (next.isDirect) 0 else next.seeders ?: 0,
             downloadRateBytes = 0,
             label = "Trying another source…",
         )
@@ -987,17 +989,33 @@ class PlayerViewModel @Inject constructor(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
                     Player.STATE_READY -> {
-                        sourceErrorRetries = 0 // recovered / playing — forget transient stalls
-                        maybeSeekToResume(exo)
-                        // Playing — clear the buffering clock, any pending smaller-stream hint, and any
-                        // mid-playback rebuffer badge + downshift watchdog (we just recovered).
-                        bufferingSinceMs = 0L
-                        _suggestSmaller.value = false
-                        _rebuffering.value = null
-                        rebufferWatchdogJob?.cancel()
-                        hasReachedPlaying = true
-                        _uiState.value = PlayerUiState.Playing
-                        maybeStartThumbnails(exo)
+                        // FAKE/SAMPLE RD link: a "[RD+]" result whose real file is only a few seconds (spam
+                        // sample) loads fine but reports an implausibly short duration. A real movie/episode
+                        // is always minutes long, so treat a sub-2-min direct source as dead and fail over
+                        // instead of playing 8 seconds of junk. (Direct only; torrents/legit shorts untouched.)
+                        val dur = exo.duration
+                        val shortFake = _currentSource.value?.isDirect == true && !usingVlcForSource &&
+                            !_isCasting.value && dur != C.TIME_UNSET && dur in 1 until MIN_DIRECT_DURATION_MS
+                        if (shortFake) {
+                            triedInfoHashes.add(_currentSource.value?.infoHash ?: "")
+                            viewModelScope.launch {
+                                if (!failoverToNext()) {
+                                    _uiState.value = PlayerUiState.Error("Couldn't start any source for this title.")
+                                }
+                            }
+                        } else {
+                            sourceErrorRetries = 0 // recovered / playing — forget transient stalls
+                            maybeSeekToResume(exo)
+                            // Playing — clear the buffering clock, any pending smaller-stream hint, and any
+                            // mid-playback rebuffer badge + downshift watchdog (we just recovered).
+                            bufferingSinceMs = 0L
+                            _suggestSmaller.value = false
+                            _rebuffering.value = null
+                            rebufferWatchdogJob?.cancel()
+                            hasReachedPlaying = true
+                            _uiState.value = PlayerUiState.Playing
+                            maybeStartThumbnails(exo)
+                        }
                     }
                     Player.STATE_BUFFERING -> {
                         if (_uiState.value !is PlayerUiState.Playing) {
@@ -1798,6 +1816,9 @@ class PlayerViewModel @Inject constructor(
         /** Direct (RD/file-server) links fail instantly + for free, and RD lists many dead/fake [RD+]
          *  entries — so allow walking past a lot of them before giving up (vs the small torrent cap). */
         const val MAX_DIRECT_FAILOVERS = 25
+        /** A direct (RD) source whose media duration is under this is a fake/sample (a few-second spam
+         *  file), not a real movie/episode — fail over instead of playing it. */
+        const val MIN_DIRECT_DURATION_MS = 120_000L
         /** Pre-player buffering wall-clock before the watchdog will consider a source a failure. */
         const val FAILOVER_BUFFER_BUDGET_MS = 45_000L
         /** Watchdog poll cadence while waiting for a source to become playable. */
