@@ -50,6 +50,10 @@ data class DetailsUiState(
     /** Where the main Play button should go: the in-progress episode (Resume), the next episode after
      *  the last one you finished (Play SxEy), or the first episode if nothing's been watched. */
     val resumeTarget: ResumeTarget? = null,
+    /** True when the BEST available release for this title is a CAM/TS (cinema rip) — i.e. there's no
+     *  real encode out yet. Surfaced on the details screen so the user knows before pressing Play.
+     *  Movies only (resolved during the source prewarm). */
+    val onlyCamAvailable: Boolean = false,
 ) {
     val mediaType: MediaType? get() = details?.item?.mediaType
     val isTv: Boolean get() = mediaType == MediaType.TV
@@ -253,6 +257,11 @@ class DetailsViewModel @Inject constructor(
                 val settings = settingsRepository.current()
                 val best = StreamPicker.pick(list, settings.wifiQuality.maxTier, settings.streamSize, deviceProfile.isLowPower)
                     ?: return@launch
+                // The picker sinks CAMs below real encodes, so a CAM only wins when nothing better exists
+                // — flag it for the details UI ("CAM" badge: the only version out is a cinema rip).
+                if (best.isCam != _uiState.value.onlyCamAvailable) {
+                    _uiState.value = _uiState.value.copy(onlyCamAvailable = best.isCam)
+                }
                 torrentStreamer.prefetch(best)
             }
         }

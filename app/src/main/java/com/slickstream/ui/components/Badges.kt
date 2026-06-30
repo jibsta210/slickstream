@@ -82,3 +82,18 @@ fun QualityChip(
             .padding(horizontal = 8.dp, vertical = 3.dp),
     )
 }
+
+/** A red "CAM" warning pill — a cinema-rip (CAM/TS/TELESYNC), i.e. terrible quality. Shown next to the
+ *  quality chip on a source, and on the details screen when the best available release is a cam. */
+@Composable
+fun CamBadge(modifier: Modifier = Modifier) {
+    Text(
+        text = "CAM",
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.Bold,
+        color = Color.White,
+        modifier = modifier
+            .background(color = Brand.Error, shape = RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+    )
+}

@@ -169,7 +169,7 @@ private fun DetailsContent(
                     )
                 }
                 Spacer(Modifier.height(10.dp))
-                MetaRow(details = details)
+                MetaRow(details = details, onlyCamAvailable = state.onlyCamAvailable)
             }
         }
 
@@ -368,12 +368,13 @@ private fun BackdropHeader(details: MediaDetails) {
 
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-private fun MetaRow(details: MediaDetails) {
+private fun MetaRow(details: MediaDetails, onlyCamAvailable: Boolean = false) {
     val item = details.item
     androidx.compose.foundation.layout.FlowRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        if (onlyCamAvailable) com.slickstream.ui.components.CamBadge()
         RatingBadge(vote = item.voteAverage)
         item.year?.let { MetaText(it) }
         runtimeLabel(details)?.let { MetaText(it) }

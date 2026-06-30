@@ -1453,6 +1453,10 @@ private fun SourceRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         QualityChip(quality = source.quality, highlighted = selected)
+        if (source.isCam) {
+            Spacer(Modifier.width(6.dp))
+            com.slickstream.ui.components.CamBadge()
+        }
         Spacer(Modifier.width(14.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(

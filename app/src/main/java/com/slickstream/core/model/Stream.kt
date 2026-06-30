@@ -21,6 +21,9 @@ data class StreamSource(
     val englishLikely: Boolean = true,
     /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */
     val playable: Boolean = true,
+    /** True when the release name marks it a CAM / TS / TELESYNC (a filmed-in-cinema rip — terrible
+     *  quality, common for new releases). Surfaced to the user and sorted/picked below real encodes. */
+    val isCam: Boolean = false,
 ) {
     /** Rough sort key — higher is better. */
     val rank: Int
@@ -32,7 +35,10 @@ data class StreamSource(
                 "480P" -> 1000
                 else -> 0
             }
-            return q + (seeders ?: 0)
+            // A CAM is worse than any real encode regardless of its claimed quality/seeders — sink it
+            // below everything else so the ranked list (and the auto-pick) only reach it as a last resort.
+            val camPenalty = if (isCam) 1_000_000 else 0
+            return q + (seeders ?: 0) - camPenalty
         }
 }
 

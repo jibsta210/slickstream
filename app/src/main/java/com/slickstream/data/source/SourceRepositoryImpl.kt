@@ -128,6 +128,8 @@ class SourceRepositoryImpl @Inject constructor(
             // Detect the codec/container so an undecodable XviD/AVI release is never auto-picked over
             // a playable x264 (the "valid torrent, black screen" bug).
             playable = StreamPicker.looksPlayable(haystack),
+            // Flag cinema-rips (CAM/TS/TELESYNC) so they're badged in the UI + sunk in the picker.
+            isCam = StreamPicker.looksLikeCam(haystack, movieTitle),
         )
     }
 

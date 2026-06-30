@@ -47,12 +47,16 @@ object StreamPicker {
         // files, but the piece geometry makes packs sluggish, so skip them while a single-file release
         // is available. Soft: fall back to packs if that's all there is.
         val singleFile = english.filter { !it.isPack }.ifEmpty { english }
+        // Drop CAM/TS releases BEFORE the health floor — a heavily-seeded CAM of a new release must not
+        // raise the floor and knock out the real (lower-seeded) BluRay/WEB encode (same reason foreign /
+        // unplayable are dropped pre-floor). Soft: fall back to CAMs only if there is literally nothing else.
+        val notCam = singleFile.filterNot { it.isCam }.ifEmpty { singleFile }
         // Health floor RELATIVE to the best swarm available: never pick a near-dead torrent when a
         // well-seeded one exists, even if the dead one is a little smaller (the old bug). The size
         // preference below then only ever chooses among genuinely healthy options.
-        val bestSeeders = singleFile.maxOfOrNull { it.seeders ?: 0 } ?: 0
+        val bestSeeders = notCam.maxOfOrNull { it.seeders ?: 0 } ?: 0
         val floor = maxOf(MIN_SEEDERS, (bestSeeders * RELATIVE_HEALTH_FRACTION).toInt())
-        val healthy = singleFile.filter { (it.seeders ?: 0) >= floor }.ifEmpty { singleFile }
+        val healthy = notCam.filter { (it.seeders ?: 0) >= floor }.ifEmpty { notCam }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
                 healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
@@ -167,6 +171,20 @@ object StreamPicker {
 
     /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */
     fun looksPlayable(text: String): Boolean = !BAD_CODEC.containsMatchIn(text)
+
+    // CAM-class source markers: a cinema-filmed rip (CAM/CAMRIP/HDCAM), a telesync (TS/HDTS/TELESYNC) or
+    // a telecine (TC/TELECINE) — terrible quality, common for brand-new releases. NO screener (SCR) — it's
+    // frequently a clean high-bitrate source, so badging it CAM would mislead. The short tags TS/TC are
+    // word-bounded and applied only AFTER the movie's own title words are stripped (so the 2018 film "Cam"
+    // or a title containing "ts" isn't flagged). Still slightly fuzzy on a literal ".ts" container hint,
+    // but a real telesync is the far more likely meaning in a release name.
+    private val CAM_MARKERS = Regex(
+        "(?i)\\b(cam|camrip|hdcam|hd-?cam|ts|hdts|hd-?ts|telesync|tc|telecine)\\b",
+    )
+
+    /** True when the release name marks it a CAM/TS/TELESYNC (title-word-aware, like [noForeignTag]). */
+    fun looksLikeCam(sourceText: String, movieTitle: String): Boolean =
+        CAM_MARKERS.containsMatchIn(stripTitleWords(sourceText, movieTitle))
 
     // Season / multi-episode PACK markers, usually carried in the pack's FOLDER name (which Torrentio
     // includes alongside the chosen file name): "Season 1", "Complete", a season range "S01-S03", an

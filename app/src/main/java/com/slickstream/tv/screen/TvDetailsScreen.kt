@@ -263,6 +263,10 @@ private fun HeroBlock(
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
+            if (state.onlyCamAvailable) {
+                com.slickstream.ui.components.CamBadge()
+                Spacer(Modifier.width(12.dp))
+            }
             if (item.voteAverage > 0.0) {
                 RatingBadge(vote = item.voteAverage)
                 Spacer(Modifier.width(12.dp))

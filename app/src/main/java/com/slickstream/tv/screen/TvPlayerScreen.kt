@@ -102,6 +102,7 @@ import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.feature.player.PlayerUiState
 import com.slickstream.feature.player.PlayerViewModel
 import com.slickstream.feature.player.applyAppearance
+import com.slickstream.ui.components.CamBadge
 import com.slickstream.ui.components.QualityChip
 import com.slickstream.ui.theme.Brand
 
@@ -994,6 +995,10 @@ private fun TransportOverlay(
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     QualityChip(text = it.quality)
+                    if (it.isCam) {
+                        Spacer(Modifier.width(6.dp))
+                        CamBadge()
+                    }
                     Spacer(Modifier.width(10.dp))
                     Text(
                         text = it.provider,
@@ -1537,6 +1542,10 @@ private fun SourceRow(
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 QualityChip(text = source.quality)
+                if (source.isCam) {
+                    Spacer(Modifier.width(6.dp))
+                    CamBadge()
+                }
                 Spacer(Modifier.width(10.dp))
                 Text(
                     text = source.provider,
