@@ -118,8 +118,9 @@ class AuthRepositoryImpl @Inject constructor(
             } else if (firebaseSync.isAvailable) {
                 // TV pairing exists ONLY to enable sync. If the Firebase exchange failed, surface a real
                 // failure instead of a false "Success" that silently never syncs ("TV paired but nothing
-                // syncs"). The user can re-pair to get a fresh id-token.
-                return DataResult.Error("Couldn't link this TV for sync. Please try pairing again.")
+                // syncs"). Include the EXACT Firebase error so the cause is visible on the TV too.
+                val why = firebaseSync.lastSignInError()?.let { " ($it)" } ?: ""
+                return DataResult.Error("Couldn't link this TV for sync$why. Please try pairing again.")
             }
             DataResult.Success(profile)
         } catch (e: Exception) {

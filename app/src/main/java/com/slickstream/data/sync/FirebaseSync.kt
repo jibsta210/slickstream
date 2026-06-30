@@ -46,6 +46,14 @@ class FirebaseSync @Inject constructor(
 
     fun uid(): String? = auth?.currentUser?.uid
 
+    /** The REAL reason the last Google→Firebase exchange failed (FirebaseAuthException code + message).
+     *  Surfaced by [diagnose] and the TV pairing error so "uid null" stops being a black box — it tells
+     *  us whether it's a wrong project, a blocked API key, an unregistered SHA-1, etc. Null until a
+     *  sign-in attempt fails this session. */
+    @Volatile
+    private var lastSignInError: String? = null
+    fun lastSignInError(): String? = lastSignInError
+
     /**
      * Live, user-visible sync self-test — turns the silent runCatching black box into a diagnosable
      * answer. Reports whether Firebase is configured, whether the Google→Firebase exchange actually
@@ -58,10 +66,12 @@ class FirebaseSync @Inject constructor(
                 "Favourites stay on this device only."
         }
         val uid = uid()
-            ?: return "Signed in to Google, but NOT connected to Firebase — the account didn't link " +
-                "for sync. This almost always means Google sign-in isn't enabled for the Firebase " +
-                "project, or this app's signing SHA-1 isn't registered in it. Until that's fixed in the " +
-                "Firebase console, nothing can sync. (On TV, re-pair to retry.)"
+            ?: return "Signed in to Google, but NOT connected to Firebase — the account didn't link for sync." +
+                (lastSignInError?.let { "\n\nEXACT ERROR: $it" }
+                    ?: "\n\n(No failed attempt recorded this session — sign OUT then back IN, then run this " +
+                        "again to capture the exact error.)") +
+                "\n\nUsual causes: Google sign-in disabled, SHA-1 not registered, or the Web client ID / " +
+                "google-services.json belong to a different Firebase project. (On TV, re-pair to retry.)"
         val d = db ?: return "Connected as $uid, but Firestore is unavailable."
         return try {
             val ref = d.collection("users").document(uid).collection("_diag").document("ping")
@@ -84,8 +94,17 @@ class FirebaseSync @Inject constructor(
     suspend fun signInWithGoogle(idToken: String): String? {
         val a = auth ?: return null
         return try {
-            a.signInWithCredential(GoogleAuthProvider.getCredential(idToken, null)).await().user?.uid
+            val uid = a.signInWithCredential(GoogleAuthProvider.getCredential(idToken, null)).await().user?.uid
+            if (uid != null) lastSignInError = null
+            uid
         } catch (t: Throwable) {
+            // Capture the ACTUAL reason (e.g. "FirebaseAuthInvalidCredentialsException [ERROR_INVALID_CREDENTIAL]:
+            // audience…", "API key not valid", "CONFIGURATION_NOT_FOUND") so diagnose() can show it.
+            lastSignInError = buildString {
+                append(t.javaClass.simpleName)
+                (t as? com.google.firebase.auth.FirebaseAuthException)?.errorCode?.let { append(" [").append(it).append("]") }
+                t.message?.let { append(": ").append(it.take(180)) }
+            }
             Log.w(TAG, "Firebase sign-in failed", t)
             null
         }
