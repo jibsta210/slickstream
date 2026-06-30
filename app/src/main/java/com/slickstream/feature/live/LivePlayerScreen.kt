@@ -86,6 +86,12 @@ fun LivePlayerScreen(
     var panelOpen by remember { mutableStateOf(false) }
     val playing = state is LivePlayerViewModel.UiState.Playing
 
+    // Keep the TV awake while a live stream is playing/loading (this is a SEPARATE player from the
+    // torrent one, so it needs its own wake lock — the screensaver was kicking in during sports).
+    com.slickstream.feature.player.KeepScreenOn(
+        enabled = playing || state is LivePlayerViewModel.UiState.Buffering,
+    )
+
     val rootFocus = remember { FocusRequester() }
     val backFocus = remember { FocusRequester() }
 
