@@ -65,7 +65,9 @@ class SourceRepositoryImpl @Inject constructor(
                 .mapNotNull { it.toStreamSource(movieTitle) }
                 .groupBy { it.infoHash }
                 .map { (_, rows) -> rows.maxByOrNull { it.seeders ?: 0 }!! }
-                .sortedByDescending { it.rank }
+                // Direct (file-server) streams first — they play instantly with no swarm — then torrents
+                // by health, so the manual source list matches the auto-pick's file-server-first order.
+                .sortedWith(compareByDescending<StreamSource> { it.isDirect }.thenByDescending { it.rank })
             // English-only by default — foreign releases shouldn't even be an OPTION (the user keeps
             // hitting random Spanish/Chinese). Prefer English; if a title genuinely has no English
             // release, still NEVER surface an unreadable non-Latin name — fall back to Latin-script
@@ -97,9 +99,15 @@ class SourceRepositoryImpl @Inject constructor(
         .map { if (it.endsWith("/")) it else "$it/" }
         .ifEmpty { listOf("https://torrentio.strem.fun/") }
 
-    /** Map one indexer row to a [StreamSource], or null if it has no usable info-hash. */
+    /** Map one indexer row to a [StreamSource], or null if it's neither a torrent nor a direct URL. */
     private fun StreamDto.toStreamSource(movieTitle: String): StreamSource? {
-        val hash = infoHash?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() } ?: return null
+        // A DIRECT http/hls stream (free streaming addon) — no torrent. Synthesize a stable info-hash
+        // from the URL so all the existing infoHash-keyed bookkeeping (resume, history, failover) works
+        // unchanged. Torrent rows keep their real info-hash; rows with neither are ignored (ytId/external).
+        val directUrl = url?.trim()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        val hash = infoHash?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
+            ?: directUrl?.let { syntheticHash(it) }
+            ?: return null
 
         // Pool every text field that may carry quality / seeders / size / codec metadata (the codec
         // and container often live in the filename, e.g. "…XviD-MAXX.avi", so include it).
@@ -109,11 +117,11 @@ class SourceRepositoryImpl @Inject constructor(
         val displayName = behaviorHints?.filename
             ?: title?.lineSequence()?.firstOrNull()?.takeIf { it.isNotBlank() }
             ?: name?.replace('\n', ' ')?.trim()
-            ?: "Torrent"
+            ?: if (directUrl != null) "Direct stream" else "Torrent"
 
         return StreamSource(
             title = displayName.trim(),
-            magnetUri = buildMagnet(hash, displayName),
+            magnetUri = if (directUrl != null) "" else buildMagnet(hash, displayName),
             infoHash = hash,
             quality = parseQuality(haystack),
             sizeBytes = behaviorHints?.videoSize ?: parseSize(haystack),
@@ -130,8 +138,17 @@ class SourceRepositoryImpl @Inject constructor(
             playable = StreamPicker.looksPlayable(haystack),
             // Flag cinema-rips (CAM/TS/TELESYNC) so they're badged in the UI + sunk in the picker.
             isCam = StreamPicker.looksLikeCam(haystack, movieTitle),
+            // Direct http/hls source -> the player skips the torrent engine and streams this URL.
+            directUrl = directUrl,
         )
     }
+
+    /** A stable synthetic info-hash for a direct (non-torrent) URL = SHA-1(url) hex. Lets a direct
+     *  stream key into all the existing infoHash bookkeeping (resume/history/failover) like a torrent. */
+    private fun syntheticHash(url: String): String =
+        java.security.MessageDigest.getInstance("SHA-1")
+            .digest(url.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
 
     private fun buildMagnet(infoHash: String, displayName: String): String {
         val sb = StringBuilder("magnet:?xt=urn:btih:").append(infoHash)

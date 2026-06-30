@@ -483,8 +483,17 @@ class PlayerViewModel @Inject constructor(
      * profile (and the dominant cause of "playback failed" on TV). Quality only tiebreaks.
      */
     private suspend fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
-        val sizePref = settingsRepository.current().streamSize
         currentNetworkMaxTier = pref.maxTier   // cache for the synchronous smaller-source scan
+        // File-server-first: a DIRECT http/hls source plays INSTANTLY with no swarm, so always prefer the
+        // best direct stream (within the quality cap) over any torrent. Only fall through to the torrent
+        // health-pick when there's no direct source.
+        val directs = list.filter { it.isDirect }
+        if (directs.isNotEmpty()) {
+            val cap = if (deviceProfile.isLowPower) minOf(pref.maxTier, QualityPreference.FHD_1080.maxTier) else pref.maxTier
+            return directs.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { directs }
+                .maxByOrNull { it.rank } ?: directs.first()
+        }
+        val sizePref = settingsRepository.current().streamSize
         return StreamPicker.pick(list, pref.maxTier, sizePref, deviceProfile.isLowPower) ?: list.first()
     }
 
@@ -542,10 +551,20 @@ class PlayerViewModel @Inject constructor(
             percent = 0,
             seeders = source.seeders ?: 0,
             downloadRateBytes = 0,
-            label = "Connecting to peers…",
+            label = if (source.isDirect) "Loading…" else "Connecting to peers…",
         )
 
         streamJob?.cancel()
+
+        // DIRECT http/hls source: no torrent engine, no swarm, no readiness gate — hand the URL straight
+        // to the player ("file-server-first"). onPlayerError still fails over to the next source (incl. a
+        // torrent) if the direct link is dead; STATE_READY -> maybeSeekToResume restores position.
+        if (source.isDirect) {
+            ensurePlayer(source.directUrl!!)
+            startProgressTicker()
+            return
+        }
+
         streamJob = viewModelScope.launch {
             torrentStreamer.start(source).collect { status ->
                 handleStatus(status, source)
@@ -1395,6 +1414,7 @@ class PlayerViewModel @Inject constructor(
         // next-episode hop can reuse this torrent mid-warm. With the in-session keep (engine stop change),
         // even a half-warmed torrent is paused-in-session, so startSource() re-attaches + resumes it.
         prefetchedInfoHash = best.infoHash
+        if (best.isDirect) return   // direct http/hls plays instantly — nothing to pre-warm
         if (best.infoHash in torrentStreamer.cachedTorrents()) return
         torrentStreamer.prefetch(best, setOfNotNull(playing))
     }

@@ -24,7 +24,12 @@ data class StreamSource(
     /** True when the release name marks it a CAM / TS / TELESYNC (a filmed-in-cinema rip — terrible
      *  quality, common for new releases). Surfaced to the user and sorted/picked below real encodes. */
     val isCam: Boolean = false,
+    /** A DIRECT http/hls URL for a non-torrent source (free streaming addon). When set, the player
+     *  bypasses the torrent engine and streams this URL — instant, no P2P ("file-server-first"). */
+    val directUrl: String? = null,
 ) {
+    /** True for a direct HTTP/HLS source (no torrent). */
+    val isDirect: Boolean get() = directUrl != null
     /** Rough sort key — higher is better. */
     val rank: Int
         get() {

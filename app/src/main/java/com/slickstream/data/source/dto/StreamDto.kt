@@ -26,6 +26,9 @@ data class StreamDto(
     val infoHash: String? = null,
     /** Index of the desired file inside a multi-file torrent. */
     val fileIdx: Int? = null,
+    /** A DIRECT http/hls stream URL (Stremio standard) — present INSTEAD of [infoHash] for non-torrent
+     *  addons (free direct-streaming). When set, the app plays it straight, no P2P. */
+    val url: String? = null,
     @SerialName("behaviorHints")
     val behaviorHints: BehaviorHintsDto? = null,
 )
