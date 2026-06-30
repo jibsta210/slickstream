@@ -103,6 +103,7 @@ import com.slickstream.feature.player.PlayerUiState
 import com.slickstream.feature.player.PlayerViewModel
 import com.slickstream.feature.player.applyAppearance
 import com.slickstream.ui.components.CamBadge
+import com.slickstream.ui.components.DirectBadge
 import com.slickstream.ui.components.QualityChip
 import com.slickstream.ui.theme.Brand
 
@@ -1542,6 +1543,10 @@ private fun SourceRow(
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 QualityChip(text = source.quality)
+                if (source.isDirect) {
+                    Spacer(Modifier.width(6.dp))
+                    DirectBadge()
+                }
                 if (source.isCam) {
                     Spacer(Modifier.width(6.dp))
                     CamBadge()
@@ -1561,15 +1566,25 @@ private fun SourceRow(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
-            val meta = buildString {
-                source.seeders?.let { append("$it seeders") }
-                source.sizeBytes?.let {
-                    if (isNotEmpty()) append("  ·  ")
-                    append(formatBytes(it))
+            if (source.isDirect) {
+                // A direct (Real-Debrid / file-server) source has no swarm — show it plays instantly
+                // instead of a torrent seeder count, which made an RD stream look like a torrent.
+                val meta = buildString {
+                    append("⚡ Instant — no torrent")
+                    source.sizeBytes?.takeIf { it > 0 }?.let { append("  ·  "); append(formatBytes(it)) }
                 }
-            }
-            if (meta.isNotBlank()) {
-                Text(meta, style = MaterialTheme.typography.labelMedium, color = Brand.Cyan)
+                Text(meta, style = MaterialTheme.typography.labelMedium, color = Color(0xFF22C55E), fontWeight = FontWeight.SemiBold)
+            } else {
+                val meta = buildString {
+                    source.seeders?.let { append("$it seeders") }
+                    source.sizeBytes?.let {
+                        if (isNotEmpty()) append("  ·  ")
+                        append(formatBytes(it))
+                    }
+                }
+                if (meta.isNotBlank()) {
+                    Text(meta, style = MaterialTheme.typography.labelMedium, color = Brand.Cyan)
+                }
             }
         }
     }
