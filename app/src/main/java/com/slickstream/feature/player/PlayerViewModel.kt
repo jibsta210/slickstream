@@ -249,8 +249,11 @@ class PlayerViewModel @Inject constructor(
     // --- Automatic source failover ---
     /** infoHashes already attempted for THIS title/episode — failover never re-picks one. */
     private val triedInfoHashes = mutableSetOf<String>()
-    /** Automatic failovers since the last fresh load()/episode switch; capped to avoid churn. */
+    /** Automatic TORRENT failovers since the last fresh load()/episode switch; capped (expensive). */
     private var failoverCount = 0
+    /** Automatic DIRECT (RD/file-server) failovers — separate, generous budget: RD lists many dead/
+     *  removed/fake [RD+] links that only fail at play time, and skipping them is instant + free. */
+    private var directFailoverCount = 0
     /** Set synchronously while a failover is in progress so two triggers can't fire it twice. */
     private var failoverInFlight = false
     /** Watchdog that fails over when a source never reaches playable (dead / fake-seeded swarm). */
@@ -410,6 +413,7 @@ class PlayerViewModel @Inject constructor(
             // Fresh title -> fresh failover budget over the new candidate list.
             triedInfoHashes.clear()
             failoverCount = 0
+            directFailoverCount = 0
 
             // Resume the SAME torrent if we have one cached for this episode; else auto-pick the best
             // source within the user's per-network quality cap.
@@ -651,12 +655,22 @@ class PlayerViewModel @Inject constructor(
      */
     private suspend fun failoverToNext(): Boolean {
         if (failoverInFlight) return true
-        if (failoverCount >= MAX_FAILOVERS) return false
         val remaining = _sources.value.filter { it.infoHash !in triedInfoHashes }
         if (remaining.isEmpty()) return false
+        // The source we're failing AWAY from: a direct (RD/file-server) link fails INSTANTLY and for
+        // free (no swarm), and RD lists many dead/removed/fake [RD+] entries that only fail at play
+        // time — so walking past them must NOT be bounded by the small TORRENT failover cap or the user
+        // dead-ends mid-list. Count direct failovers separately with a generous budget; expensive
+        // torrent failovers stay tightly capped.
+        val leavingDirect = _currentSource.value?.isDirect == true
+        if (leavingDirect) {
+            if (directFailoverCount >= MAX_DIRECT_FAILOVERS) return false
+        } else if (failoverCount >= MAX_FAILOVERS) {
+            return false
+        }
         // Claim synchronously (before any suspension) so the watchdog + onPlayerError can't both fire.
         failoverInFlight = true
-        failoverCount++
+        if (leavingDirect) directFailoverCount++ else failoverCount++
         val pref = currentNetworkMaxTier ?: networkQualityPreference().maxTier
         val sizePref = settingsRepository.current().streamSize
         val next = StreamPicker.pick(remaining, pref, sizePref, deviceProfile.isLowPower)
@@ -1703,6 +1717,7 @@ class PlayerViewModel @Inject constructor(
             // Fresh episode -> fresh failover budget over the new candidate list.
             triedInfoHashes.clear()
             failoverCount = 0
+            directFailoverCount = 0
             // Prefer the torrent we PRE-WARMED for this episode (instant start), then one we already
             // partly downloaded, then a fresh auto-pick.
             val best = warmedHash?.let { w -> list.firstOrNull { it.infoHash == w } }
@@ -1780,6 +1795,9 @@ class PlayerViewModel @Inject constructor(
 
         /** Cap automatic source failovers per title so a wholly-dead title can't loop forever. */
         const val MAX_FAILOVERS = 5
+        /** Direct (RD/file-server) links fail instantly + for free, and RD lists many dead/fake [RD+]
+         *  entries — so allow walking past a lot of them before giving up (vs the small torrent cap). */
+        const val MAX_DIRECT_FAILOVERS = 25
         /** Pre-player buffering wall-clock before the watchdog will consider a source a failure. */
         const val FAILOVER_BUFFER_BUDGET_MS = 45_000L
         /** Watchdog poll cadence while waiting for a source to become playable. */
