@@ -956,6 +956,11 @@ class PlayerViewModel @Inject constructor(
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
             .build().apply {
+                // Dual/multi-audio releases: prefer ENGLISH and let ExoPlayer auto-detect it (the user
+                // kept landing on Italian). Set before prepare so the first track selection honours it.
+                trackSelectionParameters = trackSelectionParameters.buildUpon()
+                    .setPreferredAudioLanguage("en")
+                    .build()
                 setMediaItem(buildMediaItem(url))
                 prepare()
                 playWhenReady = true
@@ -1031,6 +1036,24 @@ class PlayerViewModel @Inject constructor(
                 if (w > 0 && h > 0) {
                     val par = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
                     _videoAspect.value = (w * par) / h
+                }
+            }
+
+            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                // No-sound bug (~20% of torrents): AC3 / E-AC3 / DTS / DTS-HD / TrueHD audio that
+                // ExoPlayer can't decode on this device (esp. phones, which lack those licensed decoders)
+                // -> the video plays but it's SILENT. If the release HAS audio track(s) but the device
+                // supports NONE of them, hand the whole stream to libVLC (bundles FFmpeg, decodes them
+                // all) at the live position — the audio twin of the "valid torrent, black screen" fix.
+                // Guarded so it never fires on the VLC/cast path; once we switch, ExoPlayer is released so
+                // it can't loop. A release with a SUPPORTED track (e.g. an AAC alongside the AC3) keeps
+                // playing on ExoPlayer (isTypeSupported stays true) and is untouched.
+                if (usingVlcForSource || _isCasting.value) return
+                val hasAudio = tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }
+                if (hasAudio && !tracks.isTypeSupported(C.TRACK_TYPE_AUDIO)) {
+                    val url = currentMediaUrl ?: return
+                    val pos = _currentPlayer.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    switchToVlc(url, pos)
                 }
             }
 
