@@ -27,6 +27,10 @@ data class StreamSource(
     /** A DIRECT http/hls URL for a non-torrent source (free streaming addon). When set, the player
      *  bypasses the torrent engine and streams this URL — instant, no P2P ("file-server-first"). */
     val directUrl: String? = null,
+    /** HTTP request headers (Referer/Origin/User-Agent) the direct host requires — without them many
+     *  CDNs return 403 and the stream starts but never plays. Carried to the ExoPlayer/libVLC data
+     *  source for direct sources; empty for torrents. */
+    val requestHeaders: Map<String, String> = emptyMap(),
 ) {
     /** True for a direct HTTP/HLS source (no torrent). */
     val isDirect: Boolean get() = directUrl != null

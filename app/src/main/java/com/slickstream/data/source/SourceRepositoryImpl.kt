@@ -149,6 +149,17 @@ class SourceRepositoryImpl @Inject constructor(
             isCam = StreamPicker.looksLikeCam(haystack, movieTitle),
             // Direct http/hls source -> the player skips the torrent engine and streams this URL.
             directUrl = directUrl,
+            // Headers the host requires (Referer/Origin/User-Agent) — only for direct URLs, so torrents
+            // never carry stray headers. Without these many free-streaming hosts 403 and the stream
+            // "starts but never plays". Drop blank keys/values defensively.
+            requestHeaders = if (directUrl != null) {
+                behaviorHints?.proxyHeaders?.request
+                    ?.filterKeys { it.isNotBlank() }
+                    ?.filterValues { it.isNotBlank() }
+                    ?: emptyMap()
+            } else {
+                emptyMap()
+            },
         )
     }
 

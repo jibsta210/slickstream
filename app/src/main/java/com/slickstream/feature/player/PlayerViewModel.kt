@@ -16,6 +16,8 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.cast.CastPlayer
 import androidx.media3.cast.SessionAvailabilityListener
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -562,6 +564,7 @@ class PlayerViewModel @Inject constructor(
         if (source.isDirect) {
             ensurePlayer(source.directUrl!!)
             startProgressTicker()
+            armDirectWatchdog()
             return
         }
 
@@ -607,6 +610,26 @@ class PlayerViewModel @Inject constructor(
                         _uiState.value = PlayerUiState.Error("Couldn't start any source for this title.")
                     }
                     return@launch
+                }
+            }
+        }
+    }
+
+    /**
+     * Direct (file-server) links have no swarm and no readiness gate, so the torrent buffering watchdog
+     * never arms for them — a dead/403/redirect or a half-alive CDN that connects but never produces a
+     * frame would otherwise hang in BUFFERING forever (the "found sources, started ExoPlayer, none
+     * played, had to revert to torrent" bug). A direct link must respond fast: if it isn't Playing within
+     * a short budget, fail over to the next source (which may be a torrent). A healthy link flips to
+     * Playing first, so this self-cancels via the state check.
+     */
+    private fun armDirectWatchdog() {
+        bufferWatchdogJob?.cancel()
+        bufferWatchdogJob = viewModelScope.launch {
+            delay(DIRECT_STARTUP_TIMEOUT_MS)
+            if (_uiState.value !is PlayerUiState.Playing && !_isCasting.value) {
+                if (!failoverToNext()) {
+                    _uiState.value = PlayerUiState.Error("Couldn't start any source for this title.")
                 }
             }
         }
@@ -824,6 +847,29 @@ class PlayerViewModel @Inject constructor(
         return if (candidateSize < currentSize) candidate else null
     }
 
+    /**
+     * The ExoPlayer media-source factory. For a DIRECT source it carries the host's required request
+     * headers (Referer/Origin/User-Agent from the addon's behaviorHints.proxyHeaders) plus a real
+     * browser User-Agent — without these the default data source sends no UA and header-gated CDNs 403,
+     * which is the root cause of "found a direct stream, ExoPlayer started, nothing played". Torrent
+     * sources pass an empty header map (no-op) but still get a real UA on the local HTTP-server requests.
+     * Wrapped in [DefaultDataSource.Factory] so non-http schemes still resolve, mirroring what the bare
+     * DefaultMediaSourceFactory(context) does internally.
+     */
+    @OptIn(UnstableApi::class)
+    private fun buildMediaSourceFactory(): DefaultMediaSourceFactory {
+        val src = _currentSource.value
+        val headers = src?.takeIf { it.isDirect }?.requestHeaders ?: emptyMap()
+        val userAgent = headers["User-Agent"] ?: headers["user-agent"] ?: DEFAULT_USER_AGENT
+        val http = DefaultHttpDataSource.Factory()
+            .setDefaultRequestProperties(headers)
+            .setUserAgent(userAgent)
+            .setAllowCrossProtocolRedirects(true)
+        val dataSourceFactory = DefaultDataSource.Factory(appContext, http)
+        return DefaultMediaSourceFactory(dataSourceFactory)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(SOURCE_LOAD_RETRIES))
+    }
+
     @OptIn(UnstableApi::class)
     private fun ensurePlayer(url: String) {
         // A source ExoPlayer can't decode (XviD/AVI/WMV…) goes straight to the libVLC fallback so it
@@ -833,15 +879,13 @@ class PlayerViewModel @Inject constructor(
             return
         }
         val existing = _player.value
-        if (existing != null) {
-            // Only reload on a genuine URL change (source switch / episode hop); steady-state
-            // READY re-emissions carry the same URL and must be no-ops.
-            if (currentMediaUrl == url) return
-            // Full reset, NOT just setMediaItem: stop()+clearMediaItems() wipe any leftover ENDED/error
-            // state from the previous episode that otherwise wedged the new one in a permanent buffer
-            // ("play next never starts but re-entry plays instantly"). Crucially we REUSE the same
-            // ExoPlayer + PlayerView surface, so the video doesn't black out on the hand-off (releasing
-            // and rebuilding tore the surface down -> audio-only black screen on the next episode).
+        // Steady-state READY re-emissions carry the same URL and must be no-ops.
+        if (existing != null && currentMediaUrl == url) return
+        if (existing != null && _currentSource.value?.isDirect != true) {
+            // TORRENT source switch / episode hop: REUSE the same ExoPlayer + PlayerView surface so the
+            // video doesn't black out on the hand-off (releasing+rebuilding tore the surface down ->
+            // audio-only black screen on the next episode). Full reset (stop()+clearMediaItems()) wipes
+            // any leftover ENDED/error state that otherwise wedged the new media in a permanent buffer.
             existing.stop()
             existing.clearMediaItems()
             existing.setMediaItem(buildMediaItem(url))
@@ -854,6 +898,17 @@ class PlayerViewModel @Inject constructor(
             startProgressTicker()      // restart the ticker we cancelled for the hop
             if (_isCasting.value) loadCastMedia(fromPositionMs = 0L)
             return
+        }
+        // DIRECT source reached with a live player (a switch INTO a direct URL): its required headers +
+        // MIME are baked into the MediaSource.Factory at BUILD time — ExoPlayer has no
+        // setMediaSourceFactory() — so reusing the old player would replay the previous (header-less)
+        // factory and 403. Tear it down and fall through to a fresh build that bakes in THIS source's
+        // headers. Rare (direct→direct mid-play switch); a brief rebuild flicker is acceptable.
+        if (existing != null) {
+            playerListener?.let { existing.removeListener(it) }
+            existing.release()
+            _player.value = null
+            playerListener = null
         }
 
         // Start playing with a small buffer so we don't sit idle while the torrent fills ahead, but
@@ -885,8 +940,11 @@ class PlayerViewModel @Inject constructor(
         // disk YET (slow swarm) — ExoPlayer would otherwise treat that as a FATAL source error and
         // kill the stream. A high source-retry count makes it rebuffer + re-request the byte range
         // (the bytes are downloading) instead. This is the real fix for "the stream died".
-        val mediaSourceFactory = DefaultMediaSourceFactory(appContext)
-            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(SOURCE_LOAD_RETRIES))
+        // For a DIRECT source, the factory also carries the host's required headers + a real browser
+        // User-Agent (default DefaultHttpDataSource sends NO UA -> many CDNs 403, the "starts but never
+        // plays" bug). Torrents pass an empty header map (no-op) but still get a real UA on the local
+        // server, which is harmless.
+        val mediaSourceFactory = buildMediaSourceFactory()
         val exo = ExoPlayer.Builder(appContext, renderers)
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
@@ -971,6 +1029,20 @@ class PlayerViewModel @Inject constructor(
 
             override fun onPlayerError(error: PlaybackException) {
                 val p = _player.value
+                // A DIRECT link either works or it doesn't — a 403/404/redirect/dead host won't recover
+                // by re-preparing the same URL (that retry budget is for torrents whose bytes arrive
+                // late) and isn't a codec problem VLC can fix. Drop STRAIGHT to the next source (which
+                // may be a torrent) so a dead direct URL never strands the user on a spinner — the
+                // "found sources, none played, had to manually revert to torrent" bug.
+                if (_currentSource.value?.isDirect == true && !_isCasting.value) {
+                    viewModelScope.launch {
+                        if (!failoverToNext()) {
+                            val msg = error.localizedMessage ?: "Playback error"
+                            _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                        }
+                    }
+                    return
+                }
                 // Transient on a torrent, NOT a dead stream:
                 //  - IO (2000-2999): pieces aren't downloaded YET.
                 //  - PARSING (3000-3999): ExoPlayer started via tail-grace before the mp4 moov/mkv
@@ -1055,6 +1127,9 @@ class PlayerViewModel @Inject constructor(
             vlcPlayer = built
             built.addListener(buildVlcListener(built))
         }
+        // A direct source falling back to libVLC (rare — a direct stream in a codec ExoPlayer can't
+        // decode) must carry its host headers too, or libVLC 403s the same way. No-op for torrents.
+        vlc.setRequestHeaders(_currentSource.value?.takeIf { it.isDirect }?.requestHeaders ?: emptyMap())
         vlc.setMediaItem(buildMediaItem(url), startPositionMs)
         vlc.prepare()
         vlc.playWhenReady = !_isCasting.value
@@ -1199,11 +1274,27 @@ class PlayerViewModel @Inject constructor(
         _currentSubtitle.value = _subtitles.value.firstOrNull { it.languageCode.equals(code, true) }
     }
 
-    private fun buildMediaItem(url: String): ExoMediaItem =
-        ExoMediaItem.Builder()
+    private fun buildMediaItem(url: String): ExoMediaItem {
+        val builder = ExoMediaItem.Builder()
             .setUri(url)
             .setSubtitleConfigurations(subtitleConfigs)
-            .build()
+        mimeForDirect(url)?.let { builder.setMimeType(it) }
+        return builder.build()
+    }
+
+    /** Explicit MIME for a DIRECT URL so HLS (.m3u8) is detected deterministically instead of relying on
+     *  Content-Type sniffing (a CDN that mislabels or omits it would otherwise fail to pick the HLS
+     *  MediaSource). Torrents return null — they stream from the local server with no extension, so let
+     *  ExoPlayer infer. DASH (.mpd) is intentionally omitted: no media3-exoplayer-dash module is bundled. */
+    private fun mimeForDirect(url: String): String? {
+        if (_currentSource.value?.isDirect != true) return null
+        val path = url.substringBefore('?').lowercase()
+        return when {
+            path.endsWith(".m3u8") -> MimeTypes.APPLICATION_M3U8
+            path.endsWith(".mp4") -> MimeTypes.VIDEO_MP4
+            else -> null
+        }
+    }
 
     private fun buildSubConfig(track: SubtitleTrack): ExoMediaItem.SubtitleConfiguration =
         ExoMediaItem.SubtitleConfiguration.Builder(Uri.parse(track.url))
@@ -1633,6 +1724,14 @@ class PlayerViewModel @Inject constructor(
     }
 
     private companion object {
+        /** Real browser User-Agent for direct (file-server) streams — DefaultHttpDataSource sends NO UA
+         *  by default, which header-checking CDNs reject (403). Matches LivePlayerViewModel.DEFAULT_UA. */
+        const val DEFAULT_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Mobile Safari/537.36"
+        /** A direct link must reach Playing within this budget or it's failed over (no swarm watchdog
+         *  covers direct sources). Short: a live host starts fast; a dead one shouldn't stall the user. */
+        const val DIRECT_STARTUP_TIMEOUT_MS = 12_000L
+
         /** Auto-pick floor: don't choose a torrent under this many seeders if a healthier one exists. */
         const val MIN_SEEDERS = 8
 

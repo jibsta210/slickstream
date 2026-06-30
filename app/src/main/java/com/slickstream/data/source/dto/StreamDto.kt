@@ -40,4 +40,15 @@ data class BehaviorHintsDto(
     val filename: String? = null,
     /** File size in bytes, when the indexer provides it directly. */
     val videoSize: Long? = null,
+    /** HTTP headers the player MUST send when fetching a DIRECT [StreamDto.url] — many streaming hosts
+     *  reject requests without the right Referer/Origin/User-Agent (403/empty), which is exactly why a
+     *  found direct stream starts the player but never plays. Threaded to ExoPlayer/libVLC for direct
+     *  sources; ignored for torrents. */
+    val proxyHeaders: ProxyHeadersDto? = null,
+)
+
+@Serializable
+data class ProxyHeadersDto(
+    /** Outgoing headers (Referer/Origin/User-Agent…) the player must send. ("response" is unused.) */
+    val request: Map<String, String>? = null,
 )

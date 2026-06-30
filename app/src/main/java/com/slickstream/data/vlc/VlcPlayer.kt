@@ -41,6 +41,15 @@ class VlcPlayer(
 
     private val mediaPlayer = MediaPlayer(engine.libVlc)
 
+    /** HTTP headers a direct source's host requires (Referer/User-Agent). Set before the media item;
+     *  empty for torrents (served by the local HTTP server, which needs no headers). */
+    private var requestHeaders: Map<String, String> = emptyMap()
+
+    /** Supply the host's required request headers before [handleSetMediaItems] builds the [Media]. */
+    fun setRequestHeaders(headers: Map<String, String>) {
+        requestHeaders = headers
+    }
+
     // --- Mutable player state, all read back in getState() ---
     private var playWhenReadyField: Boolean = false
     private var mediaItemField: MediaItem? = null
@@ -240,6 +249,15 @@ class VlcPlayer(
             val uriString = item.localConfiguration!!.uri.toString()
             val media = Media(engine.libVlc, Uri.parse(uriString))
             media.setHWDecoderEnabled(true, false)
+            // Apply the direct host's required headers. libVLC exposes only user-agent + referrer (no
+            // per-arbitrary-header option), which covers the two virtually every CDN validates. Origin
+            // has no libVLC option, so map it onto referrer too. No-op when headers are empty (torrents).
+            (requestHeaders["User-Agent"] ?: requestHeaders["user-agent"])?.let {
+                media.addOption(":http-user-agent=$it")
+            }
+            (requestHeaders["Referer"] ?: requestHeaders["Origin"])?.let {
+                media.addOption(":http-referrer=$it")
+            }
             mediaPlayer.media = media
             media.release()
 
