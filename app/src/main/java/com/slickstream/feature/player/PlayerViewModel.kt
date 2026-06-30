@@ -254,8 +254,19 @@ class PlayerViewModel @Inject constructor(
     /** Automatic DIRECT (RD/file-server) failovers — separate, generous budget: RD lists many dead/
      *  removed/fake [RD+] links that only fail at play time, and skipping them is instant + free. */
     private var directFailoverCount = 0
-    /** Set synchronously while a failover is in progress so two triggers can't fire it twice. */
-    private var failoverInFlight = false
+    /** True from the instant ANY backend transition starts (failover, Exo->VLC switch, manual
+     *  selectSource, short-fake failover) until the new source's startSource() runs. EVERY transition
+     *  trigger claims it via [beginTransition] FIRST, so two can't interleave within one main-loop drain
+     *  and leave the player half-Exo-half-VLC or double-release it. Reset only in startSource(). */
+    private var transitionInFlight = false
+
+    /** Claim the single transition slot. Returns false if a transition is already running (the caller
+     *  MUST bail). All on the main thread, so a plain flag is correct — no lock/atomic needed. */
+    private fun beginTransition(): Boolean {
+        if (transitionInFlight) return false
+        transitionInFlight = true
+        return true
+    }
     /** Watchdog that fails over when a source never reaches playable (dead / fake-seeded swarm). */
     private var bufferWatchdogJob: Job? = null
     /** Post-playback watchdog: if a mid-stream stall persists (a source whose seeders can't sustain the
@@ -425,12 +436,16 @@ class PlayerViewModel @Inject constructor(
     /** Switch to a different quality/source, keeping the previous download cached. */
     fun selectSource(source: StreamSource) {
         if (source.infoHash == _currentSource.value?.infoHash) return
+        // Claim the single transition slot so a manual switch can't race an in-flight auto-failover /
+        // VLC switch and double-tear-down the player (a real crash path). startSource() releases it.
+        if (!beginTransition()) return
         // A source switch clears any pending hint; startSource() re-arms it for the new source.
         _suggestSmaller.value = false
         viewModelScope.launch {
             // Persist where we are before tearing the current stream down.
             saveProgressNow()
             bufferWatchdogJob?.cancel()
+            rebufferWatchdogJob?.cancel()   // a pending downshift must not fire into the new source's teardown
             stopActiveStream(removeFiles = false)
             startSource(source)
         }
@@ -543,7 +558,7 @@ class PlayerViewModel @Inject constructor(
         // Record this attempt so failover never loops back to a source we've already tried, and clear
         // the in-flight guard now that a new attempt is actually underway.
         triedInfoHashes.add(source.infoHash)
-        failoverInFlight = false
+        transitionInFlight = false
         lastEmittedDownloadedBytes = 0L
         // Fresh source -> reset the VLC-fallback latch and stop any prior VLC playback so it can't
         // keep playing audio underneath the new source.
@@ -656,7 +671,7 @@ class PlayerViewModel @Inject constructor(
      * self-heals to a real source instead of spinning or dead-ending on a manual "Other streams".
      */
     private suspend fun failoverToNext(): Boolean {
-        if (failoverInFlight) return true
+        if (transitionInFlight) return true
         val remaining = _sources.value.filter { it.infoHash !in triedInfoHashes }
         if (remaining.isEmpty()) return false
         // The source we're failing AWAY from: a direct (RD/file-server) link fails INSTANTLY and for
@@ -670,8 +685,9 @@ class PlayerViewModel @Inject constructor(
         } else if (failoverCount >= MAX_FAILOVERS) {
             return false
         }
-        // Claim synchronously (before any suspension) so the watchdog + onPlayerError can't both fire.
-        failoverInFlight = true
+        // Claim the shared transition slot AFTER the budget checks (so a budget-exhausted return never
+        // leaves the guard stuck). Synchronous, before any suspension, so two triggers can't both fire.
+        if (!beginTransition()) return true
         if (leavingDirect) directFailoverCount++ else failoverCount++
         val pref = currentNetworkMaxTier ?: networkQualityPreference().maxTier
         val sizePref = settingsRepository.current().streamSize
@@ -1084,7 +1100,7 @@ class PlayerViewModel @Inject constructor(
                 val hasAudio = tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }
                 if (hasAudio && !tracks.isTypeSupported(C.TRACK_TYPE_AUDIO)) {
                     val url = currentMediaUrl ?: return
-                    val pos = _currentPlayer.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    val pos = exo.currentPosition.coerceAtLeast(0L)   // read from THIS Exo, still alive here
                     switchToVlc(url, pos)
                 }
             }
@@ -1130,14 +1146,16 @@ class PlayerViewModel @Inject constructor(
                     )
                     viewModelScope.launch {
                         delay(SOURCE_RETRY_BACKOFF_MS * sourceErrorRetries)
-                        runCatching { p.prepare(); p.playWhenReady = true }
+                        // Skip if a backend switch released/replaced this exact player during the backoff
+                        // (identity check) — re-preparing a torn-down player is a crash path.
+                        if (_player.value === p) runCatching { p.prepare(); p.playWhenReady = true }
                     }
                 } else if (isParse && !usingVlcForSource && !_isCasting.value && currentMediaUrl != null) {
                     // ExoPlayer can't parse/decode this container/codec even after retries (e.g. an
                     // XviD/AVI the codec heuristic didn't catch). Hand the SAME source to the libVLC
                     // fallback (bundles FFmpeg, plays everything) at the current position before giving
                     // up on it — this is the "every codec works" path.
-                    val pos = _currentPlayer.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    val pos = exo.currentPosition.coerceAtLeast(0L)   // resume pos from the Exo being torn down
                     switchToVlc(currentMediaUrl!!, pos)
                 } else {
                     // Per-source retries are spent and VLC can't help (or already tried). Before
@@ -1177,10 +1195,15 @@ class PlayerViewModel @Inject constructor(
         val existing = vlcPlayer
         if (existing != null && currentMediaUrl == url) return  // steady-state READY re-emit -> no-op
 
-        // One backend at a time: drop the ExoPlayer if it was the one showing.
-        _player.value?.let { exo ->
-            playerListener?.let { exo.removeListener(it) }
-            exo.release()
+        // Capture the OUTGOING ExoPlayer but DON'T release it yet. Pause it now (no double-audio while
+        // VLC spins up), then release it only AFTER the UI has rebound to VLC — otherwise PlayerView
+        // rebinds and calls clearVideoSurfaceView() on a RELEASED player (a crash). Single transition
+        // guard already prevents a second path releasing it too.
+        val outgoingExo = _player.value
+        val outgoingListener = playerListener
+        outgoingExo?.let { exo ->
+            outgoingListener?.let { runCatching { exo.removeListener(it) } }
+            runCatching { exo.playWhenReady = false }
         }
         _player.value = null
         playerListener = null
@@ -1189,6 +1212,10 @@ class PlayerViewModel @Inject constructor(
             vlcPlayer = built
             built.addListener(buildVlcListener(built))
         }
+        // Reusing a VlcPlayer across a switch: drop its STALE surface binding so PlayerView's rebind
+        // triggers a real re-attach. Without this, attachSurface() early-returns on the same SurfaceView
+        // and the vout is never reattached -> the exact "audio plays but NO video" bug.
+        if (existing != null) existing.detachSurface()
         // A direct source falling back to libVLC (rare — a direct stream in a codec ExoPlayer can't
         // decode) must carry its host headers too, or libVLC 403s the same way. No-op for torrents.
         vlc.setRequestHeaders(_currentSource.value?.takeIf { it.isDirect }?.requestHeaders ?: emptyMap())
@@ -1199,6 +1226,14 @@ class PlayerViewModel @Inject constructor(
         switchingEpisode = false   // new media bound (VLC) -> resume progress saves
         if (!_isCasting.value) _currentPlayer.value = vlc
         startProgressTicker()
+        // Release the outgoing ExoPlayer AFTER the UI has had a frame to rebind to VLC, so PlayerView
+        // detaches its surface from the LIVE old player (already paused above), not a released one.
+        outgoingExo?.let { exo ->
+            viewModelScope.launch {
+                delay(80)
+                runCatching { exo.release() }
+            }
+        }
     }
 
     /** Lean transport listener for the VLC backend (READY -> Playing + resume, ENDED -> next). */
@@ -1260,16 +1295,20 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    /** Hand the CURRENT source to VLC at [startPositionMs] (ExoPlayer couldn't decode it). */
+    /** Hand the CURRENT source to VLC at [startPositionMs] (ExoPlayer couldn't decode it). Self-guards
+     *  the single transition slot so it can't race a failover/select; the swap is synchronous, so it
+     *  releases the slot on return. */
     private fun switchToVlc(url: String, startPositionMs: Long) {
+        if (!beginTransition()) return   // a failover/select transition already owns the slot — let it win
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
-            seeders = _currentSource.value?.seeders ?: 0,
+            seeders = if (_currentSource.value?.isDirect == true) 0 else _currentSource.value?.seeders ?: 0,
             downloadRateBytes = 0,
             label = "Switching player…",
         )
         currentMediaUrl = null   // force ensureVlcPlayer to (re)load even if the url matches
         ensureVlcPlayer(url, startPositionMs)
+        transitionInFlight = false   // the Exo->VLC swap completed synchronously; release the slot
     }
 
     /** Release the VLC fallback player, if any. */
