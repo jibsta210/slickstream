@@ -186,6 +186,34 @@ object StreamPicker {
     fun looksLikeCam(sourceText: String, movieTitle: String): Boolean =
         CAM_MARKERS.containsMatchIn(stripTitleWords(sourceText, movieTitle))
 
+    // A "configure me" PLACEHOLDER, not a real stream. Many catalog addons advertise no config in their
+    // manifest yet, at /stream time, return a single fake entry that carries a real-looking `url` (often a
+    // debrid/playback gate) with a name/title like "ℹ Kindly configure this addon to access streams." or
+    // "Addon not configured · Needs API keys". Playing it does nothing — it's the root cause of "found
+    // direct sources, none played". Detect it by that prompt language (which never appears in a real
+    // release name like "Movie.2024.1080p.WEB-DL"), so it's filtered at discovery AND mapping time.
+    private val CONFIG_PROMPT = Regex(
+        "(?i)(" +
+            "kindly\\s+configure|" +
+            "configure\\s+(this\\s+)?add[\\s-]?on|" +
+            "(addon|add-on)\\s+not\\s+configured|" +
+            "not\\s+configured|" +
+            "needs?\\s+(an?\\s+)?(\\d+\\s+)?api\\s*keys?|" +
+            "api[\\s-]?key\\s+(is\\s+)?required|" +
+            "requires?\\s+configuration|" +
+            "configuration\\s+(is\\s+)?required|" +
+            "please\\s+configure|" +
+            "to\\s+access\\s+(the\\s+|your\\s+)?streams?|" +
+            "setup\\s+required|" +
+            "sign[\\s-]?in\\s+to\\s+|" +
+            "log[\\s-]?in\\s+to\\s+" +
+        ")",
+    )
+
+    /** True when a stream is a "kindly configure this addon" placeholder rather than a playable stream.
+     *  Pass the pooled name/title/description text. */
+    fun looksLikeConfigPrompt(sourceText: String): Boolean = CONFIG_PROMPT.containsMatchIn(sourceText)
+
     // Season / multi-episode PACK markers, usually carried in the pack's FOLDER name (which Torrentio
     // includes alongside the chosen file name): "Season 1", "Complete", a season range "S01-S03", an
     // episode range "E01-E10", "Pack"/"Collection"/"Batch". A single-episode filename ("…S01E01…")

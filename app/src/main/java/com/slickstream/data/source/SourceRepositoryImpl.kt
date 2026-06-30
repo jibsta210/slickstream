@@ -123,6 +123,11 @@ class SourceRepositoryImpl @Inject constructor(
         val haystack = listOfNotNull(name, title, description, behaviorHints?.bingeGroup, behaviorHints?.filename)
             .joinToString("\n")
 
+        // A "kindly configure this addon to access streams" placeholder is NOT playable — its url is a
+        // debrid/config gate, not a video. Drop it so it never appears as a (broken) direct source.
+        // (This is exactly what the user hit: every "direct" option said "kindly configure".)
+        if (directUrl != null && StreamPicker.looksLikeConfigPrompt(haystack)) return null
+
         val displayName = behaviorHints?.filename
             ?: title?.lineSequence()?.firstOrNull()?.takeIf { it.isNotBlank() }
             ?: name?.replace('\n', ' ')?.trim()

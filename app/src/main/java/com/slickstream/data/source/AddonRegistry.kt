@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -50,10 +51,15 @@ class AddonRegistry @Inject constructor(
         dataStore.data.first()[KEY_URLS]?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
 
     /** Refresh the working set if the cache is stale (or never built). Safe to call on every launch —
-     *  it no-ops within the TTL and swallows all failures (keeping the last-good cache). */
+     *  it no-ops within the TTL and swallows all failures (keeping the last-good cache). A bump of
+     *  [CACHE_VERSION] forces a one-off re-discovery regardless of TTL, so a fix to the discovery filter
+     *  (e.g. now rejecting "configure me" placeholders) flushes a stale cache that holds bad addons. */
     suspend fun refreshIfStale() {
-        val last = dataStore.data.first()[KEY_TS] ?: 0L
-        if (System.currentTimeMillis() - last in 0 until TTL_MS) return
+        val prefs = dataStore.data.first()
+        val last = prefs[KEY_TS] ?: 0L
+        val ver = prefs[KEY_VER] ?: 0
+        val fresh = ver == CACHE_VERSION && System.currentTimeMillis() - last in 0 until TTL_MS
+        if (fresh) return
         runCatching { refresh() }.onFailure { Log.w(TAG, "addon registry refresh failed", it) }
     }
 
@@ -79,18 +85,29 @@ class AddonRegistry @Inject constructor(
         dataStore.edit {
             it[KEY_URLS] = ordered.joinToString("\n")
             it[KEY_TS] = System.currentTimeMillis()
+            it[KEY_VER] = CACHE_VERSION
         }
         Log.i(TAG, "addon registry: ${ordered.size} direct stream addons healthy (of ${candidates.size} checked)")
     }
 
-    /** A working addon = its /stream endpoint returns at least one playable stream (direct url OR a
-     *  torrent infoHash) for a universally-available test title, within a short timeout. */
+    /** A working addon = its /stream endpoint returns at least one REAL playable stream for a
+     *  universally-available test title, within a short timeout. Crucially, a "direct" stream only
+     *  counts if it isn't a "kindly configure this addon to access streams" PLACEHOLDER — many catalog
+     *  addons advertise no config in their manifest yet return a single fake entry whose url is a
+     *  debrid/config gate (the title literally says to configure it). Counting those as direct is what
+     *  surfaced unplayable HTTPS sources; here they're rejected so the addon is dropped (we only keep
+     *  direct addons), and torrents keep coming from the configured indexer regardless. */
     private suspend fun healthCheck(base: String): WorkingAddon? = withTimeoutOrNull(HEALTHCHECK_TIMEOUT_MS) {
         val resp = runCatching { api.getStreamsAt("${base}stream/movie/$TEST_ID.json") }.getOrNull()
             ?: return@withTimeoutOrNull null
-        val usable = resp.streams.filter { !it.url.isNullOrBlank() || !it.infoHash.isNullOrBlank() }
-        if (usable.isEmpty()) return@withTimeoutOrNull null
-        WorkingAddon(base, isDirect = usable.any { !it.url.isNullOrBlank() })
+        val realDirect = resp.streams.any { s ->
+            !s.url.isNullOrBlank() && !StreamPicker.looksLikeConfigPrompt(
+                listOfNotNull(s.name, s.title, s.description).joinToString("\n")
+            )
+        }
+        val hasTorrent = resp.streams.any { !it.infoHash.isNullOrBlank() }
+        if (!realDirect && !hasTorrent) return@withTimeoutOrNull null
+        WorkingAddon(base, isDirect = realDirect)
     }
 
     /** Manifest base from a manifest URL, normalised to end in '/'. */
@@ -119,8 +136,12 @@ class AddonRegistry @Inject constructor(
         const val HEALTHCHECK_CONCURRENCY = 8
         const val HEALTHCHECK_TIMEOUT_MS = 8_000L
         const val MAX_ACTIVE = 12                // cap the addons queried per title (keeps resolve fast)
+        /** Bump to force a one-off re-discovery on next launch (flushes a cache holding bad addons).
+         *  2 = reject "kindly configure" placeholder streams that older builds cached as direct. */
+        const val CACHE_VERSION = 2
         val KEY_URLS = stringPreferencesKey("addon_urls")
         val KEY_TS = longPreferencesKey("addon_refreshed_at")
+        val KEY_VER = intPreferencesKey("addon_cache_version")
     }
 }
 
