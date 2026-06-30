@@ -136,6 +136,12 @@ data class AppSettings(
     val screenScale: Float = 1f,
     val screenOffsetX: Float = 0f,
     val screenOffsetY: Float = 0f,
+    /** A user-supplied streaming-source addon URL (e.g. a debrid-backed Torrentio that returns instant
+     *  cached direct streams). Queried FIRST, before the built-in indexer + auto-discovered addons.
+     *  Comma-separated for multiple. Contains a private API token, so it is entered per-device (never
+     *  baked into the shipped APK) — but DOES sync to the user's other signed-in devices for convenience
+     *  (painful to type a long URL on a TV remote). */
+    val customSourceUrl: String = "",
 )
 
 /** Screen-calibration triple (uniform scale + dp shift) used for the live, in-memory preview. */
@@ -199,6 +205,7 @@ class SettingsRepository @Inject constructor(
             screenScale = (p[KEY_SCREEN_SCALE] ?: 1f).coerceIn(SCALE_MIN, SCALE_MAX),
             screenOffsetX = (p[KEY_SCREEN_OFF_X] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
             screenOffsetY = (p[KEY_SCREEN_OFF_Y] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
+            customSourceUrl = p[KEY_CUSTOM_SOURCE] ?: "",
         )
     }
 
@@ -213,6 +220,10 @@ class SettingsRepository @Inject constructor(
     suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name }
     suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
+    suspend fun setCustomSourceUrl(url: String) = dataStore.edit {
+        it[KEY_CUSTOM_SOURCE] = url.trim()
+        it[KEY_SYNC_UPDATED] = System.currentTimeMillis()   // LWW clock so it propagates to other devices
+    }
     suspend fun setUpNextPercent(pct: Int) = dataStore.edit { it[KEY_UP_NEXT_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX) }
     suspend fun setMovieBarPercent(pct: Int) = dataStore.edit { it[KEY_MOVIE_BAR_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX) }
     suspend fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) = dataStore.edit {
@@ -241,6 +252,7 @@ class SettingsRepository @Inject constructor(
             "streamSize" to s.streamSize.name,
             "upNextPercent" to s.upNextPercent,
             "movieBarPercent" to s.movieBarPercent,
+            "customSourceUrl" to s.customSourceUrl,
         )
     }
 
@@ -270,6 +282,9 @@ class SettingsRepository @Inject constructor(
             (remote["streamSize"] as? String)?.let { v -> if (runCatching { StreamSizePreference.valueOf(v) }.isSuccess) p[KEY_STREAM_SIZE] = v }
             (remote["upNextPercent"] as? Number)?.toInt()?.let { p[KEY_UP_NEXT_PCT] = it.coerceIn(PCT_MIN, PCT_MAX) }
             (remote["movieBarPercent"] as? Number)?.toInt()?.let { p[KEY_MOVIE_BAR_PCT] = it.coerceIn(PCT_MIN, PCT_MAX) }
+            // Only adopt a NON-BLANK remote custom source — a device that never set one must not wipe a
+            // URL another device configured (whole-doc LWW would otherwise clobber it). Clearing is local.
+            (remote["customSourceUrl"] as? String)?.let { if (it.isNotBlank()) p[KEY_CUSTOM_SOURCE] = it }
             p[KEY_SYNC_UPDATED] = ts
         }
     }
@@ -289,6 +304,7 @@ class SettingsRepository @Inject constructor(
         val KEY_SUB_STYLE = stringPreferencesKey("sub_style")
         val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
+        val KEY_CUSTOM_SOURCE = stringPreferencesKey("custom_source_url")
         val KEY_UP_NEXT_PCT = intPreferencesKey("up_next_pct")
         val KEY_MOVIE_BAR_PCT = intPreferencesKey("movie_bar_pct")
         val KEY_SCREEN_SCALE = floatPreferencesKey("screen_scale")
@@ -300,6 +316,7 @@ class SettingsRepository @Inject constructor(
         val SYNCED_KEYS = listOf(
             "wifiQuality", "cellularQuality", "density", "subtitlesEnabled", "subtitleLanguage",
             "subtitleSize", "subtitleStyle", "streamSize", "upNextPercent", "movieBarPercent",
+            "customSourceUrl",
         )
 
         // Calibration bounds (shared by the persisted read/write and the live in-memory preview).

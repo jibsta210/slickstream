@@ -6,6 +6,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.repository.SourceRepository
+import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.source.dto.StreamDto
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -28,6 +29,7 @@ import javax.inject.Singleton
 class SourceRepositoryImpl @Inject constructor(
     private val api: IndexerApi,
     private val addonRegistry: AddonRegistry,
+    private val settingsRepository: SettingsRepository,
 ) : SourceRepository {
 
     override suspend fun resolve(
@@ -51,8 +53,16 @@ class SourceRepositoryImpl @Inject constructor(
             // streaming addons (AddonRegistry — kept current automatically, no manual URLs) in parallel.
             // One being down/slow never blocks the others (per-addon timeout + getOrNull). Merge + de-dupe
             // by info-hash (keep the row with the most seeders).
+            // The user's OWN configured source (e.g. a debrid-backed Torrentio that returns instant
+            // cached direct streams) is queried FIRST, then the built-in indexer, then the
+            // auto-discovered free addons. Paste-tolerant: a ".../manifest.json" install URL is
+            // normalised to the query base.
+            val customBases = runCatching {
+                settingsRepository.current().customSourceUrl
+                    .split(",").map { it.trim() }.filter { it.isNotBlank() }.map(::normalizeBase)
+            }.getOrDefault(emptyList())
             val autoBases = runCatching { addonRegistry.streamingBaseUrls() }.getOrDefault(emptyList())
-            val allBases = (baseUrls + autoBases).distinct()
+            val allBases = (customBases + baseUrls + autoBases).distinct()
             val responses = coroutineScope {
                 allBases.map { base ->
                     async {
@@ -107,6 +117,11 @@ class SourceRepositoryImpl @Inject constructor(
         .filter { it.isNotBlank() }
         .map { if (it.endsWith("/")) it else "$it/" }
         .ifEmpty { listOf("https://torrentio.strem.fun/") }
+
+    /** Normalise a user-pasted addon URL into a query base: drop a trailing manifest.json and ensure a
+     *  trailing '/'. Users paste the ".../manifest.json" install URL; we query {base}stream/{type}/{id}.json. */
+    private fun normalizeBase(url: String): String =
+        url.substringBefore("manifest.json").let { if (it.endsWith("/")) it else "$it/" }
 
     /** Map one indexer row to a [StreamSource], or null if it's neither a torrent nor a direct URL. */
     private fun StreamDto.toStreamSource(movieTitle: String): StreamSource? {

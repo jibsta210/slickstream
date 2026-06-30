@@ -80,6 +80,7 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setMaxCacheSize(size: CacheSize) = viewModelScope.launch { repo.setMaxCacheSize(size) }
+    fun setCustomSourceUrl(url: String) = viewModelScope.launch { repo.setCustomSourceUrl(url) }
     fun setWifiQuality(q: QualityPreference) = viewModelScope.launch { repo.setWifiQuality(q) }
     fun setCellularQuality(q: QualityPreference) = viewModelScope.launch { repo.setCellularQuality(q) }
     fun setDensity(d: UiDensity) = viewModelScope.launch { repo.setDensity(d) }

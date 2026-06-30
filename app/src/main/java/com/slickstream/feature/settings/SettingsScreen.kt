@@ -22,6 +22,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -57,6 +59,7 @@ fun SettingsScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val cacheStats by viewModel.cacheStats.collectAsStateWithLifecycle()
     var showClearCacheDialog by remember { mutableStateOf(false) }
+    var sourceInput by remember { mutableStateOf("") }
     LaunchedEffect(Unit) { viewModel.refreshCacheStats() }
 
     val updateVm: UpdateViewModel = hiltViewModel()
@@ -116,6 +119,65 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(6.dp))
             Hint("Caps the quality of the source auto-picked when you hit Play, and how big a file to prefer within that quality (a 1080p episode can be 700 MB or 4 GB). You can still pick any source manually from the player's Quality sheet.")
+        }
+
+        SettingsSection("Streaming source") {
+            val current = settings.customSourceUrl
+            if (current.isNotBlank()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Brand.Surface)
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "✓ Custom source active",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Color(0xFF22C55E),
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = maskSource(current),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Brand.OnSurfaceDim,
+                            maxLines = 1,
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    SettingsPill("Clear", primary = false) {
+                        viewModel.setCustomSourceUrl("")
+                        sourceInput = ""
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+            TextField(
+                value = sourceInput,
+                onValueChange = { sourceInput = it },
+                placeholder = { Text("Paste your Torrentio / debrid URL", color = Brand.OnSurfaceDim) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Brand.Surface,
+                    unfocusedContainerColor = Brand.Surface,
+                    focusedTextColor = Brand.OnSurface,
+                    unfocusedTextColor = Brand.OnSurface,
+                    cursorColor = Brand.Cyan,
+                    focusedIndicatorColor = Brand.Cyan,
+                    unfocusedIndicatorColor = Color.Transparent,
+                ),
+            )
+            Spacer(Modifier.height(10.dp))
+            SettingsPill("Save source", primary = true) {
+                viewModel.setCustomSourceUrl(sourceInput.trim())
+                sourceInput = ""
+            }
+            Spacer(Modifier.height(6.dp))
+            Hint("Paste a configured streaming-addon URL — e.g. a Real-Debrid–backed Torrentio from torrentio.strem.fun/configure. It's queried first and returns instant direct streams (no torrenting, no waiting). It syncs to your signed-in TVs, so you only paste it once. Keep it private — it contains your account token.")
         }
 
         SettingsSection("Display") {
@@ -294,6 +356,10 @@ private fun formatBytes(bytes: Long): String {
 
 private fun pluralizeTitles(count: Int): String =
     if (count == 1) "1 cached title" else "$count cached titles"
+
+/** Hide the secret token when echoing a source URL back on screen (…realdebrid=••••••…). */
+private fun maskSource(url: String): String =
+    url.replace(Regex("=[A-Za-z0-9_-]{6,}"), "=••••••")
 
 @Composable
 private fun SettingsPill(label: String, primary: Boolean, onClick: () -> Unit) {

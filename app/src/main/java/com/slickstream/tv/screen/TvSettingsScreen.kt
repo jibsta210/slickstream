@@ -94,6 +94,40 @@ fun TvSettingsScreen(
         }
 
         item {
+            TvSettingSection("Streaming source") {
+                val current = settings.customSourceUrl
+                Text(
+                    text = if (current.isNotBlank()) "✓ Custom source active — ${maskTvSource(current)}"
+                    else "No custom source set. Add your Real-Debrid / Torrentio URL on your phone " +
+                        "(Settings → Streaming source) — it syncs here automatically (typing a long URL " +
+                        "with a remote is no fun).",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (current.isNotBlank()) Color(0xFF22C55E) else Brand.OnSurfaceDim,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+                if (current.isNotBlank()) {
+                    val shape = RoundedCornerShape(50)
+                    Surface(
+                        onClick = { viewModel.setCustomSourceUrl("") },
+                        shape = ClickableSurfaceDefaults.shape(shape = shape),
+                        colors = ClickableSurfaceDefaults.colors(
+                            containerColor = Brand.Surface,
+                            focusedContainerColor = Brand.Error,
+                            contentColor = Brand.Error,
+                            focusedContentColor = Color.White,
+                        ),
+                        border = ClickableSurfaceDefaults.border(
+                            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Brand.Error), shape = shape),
+                        ),
+                        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
+                    ) {
+                        Text("Clear source", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
+                    }
+                }
+            }
+        }
+
+        item {
             TvSettingSection("Display") {
                 TvOptionRow("Interface density", UiDensity.entries, settings.density, { it.label }, viewModel::setDensity)
                 val calShape = RoundedCornerShape(50)
@@ -257,6 +291,10 @@ private fun <T> TvOptionRow(
         }
     }
 }
+
+/** Hide the secret token when echoing a source URL back on screen (…realdebrid=••••••…). */
+private fun maskTvSource(url: String): String =
+    url.replace(Regex("=[A-Za-z0-9_-]{6,}"), "=••••••")
 
 private fun formatBytes(bytes: Long): String {
     val gb = bytes / 1_000_000_000.0
