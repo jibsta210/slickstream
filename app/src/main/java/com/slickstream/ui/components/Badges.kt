@@ -97,3 +97,18 @@ fun CamBadge(modifier: Modifier = Modifier) {
             .padding(horizontal = 8.dp, vertical = 3.dp),
     )
 }
+
+/** A green "DIRECT" pill — a non-torrent file-server/HLS source that plays instantly with no swarm.
+ *  Shown next to the quality chip so a direct stream is obviously distinct from a torrent in the picker. */
+@Composable
+fun DirectBadge(modifier: Modifier = Modifier) {
+    Text(
+        text = "DIRECT",
+        style = MaterialTheme.typography.labelLarge,
+        fontWeight = FontWeight.Bold,
+        color = Color.White,
+        modifier = modifier
+            .background(color = Color(0xFF22C55E), shape = RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+    )
+}

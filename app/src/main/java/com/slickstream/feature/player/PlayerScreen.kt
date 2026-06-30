@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -389,6 +390,10 @@ fun PlayerScreen(
                     suggestSmaller = suggestSmaller,
                     onSwitchToSmaller = viewModel::switchToSmaller,
                     onDismissSuggestSmaller = viewModel::dismissSuggestSmaller,
+                    // Let the user open the source sheet (direct + torrents, badged) WHILE loading — the
+                    // overlay otherwise covers the top bar's source button, stranding them on the auto-pick.
+                    canSwitchSource = sources.size > 1,
+                    onSwitchSource = { showSources = true },
                 )
                 is PlayerUiState.Error -> ErrorOverlay(
                     message = state.message,
@@ -764,6 +769,8 @@ private fun BufferingOverlay(
     suggestSmaller: Boolean = false,
     onSwitchToSmaller: () -> Unit = {},
     onDismissSuggestSmaller: () -> Unit = {},
+    canSwitchSource: Boolean = false,
+    onSwitchSource: () -> Unit = {},
 ) {
     Box(
         modifier = Modifier
@@ -848,6 +855,36 @@ private fun BufferingOverlay(
                 color = Brand.OnSurfaceDim,
                 fontSize = 13.sp,
             )
+
+            // Switch source DURING loading: the full-screen buffering overlay covers the top bar's
+            // source button, so without this the user is stranded on whatever the auto-pick chose (a
+            // slow torrent) with "no way to switch to a direct/HTTPS source". Opens the same styled
+            // source sheet; shown only when there's an alternative to switch to.
+            if (canSwitchSource) {
+                Spacer(Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Brand.Surface.copy(alpha = 0.92f))
+                        .clickable(onClick = onSwitchSource)
+                        .padding(horizontal = 22.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.SwapHoriz,
+                        contentDescription = null,
+                        tint = Brand.OnSurface,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Switch source",
+                        color = Brand.OnSurface,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp,
+                    )
+                }
+            }
 
             // Gentle, dismissible "taking a while?" card — only once the VM decides a smaller,
             // well-seeded source would genuinely help. Non-blocking; the buffer keeps filling behind it.
@@ -1453,6 +1490,10 @@ private fun SourceRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         QualityChip(quality = source.quality, highlighted = selected)
+        if (source.isDirect) {
+            Spacer(Modifier.width(6.dp))
+            com.slickstream.ui.components.DirectBadge()
+        }
         if (source.isCam) {
             Spacer(Modifier.width(6.dp))
             com.slickstream.ui.components.CamBadge()
@@ -1478,32 +1519,59 @@ private fun SourceRow(
                     )
                     Spacer(Modifier.width(12.dp))
                 }
-                Icon(
-                    imageVector = Icons.Filled.People,
-                    contentDescription = null,
-                    tint = Brand.OnSurfaceDim,
-                    modifier = Modifier.size(13.dp),
-                )
-                Spacer(Modifier.width(4.dp))
-                Text(
-                    text = "${source.seeders ?: 0}",
-                    color = Brand.OnSurfaceDim,
-                    fontSize = 12.sp,
-                )
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    text = formatSize(source.sizeBytes),
-                    color = Brand.OnSurfaceDim,
-                    fontSize = 12.sp,
-                )
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    text = source.provider,
-                    color = Brand.OnSurfaceDim,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                if (source.isDirect) {
+                    // A direct source has no swarm — show what it IS (instant, no torrent) instead of a
+                    // misleading "0 seeders" that made HTTPS sources look like dead torrents.
+                    Text(
+                        text = "Instant • no torrent",
+                        color = Color(0xFF22C55E),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    if ((source.sizeBytes ?: 0) > 0) {
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            text = formatSize(source.sizeBytes),
+                            color = Brand.OnSurfaceDim,
+                            fontSize = 12.sp,
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = source.provider,
+                        color = Brand.OnSurfaceDim,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.People,
+                        contentDescription = null,
+                        tint = Brand.OnSurfaceDim,
+                        modifier = Modifier.size(13.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = "${source.seeders ?: 0}",
+                        color = Brand.OnSurfaceDim,
+                        fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = formatSize(source.sizeBytes),
+                        color = Brand.OnSurfaceDim,
+                        fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = source.provider,
+                        color = Brand.OnSurfaceDim,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         }
         if (selected) {

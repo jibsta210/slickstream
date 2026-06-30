@@ -399,7 +399,14 @@ class PlayerViewModel @Inject constructor(
                 _uiState.value = PlayerUiState.Error("No streamable sources found.")
                 return@launch
             }
-            _sources.value = list.sortedByDescending { it.rank }
+            // DIRECT (file-server) sources first, then torrents by health — mirrors the repository's
+            // order. A plain sortedByDescending { rank } buried direct sources below every seeded torrent
+            // (directs have null seeders -> rank ≈ quality only), so the user "never saw the HTTPS
+            // options". This only orders the PICKER list; the auto-pick uses its own file-server-first
+            // logic (pickResumeOrPreferred), so rank-based floors there are untouched.
+            _sources.value = list.sortedWith(
+                compareByDescending<StreamSource> { it.isDirect }.thenByDescending { it.rank }
+            )
             // Fresh title -> fresh failover budget over the new candidate list.
             triedInfoHashes.clear()
             failoverCount = 0
@@ -1662,7 +1669,14 @@ class PlayerViewModel @Inject constructor(
                 _uiState.value = PlayerUiState.Error("No streamable sources found.")
                 return@launch
             }
-            _sources.value = list.sortedByDescending { it.rank }
+            // DIRECT (file-server) sources first, then torrents by health — mirrors the repository's
+            // order. A plain sortedByDescending { rank } buried direct sources below every seeded torrent
+            // (directs have null seeders -> rank ≈ quality only), so the user "never saw the HTTPS
+            // options". This only orders the PICKER list; the auto-pick uses its own file-server-first
+            // logic (pickResumeOrPreferred), so rank-based floors there are untouched.
+            _sources.value = list.sortedWith(
+                compareByDescending<StreamSource> { it.isDirect }.thenByDescending { it.rank }
+            )
             // Fresh episode -> fresh failover budget over the new candidate list.
             triedInfoHashes.clear()
             failoverCount = 0
