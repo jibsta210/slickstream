@@ -1,5 +1,6 @@
 package com.slickstream.data.source
 
+import com.slickstream.data.source.dto.AddonCatalogEntry
 import com.slickstream.data.source.dto.StreamResponseDto
 import retrofit2.http.GET
 import retrofit2.http.Url
@@ -25,4 +26,8 @@ interface IndexerApi {
      */
     @GET
     suspend fun getStreamsAt(@Url url: String): StreamResponseDto
+
+    /** Fetch the community addon catalog (a JSON array) used to auto-discover working streaming addons. */
+    @GET
+    suspend fun getAddonCatalog(@Url url: String): List<AddonCatalogEntry>
 }

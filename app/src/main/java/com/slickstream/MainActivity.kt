@@ -59,6 +59,9 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var authRepository: com.slickstream.core.repository.AuthRepository
 
+    @Inject
+    lateinit var addonRegistry: com.slickstream.data.source.AddonRegistry
+
     // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
     private val onTv: Boolean get() = deviceProfile.isTv
 
@@ -152,6 +155,9 @@ class MainActivity : ComponentActivity() {
         // started unless you visited Profile, and favourites/settings silently didn't sync. Idempotent
         // (onSignedIn guards on `running`), so safe to call here unconditionally.
         lifecycleScope.launch { runCatching { authRepository.restoreSession() } }
+        // Keep the free streaming-addon set current automatically (daily): discover + health-check, no
+        // manual URLs. Background; torrents are the fallback if it finds nothing.
+        lifecycleScope.launch { runCatching { addonRegistry.refreshIfStale() } }
         setContent {
             val settings by settingsRepository.settings
                 .collectAsStateWithLifecycle(initialValue = AppSettings())

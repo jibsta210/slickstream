@@ -27,6 +27,7 @@ import javax.inject.Singleton
 @Singleton
 class SourceRepositoryImpl @Inject constructor(
     private val api: IndexerApi,
+    private val addonRegistry: AddonRegistry,
 ) : SourceRepository {
 
     override suspend fun resolve(
@@ -46,11 +47,19 @@ class SourceRepositoryImpl @Inject constructor(
         }
 
         return try {
-            // Query every configured indexer addon in parallel; one being down/slow never blocks the
-            // others. Merge their results and de-dupe by info-hash (keep the row with the most seeders).
+            // Query every CONFIGURED indexer addon PLUS the auto-discovered, health-checked free
+            // streaming addons (AddonRegistry — kept current automatically, no manual URLs) in parallel.
+            // One being down/slow never blocks the others (per-addon timeout + getOrNull). Merge + de-dupe
+            // by info-hash (keep the row with the most seeders).
+            val autoBases = runCatching { addonRegistry.streamingBaseUrls() }.getOrDefault(emptyList())
+            val allBases = (baseUrls + autoBases).distinct()
             val responses = coroutineScope {
-                baseUrls.map { base ->
-                    async { runCatching { api.getStreamsAt("${base}stream/$type/$id.json") }.getOrNull() }
+                allBases.map { base ->
+                    async {
+                        kotlinx.coroutines.withTimeoutOrNull(ADDON_QUERY_TIMEOUT_MS) {
+                            runCatching { api.getStreamsAt("${base}stream/$type/$id.json") }.getOrNull()
+                        }
+                    }
                 }.awaitAll()
             }
             val ok = responses.filterNotNull()
@@ -200,6 +209,8 @@ class SourceRepositoryImpl @Inject constructor(
     }
 
     private companion object {
+        /** Per-addon resolve timeout — a slow/dead auto-discovered addon can't stall the whole resolve. */
+        const val ADDON_QUERY_TIMEOUT_MS = 10_000L
         // 👤 followed by an optional space and a seeder count.
         val SEEDER_EMOJI_REGEX = Regex("""👤\s*(\d+)""")
         val SEEDER_WORD_REGEX = Regex("""(?i)seed(?:er)?s?\s*[:=]?\s*(\d+)""")
