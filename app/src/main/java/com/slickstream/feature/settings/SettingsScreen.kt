@@ -58,6 +58,7 @@ fun SettingsScreen(
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val cacheStats by viewModel.cacheStats.collectAsStateWithLifecycle()
+    val syncDiag by viewModel.syncDiagnostic.collectAsStateWithLifecycle()
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var sourceInput by remember { mutableStateOf("") }
     LaunchedEffect(Unit) { viewModel.refreshCacheStats() }
@@ -277,6 +278,15 @@ fun SettingsScreen(
             Hint("When the cache exceeds this size, the oldest titles are removed automatically. The title you're watching is never removed.")
         }
 
+        SettingsSection("Cloud sync") {
+            Hint("Favourites, profiles, settings, and your streaming source sync across your signed-in devices. If something isn't syncing, run the test — it reports exactly what's wrong (no account link, blocked database rules, or working).")
+            Spacer(Modifier.height(12.dp))
+            SettingsPill(
+                label = if (syncDiag != null && syncDiag!!.startsWith("Testing")) "Testing…" else "Test cloud sync",
+                primary = true,
+            ) { viewModel.testSync() }
+        }
+
         SettingsSection("App updates") {
             Row(
                 modifier = Modifier
@@ -325,6 +335,17 @@ fun SettingsScreen(
         }
 
         Spacer(Modifier.height(32.dp))
+    }
+
+    syncDiag?.let { result ->
+        ConfirmDialog(
+            title = "Cloud sync",
+            message = result,
+            confirmLabel = "OK",
+            dismissLabel = "Close",
+            onConfirm = viewModel::dismissSyncDiagnostic,
+            onDismiss = viewModel::dismissSyncDiagnostic,
+        )
     }
 
     if (showClearCacheDialog) {
