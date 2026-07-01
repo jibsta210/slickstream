@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
@@ -290,14 +291,20 @@ class HomeViewModel @Inject constructor(
             val popularTvDef = asyncCatalog { catalogRepository.getPopular(MediaType.TV) }
             val topRatedDef = asyncCatalog { catalogRepository.getTopRated(MediaType.MOVIE) }
             val upcomingDef = asyncCatalog { catalogRepository.getNewAndUpcoming(MediaType.MOVIE) }
+            // Personalized "Because You Watched" rail from THIS profile's history+favourites genre mix
+            // (concurrent; null when there isn't enough signal yet).
+            val personalizedDef = viewModelScope.async { runCatching { buildPersonalizedRow() }.getOrNull() }
 
             val trending = trendingDef.await()
             val popularMovies = popularMoviesDef.await()
             val popularTv = popularTvDef.await()
             val topRated = topRatedDef.await()
             val upcoming = upcomingDef.await()
+            val personalized = personalizedDef.await()
 
             val rows = buildList {
+                // Right after Continue Watching (rendered separately) — the prime slot.
+                personalized?.let { add(it) }
                 trending.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Trending", it)) }
                 popularMovies.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Popular Movies", it)) }
                 popularTv.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Popular TV", it)) }
@@ -353,6 +360,31 @@ class HomeViewModel @Inject constructor(
         }
     }
 
+    /**
+     * "Because You Watched" — a personalized rail from the ACTIVE profile's own history + favourites.
+     * Take the dominant media type, the most-watched genre WITHIN that type (so movie/TV genre ids never
+     * cross), fetch that genre, drop anything already seen, and only surface it when there's real signal
+     * (>=4 fresh titles). Re-computed on every load() (i.e. on profile switch). Null = not enough yet.
+     */
+    private suspend fun buildPersonalizedRow(): MediaRowUi? {
+        val history = runCatching { libraryRepository.observeHistory().first() }.getOrDefault(emptyList())
+        val favs = runCatching { libraryRepository.observeFavorites().first() }.getOrDefault(emptyList())
+        val watched = history.map { it.media } + favs.map { it.media }
+        if (watched.isEmpty()) return null
+        val type = watched.groupingBy { it.mediaType }.eachCount().maxByOrNull { it.value }?.key ?: return null
+        val topGenre = watched.asSequence()
+            .filter { it.mediaType == type }
+            .flatMap { it.genreIds.asSequence() }
+            .groupingBy { it }.eachCount()
+            .maxByOrNull { it.value }?.key ?: return null
+        val items = (catalogRepository.getByGenre(type, topGenre) as? DataResult.Success)?.data ?: return null
+        val seen = watched.mapTo(HashSet()) { it.id }
+        val fresh = items.filterNot { it.id in seen }
+        if (fresh.size < 4) return null
+        val title = GENRE_NAMES[topGenre]?.let { "More $it" } ?: "Because You Watched"
+        return MediaRowUi(title, fresh)
+    }
+
     /** Commit a freshly loaded set of rows (or an error when nothing loaded) to the UI state. */
     private fun publish(
         rows: List<MediaRowUi>,
@@ -398,5 +430,16 @@ class HomeViewModel @Inject constructor(
 
         /** How recently a favourite's latest episode must have aired to count as a "new" drop. */
         const val NEW_EPISODE_WINDOW_DAYS = 21
+
+        /** TMDB genre id -> display name, for the "More <genre>" personalized rail title. Covers both
+         *  movie and TV genre id spaces (they overlap but differ for a few). */
+        val GENRE_NAMES: Map<Int, String> = mapOf(
+            28 to "Action", 12 to "Adventure", 16 to "Animation", 35 to "Comedy", 80 to "Crime",
+            99 to "Documentaries", 18 to "Drama", 10751 to "Family", 14 to "Fantasy", 36 to "History",
+            27 to "Horror", 10402 to "Music", 9648 to "Mystery", 10749 to "Romance", 878 to "Sci-Fi",
+            53 to "Thrillers", 10752 to "War", 37 to "Westerns",
+            10759 to "Action & Adventure", 10762 to "Kids", 10763 to "News", 10764 to "Reality",
+            10765 to "Sci-Fi & Fantasy", 10766 to "Soaps", 10767 to "Talk", 10768 to "War & Politics",
+        )
     }
 }
