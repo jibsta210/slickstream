@@ -55,6 +55,10 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -590,9 +594,23 @@ class PlayerViewModel @Inject constructor(
         // to the player ("file-server-first"). onPlayerError still fails over to the next source (incl. a
         // torrent) if the direct link is dead; STATE_READY -> maybeSeekToResume restores position.
         if (source.isDirect) {
-            ensurePlayer(source.directUrl!!)
-            startProgressTicker()
-            armDirectWatchdog()
+            // Pre-play validation: a quick HEAD (fallback ranged GET) catches DEAD RD links (4xx/5xx) and
+            // few-second FAKE files (tiny Content-Length) BEFORE committing the player — so a poison link
+            // fails over in ~1s instead of after the 12s watchdog, preserving the failover budget for real
+            // alternates. Lenient on ambiguous responses so a good link is never wrongly rejected.
+            val directUrl = source.directUrl!!
+            viewModelScope.launch {
+                if (validateDirectUrl(directUrl, source.requestHeaders)) {
+                    ensurePlayer(directUrl)
+                    startProgressTicker()
+                    armDirectWatchdog()
+                } else {
+                    triedInfoHashes.add(source.infoHash)
+                    if (!failoverToNext()) {
+                        _uiState.value = PlayerUiState.Error("Couldn't start any source for this title.")
+                    }
+                }
+            }
             return
         }
 
@@ -662,6 +680,44 @@ class PlayerViewModel @Inject constructor(
             }
         }
     }
+
+    /** Short-timeout client used only for the pre-play direct-link HEAD check. */
+    private val validationClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .callTimeout(4, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * Quick pre-play check of a direct/RD link. Returns false ONLY on a DEFINITIVE negative — a 4xx/5xx
+     * (dead/removed link) or a tiny Content-Length (a few-second fake sample). Ambiguous responses
+     * (timeout, HEAD-not-allowed, no length) return true so a good link is never wrongly rejected — the
+     * duration check + startup watchdog still cover those. Sends the source's required headers + UA so
+     * the probe isn't itself 403'd.
+     */
+    private suspend fun validateDirectUrl(url: String, headers: Map<String, String>): Boolean =
+        withContext(Dispatchers.IO) {
+            val ua = headers["User-Agent"] ?: headers["user-agent"] ?: DEFAULT_USER_AGENT
+            fun build(head: Boolean): Request = Request.Builder().url(url).apply {
+                if (head) head() else header("Range", "bytes=0-1")
+                header("User-Agent", ua)
+                headers.forEach { (k, v) ->
+                    if (!k.equals("User-Agent", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) header(k, v)
+                }
+            }.build()
+            val resp = runCatching { validationClient.newCall(build(head = true)).execute() }.getOrNull()
+                ?: runCatching { validationClient.newCall(build(head = false)).execute() }.getOrNull()
+                ?: return@withContext true   // couldn't reach it to judge — let the player + watchdog decide
+            resp.use { r ->
+                if (r.code in 400..599) return@withContext false   // dead / removed
+                val len = r.header("Content-Length")?.toLongOrNull()
+                    ?: r.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
+                if (len != null && len in 1 until MIN_DIRECT_FILE_BYTES) return@withContext false   // tiny fake
+                true
+            }
+        }
 
     /**
      * Advance to the next-best UNTRIED source automatically. Returns true if another source was
@@ -1858,6 +1914,9 @@ class PlayerViewModel @Inject constructor(
         /** A direct (RD) source whose media duration is under this is a fake/sample (a few-second spam
          *  file), not a real movie/episode — fail over instead of playing it. */
         const val MIN_DIRECT_DURATION_MS = 120_000L
+        /** A direct link whose real file (Content-Length) is under this is a fake/sample, not a movie —
+         *  rejected by the pre-play HEAD check before the player is even committed. */
+        const val MIN_DIRECT_FILE_BYTES = 3L * 1024 * 1024
         /** Pre-player buffering wall-clock before the watchdog will consider a source a failure. */
         const val FAILOVER_BUFFER_BUDGET_MS = 45_000L
         /** Watchdog poll cadence while waiting for a source to become playable. */
