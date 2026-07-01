@@ -34,6 +34,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AspectRatio
 import androidx.compose.material.icons.rounded.ClosedCaption
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Forward10
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -130,6 +131,7 @@ fun TvPlayerScreen(
     val title by viewModel.title.collectAsStateWithLifecycle()
     val subtitles by viewModel.subtitles.collectAsStateWithLifecycle()
     val currentSubtitle by viewModel.currentSubtitle.collectAsStateWithLifecycle()
+    val audioTracks by viewModel.audioTracks.collectAsStateWithLifecycle()
     val captionPrefs by viewModel.captionPrefs.collectAsStateWithLifecycle()
     val episodes by viewModel.episodes.collectAsStateWithLifecycle()
     val currentSeasonNumber by viewModel.currentSeasonNumber.collectAsStateWithLifecycle()
@@ -147,6 +149,7 @@ fun TvPlayerScreen(
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
     var subsPanelOpen by remember { mutableStateOf(false) }
+    var audioPanelOpen by remember { mutableStateOf(false) }
     var episodesPanelOpen by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
     var scrubbing by remember { mutableStateOf(false) }
@@ -186,7 +189,7 @@ fun TvPlayerScreen(
         enabled = isPlaying || uiState is PlayerUiState.Buffering,
     )
 
-    val anyPanelOpen = panelOpen || subsPanelOpen || episodesPanelOpen
+    val anyPanelOpen = panelOpen || subsPanelOpen || audioPanelOpen || episodesPanelOpen
 
     // The "Up next" card shows when we're near the end of a TV episode that has a next one, the user
     // hasn't dismissed it, and the transport isn't up (the card owns focus when it's visible).
@@ -291,6 +294,7 @@ fun TvPlayerScreen(
     BackHandler {
         when {
             episodesPanelOpen -> episodesPanelOpen = false
+            audioPanelOpen -> audioPanelOpen = false
             subsPanelOpen -> subsPanelOpen = false
             panelOpen -> panelOpen = false
             // Back on the Up-next card / movie bar just hides it (keep watching the tail).
@@ -454,6 +458,8 @@ fun TvPlayerScreen(
                         controlsVisible = true
                         if (subtitles.isEmpty()) viewModel.refreshSubtitles()
                     },
+                    showAudioButton = audioTracks.size > 1,
+                    onOpenAudio = { audioPanelOpen = true; controlsVisible = true },
                     // Episode navigation — only present for TV shows (episode list resolved).
                     hasEpisodes = episodes.isNotEmpty(),
                     hasPrevious = hasPrevious,
@@ -580,6 +586,23 @@ fun TvPlayerScreen(
                 },
                 onSearch = { viewModel.refreshSubtitles() },
                 onClose = { subsPanelOpen = false },
+            )
+        }
+
+        // Focusable audio-track side-panel — pick a language when the English default guesses wrong.
+        AnimatedVisibility(
+            visible = audioPanelOpen,
+            enter = slideInHorizontally { it } + fadeIn(),
+            exit = slideOutHorizontally { it } + fadeOut(),
+            modifier = Modifier.align(Alignment.CenterEnd),
+        ) {
+            AudioPanel(
+                tracks = audioTracks,
+                onSelect = { track ->
+                    viewModel.selectAudioTrack(track)
+                    audioPanelOpen = false
+                },
+                onClose = { audioPanelOpen = false },
             )
         }
 
@@ -964,6 +987,8 @@ private fun TransportOverlay(
     thumbnailVersion: Int,
     subtitlesActive: Boolean,
     onOpenSubtitles: () -> Unit,
+    showAudioButton: Boolean,
+    onOpenAudio: () -> Unit,
     hasEpisodes: Boolean,
     hasPrevious: Boolean,
     hasNext: Boolean,
@@ -1071,6 +1096,9 @@ private fun TransportOverlay(
                     onOpenSubtitles,
                     tint = if (subtitlesActive) Brand.Cyan else Color.White,
                 )
+                if (showAudioButton) {
+                    TransportButton(Icons.Rounded.GraphicEq, "Audio track", onOpenAudio)
+                }
                 TransportButton(
                     Icons.Rounded.AspectRatio,
                     if (zoomFill) "Fit to screen" else "Fill screen",
@@ -1585,6 +1613,44 @@ private fun SourceRow(
                 if (meta.isNotBlank()) {
                     Text(meta, style = MaterialTheme.typography.labelMedium, color = Brand.Cyan)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AudioPanel(
+    tracks: List<com.slickstream.feature.player.AudioTrackOption>,
+    onSelect: (com.slickstream.feature.player.AudioTrackOption) -> Unit,
+    onClose: () -> Unit,
+) {
+    BackHandler(enabled = true) { onClose() }
+    val firstFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
+    Column(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(420.dp)
+            .background(Color(0xF2101019))
+            .padding(28.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text(text = "Audio", style = MaterialTheme.typography.titleLarge, color = Brand.OnSurface)
+        Text(
+            text = "Pick the audio track / language.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Brand.OnSurfaceDim,
+        )
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
+        ) {
+            itemsIndexed(tracks, key = { _, t -> t.id }) { index, track ->
+                TvSubtitleRow(
+                    label = track.label,
+                    selected = track.selected,
+                    modifier = if (index == 0) Modifier.focusRequester(firstFocus) else Modifier,
+                ) { onSelect(track) }
             }
         }
     }

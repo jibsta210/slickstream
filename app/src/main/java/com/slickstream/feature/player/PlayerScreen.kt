@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ClosedCaption
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Refresh
@@ -132,6 +133,7 @@ fun PlayerScreen(
     val title by viewModel.title.collectAsState()
     val subtitles by viewModel.subtitles.collectAsState()
     val currentSubtitle by viewModel.currentSubtitle.collectAsState()
+    val audioTracks by viewModel.audioTracks.collectAsState()
     val captionPrefs by viewModel.captionPrefs.collectAsState()
     val episodes by viewModel.episodes.collectAsState()
     val currentSeasonNumber by viewModel.currentSeasonNumber.collectAsState()
@@ -152,10 +154,12 @@ fun PlayerScreen(
 
     var showSources by remember { mutableStateOf(false) }
     var showSubtitles by remember { mutableStateOf(false) }
+    var showAudio by remember { mutableStateOf(false) }
     var showEpisodes by remember { mutableStateOf(false) }
     var overlayVisible by remember { mutableStateOf(true) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val subtitleSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val audioSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val episodeSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
 
@@ -344,6 +348,8 @@ fun PlayerScreen(
                 showSourcesButton = sources.isNotEmpty(),
                 onSubtitles = { showSubtitles = true },
                 subtitlesActive = currentSubtitle != null,
+                onAudio = { showAudio = true },
+                showAudioButton = audioTracks.size > 1,
                 zoomFill = zoomFill,
                 onToggleZoom = { zoomFill = !zoomFill },
                 // Episode navigation — only present for TV shows (episode list resolved).
@@ -524,6 +530,25 @@ fun PlayerScreen(
         }
     }
 
+    if (showAudio) {
+        ModalBottomSheet(
+            onDismissRequest = { showAudio = false },
+            sheetState = audioSheetState,
+            containerColor = Brand.Surface,
+            contentColor = Brand.OnSurface,
+        ) {
+            AudioSheetContent(
+                tracks = audioTracks,
+                onSelect = { track ->
+                    viewModel.selectAudioTrack(track)
+                    scope.launch { audioSheetState.hide() }.invokeOnCompletion {
+                        if (!audioSheetState.isVisible) showAudio = false
+                    }
+                },
+            )
+        }
+    }
+
     if (showEpisodes) {
         ModalBottomSheet(
             onDismissRequest = { showEpisodes = false },
@@ -630,6 +655,8 @@ private fun TopOverlay(
     showSourcesButton: Boolean,
     onSubtitles: () -> Unit,
     subtitlesActive: Boolean,
+    onAudio: () -> Unit,
+    showAudioButton: Boolean,
     zoomFill: Boolean,
     onToggleZoom: () -> Unit,
     hasEpisodes: Boolean,
@@ -703,6 +730,15 @@ private fun TopOverlay(
                 contentDescription = "Subtitles",
                 tint = if (subtitlesActive) Brand.Cyan else Brand.OnSurface,
             )
+        }
+        if (showAudioButton) {
+            IconButton(onClick = onAudio) {
+                Icon(
+                    imageVector = Icons.Filled.GraphicEq,
+                    contentDescription = "Audio track",
+                    tint = Brand.OnSurface,
+                )
+            }
         }
         IconButton(onClick = onToggleZoom) {
             Icon(
@@ -1259,6 +1295,66 @@ private fun CastingOverlay(controlsVisible: Boolean, onPlayOnDevice: () -> Unit)
                 )
             }
         }
+        }
+    }
+}
+
+@Composable
+private fun AudioSheetContent(
+    tracks: List<AudioTrackOption>,
+    onSelect: (AudioTrackOption) -> Unit,
+) {
+    Column(modifier = Modifier.padding(bottom = 24.dp)) {
+        Text(
+            text = "Audio",
+            color = Brand.OnSurface,
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 4.dp),
+        )
+        Text(
+            text = if (tracks.size == 1) "1 track" else "${tracks.size} tracks",
+            color = Brand.OnSurfaceDim,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(start = 20.dp, bottom = 12.dp),
+        )
+        LazyColumn {
+            items(tracks, key = { it.id }) { track ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelect(track) }
+                        .background(if (track.selected) Brand.Violet.copy(alpha = 0.22f) else Color.Transparent)
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = track.label,
+                            color = Brand.OnSurface,
+                            fontWeight = if (track.selected) FontWeight.SemiBold else FontWeight.Normal,
+                            fontSize = 15.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (track.language.isNotBlank() && track.language != "und") {
+                            Text(
+                                text = track.language.uppercase(),
+                                color = Brand.OnSurfaceDim,
+                                fontSize = 12.sp,
+                            )
+                        }
+                    }
+                    if (track.selected) {
+                        Icon(
+                            imageVector = Icons.Filled.CheckCircle,
+                            contentDescription = "Selected",
+                            tint = Brand.Cyan,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                }
+            }
         }
     }
 }

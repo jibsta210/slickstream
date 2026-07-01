@@ -101,6 +101,15 @@ data class RebufferState(
     val downloadRateBytes: Int,
 )
 
+/** One selectable audio track for the in-player audio picker. [id] is "groupIndex:trackIndex" over the
+ *  ExoPlayer audio track groups. */
+data class AudioTrackOption(
+    val id: String,
+    val language: String,
+    val label: String,
+    val selected: Boolean,
+)
+
 /** Subtitle appearance the players apply to their Media3 SubtitleView. */
 data class CaptionPrefs(val size: SubtitleSize, val style: SubtitleStyle)
 
@@ -331,6 +340,12 @@ class PlayerViewModel @Inject constructor(
     val subtitles: StateFlow<List<SubtitleTrack>> = _subtitles.asStateFlow()
     private val _currentSubtitle = MutableStateFlow<SubtitleTrack?>(null)
     val currentSubtitle: StateFlow<SubtitleTrack?> = _currentSubtitle.asStateFlow()
+
+    // --- Audio tracks (manual selector; default is English via setPreferredAudioLanguage) ---
+    private val _audioTracks = MutableStateFlow<List<AudioTrackOption>>(emptyList())
+    val audioTracks: StateFlow<List<AudioTrackOption>> = _audioTracks.asStateFlow()
+    /** Latest ExoPlayer Tracks, kept so selectAudioTrack can build a precise per-track override. */
+    private var latestTracks: androidx.media3.common.Tracks? = null
     private var subtitleConfigs: List<ExoMediaItem.SubtitleConfiguration> = emptyList()
     private var preferredSubCode: String? = null
 
@@ -1153,6 +1168,21 @@ class PlayerViewModel @Inject constructor(
             }
 
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                // Enumerate audio tracks for the manual picker (label + language + which is selected).
+                latestTracks = tracks
+                _audioTracks.value = tracks.groups
+                    .filter { it.type == C.TRACK_TYPE_AUDIO }
+                    .flatMapIndexed { gi, group ->
+                        (0 until group.length).map { ti ->
+                            val fmt = group.getTrackFormat(ti)
+                            AudioTrackOption(
+                                id = "$gi:$ti",
+                                language = fmt.language ?: "und",
+                                label = fmt.label?.takeIf { it.isNotBlank() } ?: languageDisplayName(fmt.language),
+                                selected = group.isTrackSelected(ti),
+                            )
+                        }
+                    }
                 // No-sound bug (~20% of torrents): AC3 / E-AC3 / DTS / DTS-HD / TrueHD audio that
                 // ExoPlayer can't decode on this device (esp. phones, which lack those licensed decoders)
                 // -> the video plays but it's SILENT. If the release HAS audio track(s) but the device
@@ -1412,6 +1442,33 @@ class PlayerViewModel @Inject constructor(
             }
         }.build()
         _currentSubtitle.value = track
+    }
+
+    /** Force a specific AUDIO track (precise per-track override, so two same-language tracks are
+     *  distinguishable) — the manual fix when the English default picks the wrong one. */
+    @OptIn(UnstableApi::class)
+    fun selectAudioTrack(option: AudioTrackOption) {
+        val exo = _player.value ?: return
+        val tracks = latestTracks ?: return
+        val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        val parts = option.id.split(":")
+        val gi = parts.getOrNull(0)?.toIntOrNull() ?: return
+        val ti = parts.getOrNull(1)?.toIntOrNull() ?: return
+        val group = audioGroups.getOrNull(gi) ?: return
+        exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+            .setOverrideForType(
+                androidx.media3.common.TrackSelectionOverride(group.mediaTrackGroup, ti),
+            )
+            .build()
+        _audioTracks.value = _audioTracks.value.map { it.copy(selected = it.id == option.id) }
+    }
+
+    /** ISO-639 code -> display name for the audio picker (Format.label is often null). */
+    private fun languageDisplayName(code: String?): String {
+        val c = code?.takeIf { it.isNotBlank() && it != "und" } ?: return "Unknown"
+        return runCatching { java.util.Locale(c).displayLanguage.takeIf { it.isNotBlank() && it != c } }
+            .getOrNull() ?: c.uppercase(java.util.Locale.ROOT)
     }
 
     /** Re-query the subtitle addon (the in-player "search") and re-attach to the live player. */
