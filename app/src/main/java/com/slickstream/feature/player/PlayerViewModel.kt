@@ -669,6 +669,15 @@ class PlayerViewModel @Inject constructor(
      * a short budget, fail over to the next source (which may be a torrent). A healthy link flips to
      * Playing first, so this self-cancels via the state check.
      */
+    /** Turn an opaque ExoPlayer error code into a human message + implied next step, so the user sees a
+     *  cause + a fix instead of "Playback error (2014)". */
+    private fun friendlyPlaybackError(error: PlaybackException): String = when (error.errorCode) {
+        in 2000..2999 -> "Lost the connection to this stream — it stalled or the source went away. Try another source."
+        in 3000..3999 -> "This release is in a format the player couldn't read. Try another source."
+        in 4000..4999 -> "This device can't decode this video's codec. Try another source."
+        else -> (error.localizedMessage?.takeIf { it.isNotBlank() } ?: "Playback failed") + ". Try another source."
+    }
+
     private fun armDirectWatchdog() {
         bufferWatchdogJob?.cancel()
         bufferWatchdogJob = viewModelScope.launch {
@@ -1171,8 +1180,7 @@ class PlayerViewModel @Inject constructor(
                 if (_currentSource.value?.isDirect == true && !_isCasting.value) {
                     viewModelScope.launch {
                         if (!failoverToNext()) {
-                            val msg = error.localizedMessage ?: "Playback error"
-                            _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                            _uiState.value = PlayerUiState.Error(friendlyPlaybackError(error))
                         }
                     }
                     return
@@ -1217,15 +1225,15 @@ class PlayerViewModel @Inject constructor(
                     // Per-source retries are spent and VLC can't help (or already tried). Before
                     // dead-ending, hand off to the next untried source automatically; only surface the
                     // error (with its code) once every candidate is exhausted. Casting can't fail over.
-                    val msg = error.localizedMessage ?: "Playback error"
+                    val msg = friendlyPlaybackError(error)
                     if (!_isCasting.value) {
                         viewModelScope.launch {
                             if (!failoverToNext()) {
-                                _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                                _uiState.value = PlayerUiState.Error(msg)
                             }
                         }
                     } else {
-                        _uiState.value = PlayerUiState.Error("$msg (${error.errorCodeName})")
+                        _uiState.value = PlayerUiState.Error(msg)
                     }
                 }
             }

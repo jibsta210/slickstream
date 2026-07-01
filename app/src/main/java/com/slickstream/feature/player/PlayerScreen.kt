@@ -398,6 +398,7 @@ fun PlayerScreen(
                 is PlayerUiState.Error -> ErrorOverlay(
                     message = state.message,
                     onRetry = viewModel::retry,
+                    onOtherStreams = if (sources.size > 1) { { showSources = true } } else null,
                 )
                 PlayerUiState.Playing -> Unit
             }
@@ -1122,7 +1123,7 @@ private fun formatTimecode(ms: Long): String {
 }
 
 @Composable
-private fun ErrorOverlay(message: String, onRetry: () -> Unit) {
+private fun ErrorOverlay(message: String, onRetry: () -> Unit, onOtherStreams: (() -> Unit)? = null) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1160,26 +1161,46 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit) {
             )
             Spacer(Modifier.height(22.dp))
             Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .background(Brand.Violet)
-                    .clickable(onClick = onRetry)
-                    .padding(horizontal = 24.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Refresh,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = "Retry",
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 15.sp,
-                )
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(Brand.Violet)
+                        .clickable(onClick = onRetry)
+                        .padding(horizontal = 24.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Retry",
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp,
+                    )
+                }
+                // A dead source is one tap from picking another — the user hit "top 2 were dead, 3rd
+                // worked"; this makes that recovery obvious instead of a dead-end.
+                if (onOtherStreams != null) {
+                    Text(
+                        text = "Other streams",
+                        color = Brand.OnSurface,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Brand.SurfaceVariant)
+                            .clickable(onClick = onOtherStreams)
+                            .padding(horizontal = 20.dp, vertical = 12.dp),
+                    )
+                }
             }
         }
     }

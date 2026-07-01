@@ -200,6 +200,10 @@ private fun DetailsContent(
                 }
             }
 
+            if (details.cast.isNotEmpty()) {
+                item(key = "cast") { TvCastRow(cast = details.cast) }
+            }
+
             if (state.similar.isNotEmpty()) {
                 item(key = "similar") {
                     TvMediaRow(
@@ -207,6 +211,76 @@ private fun DetailsContent(
                         items = state.similar,
                         onItemClick = onMediaClick,
                     )
+                }
+            }
+        }
+    }
+}
+
+/** D-pad-navigable cast row for the TV details screen — the phone details had one, the TV didn't, from
+ *  data the DetailsViewModel already fetches. Circular headshots, focusable cards. */
+@Composable
+private fun TvCastRow(cast: List<com.slickstream.core.model.CastMember>) {
+    androidx.compose.foundation.layout.Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            text = "Cast",
+            style = MaterialTheme.typography.titleLarge,
+            color = Brand.OnSurface,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(start = 48.dp),
+        )
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(horizontal = 48.dp, vertical = 6.dp),
+        ) {
+            items(cast, key = { it.id }, contentType = { "cast" }) { member ->
+                val shape = RoundedCornerShape(14.dp)
+                Surface(
+                    onClick = {},   // inert but focusable so the D-pad can traverse the row
+                    shape = ClickableSurfaceDefaults.shape(shape = shape),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor = Brand.Surface,
+                        focusedContainerColor = Brand.Surface,
+                        contentColor = Brand.OnSurface,
+                        focusedContentColor = Color.White,
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet), shape = shape),
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+                    modifier = Modifier.width(124.dp),
+                ) {
+                    androidx.compose.foundation.layout.Column(
+                        modifier = Modifier.padding(10.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        coil.compose.AsyncImage(
+                            model = member.profileUrl,
+                            contentDescription = member.name,
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                            modifier = Modifier
+                                .size(92.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(Brand.SurfaceVariant),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = member.name,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (member.character.isNotBlank()) {
+                            Text(
+                                text = member.character,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Brand.OnSurfaceDim,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
                 }
             }
         }
