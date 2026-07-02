@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -158,12 +159,16 @@ class FrameThumbnailExtractor(
             // The coarse tier defines "complete enough to back off"; the dense tier is opportunistic
             // and may keep filling for the whole session as the download head grows, so we don't
             // require denseCount to finish before idling.
-            while (scope.isActive) {
+            // Cancellation checks MUST be against THIS job (reset()/start() cancel it), not the
+            // long-lived scope — a round spends seconds inside getFrameAtTime, and a job-cancelled
+            // loop that only watched scope.isActive kept decoding the OLD source into the cache the
+            // new source had just cleared (previous movie's frames in the new scrub filmstrip).
+            while (currentCoroutineContext().isActive) {
                 var progressed = false
 
                 // Coarse tier — prefetched, so its bytes will arrive; decode each as it lands.
                 for (i in coarseTimes.indices) {
-                    if (!scope.isActive) break
+                    if (!currentCoroutineContext().isActive) break
                     val t = coarseTimes[i]
                     if (t in done) continue
                     if (!streamer.isByteAvailable(hash, coarseOffsets[i])) continue
@@ -174,7 +179,7 @@ class FrameThumbnailExtractor(
                 // Dense tier — FREE only: decode a sample solely when its bytes are already on disk.
                 // Never prefetch these. Re-scanned every round so newly-downloaded regions fill in.
                 for (t in denseTimes) {
-                    if (!scope.isActive) break
+                    if (!currentCoroutineContext().isActive) break
                     if (t in done) continue
                     if (!streamer.isByteAvailable(hash, byteOffsetForTime(t))) continue
                     if (decodeAndStore(retriever, t)) progressed = true
@@ -240,14 +245,17 @@ class FrameThumbnailExtractor(
         }
         // Only evict if some existing frame is farther from the anchor than the incoming one;
         // otherwise the incoming frame is the least useful and we simply skip adding it.
+        // NEVER recycle() evicted bitmaps: thumbnailAt hands the live Bitmap to the Compose
+        // filmstrip, which may still be drawing it — recycling under it is a "trying to use a
+        // recycled bitmap" crash. Dropping the reference is enough; thumbs are small and GC'd.
         if (farKey != null) {
-            frames.remove(farKey)?.let { runCatching { it.recycle() } }
+            frames.remove(farKey)
         }
         // If farKey is null every existing frame is at least as close as the incoming one — but we
         // still need room, so drop the single farthest existing entry to honour the cap.
         if (frames.size >= MAX_FRAMES) {
             val drop = frames.keys.maxByOrNull { abs(it - anchor) }
-            if (drop != null) frames.remove(drop)?.let { runCatching { it.recycle() } }
+            if (drop != null) frames.remove(drop)
         }
     }
 
@@ -284,7 +292,8 @@ class FrameThumbnailExtractor(
         denseIntervalMs = 0L
         lastScrubMs = 0L
         synchronized(lock) {
-            frames.values.forEach { runCatching { it.recycle() } }
+            // No recycle(): a failover calls this mid-scrub while the filmstrip may still be drawing
+            // one of these bitmaps (see evictIfFullLocked). Dropping the references is enough.
             frames.clear()
         }
         _version.value = 0

@@ -32,7 +32,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.graphicsLayer
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -67,7 +70,14 @@ fun TvSearchScreen(
     viewModel: SearchViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
-    val voice by viewModel.voiceState.collectAsStateWithLifecycle()
+    // Strip the high-frequency rmsDb BEFORE collecting at screen scope: raw voiceState ticks at
+    // mic-callback rate while listening, and each tick recomposed the ENTIRE screen (hero, grid,
+    // transcript) — a sustained storm exactly while SpeechRecognizer is eating CPU. MicTile
+    // collects the loudness by itself, confining that churn to one small tile.
+    val voice by remember {
+        viewModel.voiceState.map { it.copy(rmsDb = 0f) }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = viewModel.voiceState.value.copy(rmsDb = 0f))
+    val rmsFlow = remember { viewModel.voiceState.map { it.rmsDb } }
 
     var showKeyboard by remember { mutableStateOf(false) }
 
@@ -92,7 +102,8 @@ fun TvSearchScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Brand.Background)
+            // No background here — TvApp's shell already fills Brand.Background; repeating it was
+            // a second full-screen fill pass per frame on a fill-rate-bound GPU.
             // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
@@ -114,7 +125,7 @@ fun TvSearchScreen(
             ) {
                 MicTile(
                     listening = voice.isListening,
-                    rmsDb = voice.rmsDb,
+                    rmsDbFlow = rmsFlow,
                     focusRequester = micFocus,
                     onClick = {
                         // Ask for the mic permission first if needed, else start directly.
@@ -172,15 +183,18 @@ fun TvSearchScreen(
 @Composable
 private fun MicTile(
     listening: Boolean,
-    rmsDb: Float,
+    rmsDbFlow: Flow<Float>,
     onClick: () -> Unit,
     focusRequester: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
 
-    // Pulse the ring with mic loudness while listening.
-    val pulse by animateFloatAsState(
+    // Pulse the ring with mic loudness while listening. Loudness is collected HERE so its ticks
+    // recompose only this tile, and the animated scale is applied in graphicsLayer's lambda —
+    // a draw-phase read, so the pulse animation itself never recomposes anything.
+    val rmsDb by rmsDbFlow.collectAsStateWithLifecycle(initialValue = 0f)
+    val pulse = animateFloatAsState(
         targetValue = if (listening) 1f + (rmsDb.coerceIn(0f, 12f) / 12f) * 0.18f else 1f,
         label = "mic-pulse",
     )
@@ -204,7 +218,11 @@ private fun MicTile(
         modifier = Modifier
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .size(168.dp)
-            .scale(if (listening) pulse else 1f),
+            .graphicsLayer {
+                val s = if (listening) pulse.value else 1f
+                scaleX = s
+                scaleY = s
+            },
     ) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Icon(

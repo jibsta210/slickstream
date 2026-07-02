@@ -13,9 +13,20 @@ object Img {
     const val PROFILE = "w185"
     const val STILL = "w300"
 
+    const val BACKDROP_CARD = "w780"
+
     /** Build a full image URL from a TMDB relative path, or null. */
     fun url(path: String?, size: String = POSTER): String? =
         path?.takeIf { it.isNotBlank() }?.let { "$BASE$size$it" }
+
+    /**
+     * Downgrade a full-size backdrop URL to the w780 variant for CARD-sized tiles. The model
+     * carries one w1280 backdropUrl (right for the hero/details header), but a ~460px wide card
+     * fetching w1280 downloads + disk-caches a 150-300KB file it then decodes at a quarter of the
+     * size — slower row population and 4x the disk-cache churn on weak boxes. TMDB URLs embed the
+     * size as a path segment, so a string swap is exact. No-op for non-backdrop URLs.
+     */
+    fun cardBackdrop(url: String?): String? = url?.replace("/$BACKDROP/", "/$BACKDROP_CARD/")
 }
 
 object Tmdb {

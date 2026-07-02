@@ -237,6 +237,10 @@ class PlayerViewModel @Inject constructor(
     // --- Internal -----------------------------------------------------------
     private var details: MediaDetails? = null
     private var streamJob: Job? = null
+
+    /** In-flight pre-play validation of a direct source. Cancelled on every new startSource so a
+     *  stale probe can't rebind its old URL (or fail over) after the user already switched source. */
+    private var directValidationJob: Job? = null
     private var progressTickJob: Job? = null
     private var activeInfoHash: String? = null
     private var hasSeekedToResume = false
@@ -593,6 +597,10 @@ class PlayerViewModel @Inject constructor(
         hasReachedPlaying = false       // new source starts in the STARTUP phase (failover watchdog owns it)
         latestStatus = null
         firstReadyAtMs = 0L
+        // The old source's audio-track list is meaningless for the new stream (and on the VLC path it
+        // would leave a picker that silently no-ops) — clear until the new player reports its tracks.
+        latestTracks = null
+        _audioTracks.value = emptyList()
         bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
@@ -604,6 +612,7 @@ class PlayerViewModel @Inject constructor(
         )
 
         streamJob?.cancel()
+        directValidationJob?.cancel()   // a stale direct probe must not outlive the source it was for
 
         // DIRECT http/hls source: no torrent engine, no swarm, no readiness gate — hand the URL straight
         // to the player ("file-server-first"). onPlayerError still fails over to the next source (incl. a
@@ -614,8 +623,13 @@ class PlayerViewModel @Inject constructor(
             // fails over in ~1s instead of after the 12s watchdog, preserving the failover budget for real
             // alternates. Lenient on ambiguous responses so a good link is never wrongly rejected.
             val directUrl = source.directUrl!!
-            viewModelScope.launch {
-                if (validateDirectUrl(directUrl, source.requestHeaders)) {
+            directValidationJob = viewModelScope.launch {
+                val valid = validateDirectUrl(directUrl, source.requestHeaders)
+                // The probe can take seconds and the buffering overlay offers "Switch source" the whole
+                // time — if the user (or a failover) moved on meanwhile, this result is for a source we
+                // abandoned: acting on it would rebind the old URL or tear down the new source.
+                if (_currentSource.value !== source) return@launch
+                if (valid) {
                     ensurePlayer(directUrl)
                     startProgressTicker()
                     armDirectWatchdog()
@@ -731,9 +745,19 @@ class PlayerViewModel @Inject constructor(
                     if (!k.equals("User-Agent", ignoreCase = true) && k.isNotBlank() && v.isNotBlank()) header(k, v)
                 }
             }.build()
-            val resp = runCatching { validationClient.newCall(build(head = true)).execute() }.getOrNull()
-                ?: runCatching { validationClient.newCall(build(head = false)).execute() }.getOrNull()
-                ?: return@withContext true   // couldn't reach it to judge — let the player + watchdog decide
+            val headResp = runCatching { validationClient.newCall(build(head = true)).execute() }.getOrNull()
+            val resp = when {
+                // Many hosts refuse HEAD (405/501 — or 403 it) while serving GET fine, so a HEAD error
+                // status is NOT definitive: re-probe with the ranged GET and judge on that instead.
+                headResp != null && headResp.code in 400..599 -> {
+                    runCatching { headResp.close() }
+                    runCatching { validationClient.newCall(build(head = false)).execute() }.getOrNull()
+                        ?: return@withContext true   // couldn't reach it to judge — let the watchdog decide
+                }
+                headResp != null -> headResp
+                else -> runCatching { validationClient.newCall(build(head = false)).execute() }.getOrNull()
+                    ?: return@withContext true   // couldn't reach it to judge — let the watchdog decide
+            }
             resp.use { r ->
                 if (r.code in 400..599) return@withContext false   // dead / removed
                 val len = r.header("Content-Length")?.toLongOrNull()
@@ -1324,8 +1348,14 @@ class PlayerViewModel @Inject constructor(
         // detaches its surface from the LIVE old player (already paused above), not a released one.
         outgoingExo?.let { exo ->
             viewModelScope.launch {
-                delay(80)
-                runCatching { exo.release() }
+                // finally, not a plain sequence: if the VM clears during the delay, the cancellation
+                // must still release this player or its hardware decoder leaks (it's no longer in
+                // _player.value, so onCleared can't reach it).
+                try {
+                    delay(80)
+                } finally {
+                    runCatching { exo.release() }
+                }
             }
         }
     }
@@ -1386,6 +1416,19 @@ class PlayerViewModel @Inject constructor(
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!isPlaying) saveProgressNow()
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            // VLC is the last-resort backend — nothing left to re-prepare or switch to for THIS
+            // source, so a VLC error goes straight to the next candidate (or the terminal error).
+            val msg = friendlyPlaybackError(error)
+            if (!_isCasting.value) {
+                viewModelScope.launch {
+                    if (!failoverToNext()) _uiState.value = PlayerUiState.Error(msg)
+                }
+            } else {
+                _uiState.value = PlayerUiState.Error(msg)
+            }
         }
     }
 
@@ -1842,6 +1885,10 @@ class PlayerViewModel @Inject constructor(
             switchingEpisode = true
             progressTickJob?.cancel()
             bufferWatchdogJob?.cancel()
+            // A pending mid-stream downshift belongs to the OUTGOING episode. Left armed, it can fire
+            // during the resolve below and start a smaller source of the OLD episode under the new title.
+            rebufferWatchdogJob?.cancel()
+            _rebuffering.value = null
             stopActiveStream(removeFiles = false)
             // Capture the next-episode torrent we PRE-WARMED before clearing it, so the source pick below
             // can reuse it (its head + moov are already buffered) instead of re-ranking from scratch and

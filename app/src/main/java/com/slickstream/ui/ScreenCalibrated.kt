@@ -32,8 +32,17 @@ fun ScreenCalibrated(
     offsetY: Float,
     content: @Composable () -> Unit,
 ) {
-    // Black fills whatever the scaled-down child doesn't cover (and shows through on an offset).
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
+    // Black fills whatever the scaled-down child doesn't cover (and shows through on an offset) —
+    // but ONLY when a calibration is actually active. At identity the child covers every pixel, so
+    // the fill was a pure extra full-screen draw pass per frame on fill-rate-bound TV GPUs. This
+    // toggles just the MODIFIER (draw invalidation); the Box node itself stays unconditional, so
+    // the no-structural-wrapper rule in the kdoc above is preserved.
+    val identity = scale == 1f && offsetX == 0f && offsetY == 0f
+    Box(
+        Modifier
+            .fillMaxSize()
+            .then(if (identity) Modifier else Modifier.background(Color.Black)),
+    ) {
         Box(
             Modifier
                 .fillMaxSize()

@@ -11,7 +11,7 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
-import com.slickstream.data.torrent.TorrentCacheManager
+import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.data.torrent.TorrentEngine
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.launch
@@ -24,7 +24,7 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
     lateinit var torrentEngine: TorrentEngine
 
     @Inject
-    lateinit var torrentCache: TorrentCacheManager
+    lateinit var torrentStreamer: TorrentStreamer
 
     /** True on RAM-starved TV boxes (the common cheap Android TV) — used to shrink the image cache so a
      *  long session with big backdrops + multi-GB torrents doesn't get OOM-killed mid-playback. */
@@ -58,6 +58,10 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
             .crossfade(true)
+            // Half the bitmap memory on RAM-starved boxes: TMDB art is opaque JPEG, so RGB_565 is
+            // visually free at 10 feet and doubles how many posters the small cache can hold —
+            // less GC churn and fewer re-decodes during D-pad row flings.
+            .allowRgb565(lowRam)
             .memoryCache { MemoryCache.Builder(this).maxSizePercent(if (lowRam) 0.10 else 0.20).build() }
             .diskCache {
                 DiskCache.Builder()
@@ -82,6 +86,10 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
         } else {
             2L * 1024 * 1024 * 1024   // low: trim toward ~2 GB
         }
-        runCatching { torrentCache.enforceBudget(maxBytes = budget) }
+        // Via the streamer, which knows which hashes are actively streaming/warmed (protected) and
+        // runs the eviction off-main. The old direct enforceBudget(maxBytes=…) call resolved to the
+        // isActive-filtered overload — paused-in-session torrents were all excluded, so it freed
+        // nothing — and walked the multi-GB cache tree on the main thread.
+        runCatching { torrentStreamer.onMemoryPressure(budget) }
     }
 }

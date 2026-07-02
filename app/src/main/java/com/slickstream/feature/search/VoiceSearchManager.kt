@@ -164,9 +164,14 @@ class VoiceSearchManager @Inject constructor(
     }
 
     override fun onRmsChanged(rmsdB: Float) {
-        // Smooth a little so the UI ring doesn't jitter.
+        // Smooth a little so the UI ring doesn't jitter, and only emit on a VISIBLE change —
+        // recognizers fire this at 10-50Hz, and each emission recomposes whatever collects the
+        // state. Sub-0.5dB steps are invisible on the pulse ring anyway.
         val prev = _state.value.rmsDb
-        _state.value = _state.value.copy(rmsDb = prev * 0.6f + rmsdB * 0.4f)
+        val next = prev * 0.6f + rmsdB * 0.4f
+        if (kotlin.math.abs(next - prev) >= 0.5f) {
+            _state.value = _state.value.copy(rmsDb = next)
+        }
     }
 
     override fun onBufferReceived(buffer: ByteArray?) = Unit

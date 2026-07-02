@@ -1,6 +1,7 @@
 package com.slickstream.data.settings
 
 import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
@@ -211,21 +212,30 @@ class SettingsRepository @Inject constructor(
 
     suspend fun current(): AppSettings = settings.first()
 
-    suspend fun setWifiQuality(q: QualityPreference) = dataStore.edit { it[KEY_WIFI] = q.name }
-    suspend fun setCellularQuality(q: QualityPreference) = dataStore.edit { it[KEY_CELL] = q.name }
-    suspend fun setDensity(d: UiDensity) = dataStore.edit { it[KEY_DENSITY] = d.name }
-    suspend fun setSubtitlesEnabled(enabled: Boolean) = dataStore.edit { it[KEY_SUBS_ON] = enabled }
-    suspend fun setSubtitleLanguage(lang: SubtitleLanguage) = dataStore.edit { it[KEY_SUB_LANG] = lang.name }
-    suspend fun setSubtitleSize(size: SubtitleSize) = dataStore.edit { it[KEY_SUB_SIZE] = size.name }
-    suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name }
-    suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name }
+    // Every SYNCED-field setter stamps the LWW clock at write time (not just at push time): a change
+    // made while signed out — or lost in the push debounce window when the app dies — otherwise keeps
+    // a stale syncedUpdatedAt, and the next sign-in lets an OLDER remote doc overwrite the newer local
+    // value. Device-local settings (cache size, calibration) deliberately don't stamp.
+    suspend fun setWifiQuality(q: QualityPreference) = dataStore.edit { it[KEY_WIFI] = q.name; it.stampSynced() }
+    suspend fun setCellularQuality(q: QualityPreference) = dataStore.edit { it[KEY_CELL] = q.name; it.stampSynced() }
+    suspend fun setDensity(d: UiDensity) = dataStore.edit { it[KEY_DENSITY] = d.name; it.stampSynced() }
+    suspend fun setSubtitlesEnabled(enabled: Boolean) = dataStore.edit { it[KEY_SUBS_ON] = enabled; it.stampSynced() }
+    suspend fun setSubtitleLanguage(lang: SubtitleLanguage) = dataStore.edit { it[KEY_SUB_LANG] = lang.name; it.stampSynced() }
+    suspend fun setSubtitleSize(size: SubtitleSize) = dataStore.edit { it[KEY_SUB_SIZE] = size.name; it.stampSynced() }
+    suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name; it.stampSynced() }
+    suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name; it.stampSynced() }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
     suspend fun setCustomSourceUrl(url: String) = dataStore.edit {
         it[KEY_CUSTOM_SOURCE] = url.trim()
-        it[KEY_SYNC_UPDATED] = System.currentTimeMillis()   // LWW clock so it propagates to other devices
+        it.stampSynced()
     }
-    suspend fun setUpNextPercent(pct: Int) = dataStore.edit { it[KEY_UP_NEXT_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX) }
-    suspend fun setMovieBarPercent(pct: Int) = dataStore.edit { it[KEY_MOVIE_BAR_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX) }
+    suspend fun setUpNextPercent(pct: Int) = dataStore.edit { it[KEY_UP_NEXT_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX); it.stampSynced() }
+    suspend fun setMovieBarPercent(pct: Int) = dataStore.edit { it[KEY_MOVIE_BAR_PCT] = pct.coerceIn(PCT_MIN, PCT_MAX); it.stampSynced() }
+
+    /** LWW clock bump for a synced-field write. */
+    private fun MutablePreferences.stampSynced() {
+        this[KEY_SYNC_UPDATED] = System.currentTimeMillis()
+    }
     suspend fun setScreenCalibration(scale: Float, offsetX: Float, offsetY: Float) = dataStore.edit {
         it[KEY_SCREEN_SCALE] = scale.coerceIn(SCALE_MIN, SCALE_MAX)
         it[KEY_SCREEN_OFF_X] = offsetX.coerceIn(OFFSET_MIN, OFFSET_MAX)

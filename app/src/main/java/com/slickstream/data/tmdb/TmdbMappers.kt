@@ -122,6 +122,9 @@ internal fun MovieDetailsDto.toDomain(): MediaDetails {
         genres = genres.map { it.toDomain() },
         cast = credits?.cast.orEmpty()
             .sortedBy { it.order ?: Int.MAX_VALUE }
+            // TMDB lists one entry PER CREDIT, so an actor with multiple roles appears twice with the
+            // same person id — which duplicates the cast rows' LazyRow keys and crashes the screen.
+            .distinctBy { it.id }
             .take(MAX_CAST)
             .map { it.toDomain() },
         seasons = emptyList(),
@@ -154,6 +157,8 @@ internal fun TvDetailsDto.toDomain(): MediaDetails {
         genres = genres.map { it.toDomain() },
         cast = credits?.cast.orEmpty()
             .sortedBy { it.order ?: Int.MAX_VALUE }
+            // Same dedupe as the movie mapper — one entry per credit means duplicate person ids.
+            .distinctBy { it.id }
             .take(MAX_CAST)
             .map { it.toDomain() },
         // Hide the "Specials" season (number 0) from the browsable list.

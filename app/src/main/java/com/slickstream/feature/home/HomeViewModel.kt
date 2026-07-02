@@ -17,6 +17,7 @@ import com.slickstream.core.repository.ProfileRepository
 import com.slickstream.data.settings.SettingsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -119,7 +120,10 @@ class HomeViewModel @Inject constructor(
             .mapLatest { favs -> resolveNewEpisodes(favs) }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    private val newEpisodeIds: Flow<Set<Int>> = newEpisodes.map { list -> list.mapTo(HashSet()) { it.media.id } }
+    // (type, id) pairs, not bare ids — movie and TV ids overlap numerically, and an id-only set could
+    // hide an unrelated MOVIE from Continue Watching because a show with the same id dropped an episode.
+    private val newEpisodeIds: Flow<Set<Pair<MediaType, Int>>> =
+        newEpisodes.map { list -> list.mapTo(HashSet()) { it.media.mediaType to it.media.id } }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val continueWatching: StateFlow<List<WatchHistoryItem>> =
@@ -127,7 +131,8 @@ class HomeViewModel @Inject constructor(
             .mapLatest { (rows, th, newIds) ->
                 // A caught-up favourite with a fresh episode lives on the "New Episodes" rail, NOT here —
                 // exclude those show ids so the same title isn't shown twice.
-                resolveContinueWatching(rows, th.first, th.second).filterNot { it.media.id in newIds }
+                resolveContinueWatching(rows, th.first, th.second)
+                    .filterNot { (it.media.mediaType to it.media.id) in newIds }
             }
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
@@ -233,20 +238,34 @@ class HomeViewModel @Inject constructor(
      */
     private suspend fun nextAiredEpisode(showId: Int, curSeason: Int, curEpisode: Int): Pair<Int, Int>? {
         val today = isoToday()
-        val curEps = (catalogRepository.getEpisodes(showId, curSeason) as? DataResult.Success)?.data ?: return null
+        // Catalog ERRORS must THROW, never collapse to null: null means "no next episode exists" and
+        // drops the show from the rail, so an offline device / TMDB hiccup was silently emptying
+        // Continue Watching (the try/catch in resolveShowRow existed for this but was dead code —
+        // DataResult.Error never throws on its own).
+        val curEps = catalogRepository.getEpisodes(showId, curSeason).successOrThrow()
         curEps.firstOrNull { it.episodeNumber == curEpisode + 1 }?.let { next ->
             return if (next.hasAired(today)) curSeason to next.episodeNumber else null
         }
-        val details = (catalogRepository.getDetails(showId, MediaType.TV) as? DataResult.Success)?.data ?: return null
+        val details = catalogRepository.getDetails(showId, MediaType.TV).successOrThrow()
         val nextSeason = details.seasons.map { it.seasonNumber }.filter { it > curSeason && it >= 1 }.minOrNull()
             ?: return null
-        val nextEps = (catalogRepository.getEpisodes(showId, nextSeason) as? DataResult.Success)?.data ?: return null
+        val nextEps = catalogRepository.getEpisodes(showId, nextSeason).successOrThrow()
         val ep1 = nextEps.firstOrNull { it.episodeNumber == 1 } ?: return null
         return if (ep1.hasAired(today)) nextSeason to ep1.episodeNumber else null
     }
 
+    private fun <T> DataResult<T>.successOrThrow(): T = when (this) {
+        is DataResult.Success -> data
+        is DataResult.Error -> throw IllegalStateException(message)
+    }
+
     /** Whether the active profile is a kids profile — branches Home between default and kid rows. */
     private var kidsMode: Boolean = false
+
+    /** The in-flight load. Each load() cancels the previous one: publish() is last-writer-wins, so a
+     *  slow default load finishing AFTER a kids-profile switch would otherwise put adult rows on the
+     *  kids profile (profile startup routinely emits null -> profile, making two loads back-to-back). */
+    private var loadJob: Job? = null
 
     init {
         // Keep the continue-watching + new-episodes rows in sync with the library + settings at all times
@@ -274,10 +293,11 @@ class HomeViewModel @Inject constructor(
     fun refresh() = load(isRefresh = true)
 
     private fun load(isRefresh: Boolean = false) {
-        if (kidsMode) loadKids(isRefresh) else loadDefault(isRefresh)
+        loadJob?.cancel()
+        loadJob = if (kidsMode) loadKids(isRefresh) else loadDefault(isRefresh)
     }
 
-    private fun loadDefault(isRefresh: Boolean) {
+    private fun loadDefault(isRefresh: Boolean): Job =
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 isLoading = !isRefresh,
@@ -319,14 +339,13 @@ class HomeViewModel @Inject constructor(
 
             publish(rows, featured, firstError(trending, popularMovies, popularTv, topRated, upcoming), isRefresh)
         }
-    }
 
     /**
      * Kid-focused Home: family/animation movie + kids/family TV rows from the genre discover
      * endpoint (which already sends include_adult=false). The hero comes from the first non-empty
      * kid row so the banner is also family-safe.
      */
-    private fun loadKids(isRefresh: Boolean) {
+    private fun loadKids(isRefresh: Boolean): Job =
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 isLoading = !isRefresh,
@@ -358,7 +377,6 @@ class HomeViewModel @Inject constructor(
 
             publish(rows, featured, firstError(familyMovies, animation, kidsTv, familyTv), isRefresh)
         }
-    }
 
     /**
      * "Because You Watched" — a personalized rail from the ACTIVE profile's own history + favourites.
@@ -378,7 +396,10 @@ class HomeViewModel @Inject constructor(
             .groupingBy { it }.eachCount()
             .maxByOrNull { it.value }?.key ?: return null
         val items = (catalogRepository.getByGenre(type, topGenre) as? DataResult.Success)?.data ?: return null
-        val seen = watched.mapTo(HashSet()) { it.id }
+        // Only ids of the SAME type count as "seen" — the genre results are single-type, and a mixed
+        // id set wrongly excluded fresh titles that merely shared an id with a watched item of the
+        // other type (enough of those pushes fresh below 4 and suppresses the whole rail).
+        val seen = watched.asSequence().filter { it.mediaType == type }.mapTo(HashSet()) { it.id }
         val fresh = items.filterNot { it.id in seen }
         if (fresh.size < 4) return null
         val title = GENRE_NAMES[topGenre]?.let { "More $it" } ?: "Because You Watched"

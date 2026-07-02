@@ -116,6 +116,10 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    // Installs the baseline profiles bundled in Compose/Media3/etc. at first launch. This app is
+    // SIDELOADED (in-app updater, no Play Store), so without this every install runs fully JIT-cold
+    // until ART re-profiles from scratch — visibly janky first sessions on weak TV boxes.
+    implementation(libs.androidx.profileinstaller)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)

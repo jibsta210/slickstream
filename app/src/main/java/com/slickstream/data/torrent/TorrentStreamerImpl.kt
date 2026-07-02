@@ -298,7 +298,21 @@ class TorrentStreamerImpl @Inject constructor(
     override fun cachedTorrents(): List<String> = cache.cachedTorrents()
 
     override suspend fun clearCache() = withContext(Dispatchers.IO) {
-        cache.clearCache()
+        // Never delete files out from under an active stream — its live handle would keep claiming
+        // pieces exist and the HTTP server would serve zeros from a recreated sparse file.
+        cache.clearCache(protectedHashes = streamingHashes.toSet())
+    }
+
+    override fun onMemoryPressure(maxBytes: Long) {
+        // Fire-and-forget onto IO: onTrimMemory arrives on the main thread, and enforceBudget walks
+        // the whole multi-GB cache tree + removes torrents from the native session — an ANR if run
+        // inline. Uses the SET overload (the single-hash one filtered on engine.isActive(), which
+        // excludes every paused-in-session torrent and made pressure eviction a no-op).
+        scope.launch {
+            runCatching {
+                cache.enforceBudget(streamingHashes + setOfNotNull(warmedHash), maxBytes = maxBytes)
+            }
+        }
     }
 
     override fun cacheSizeBytes(): Long = cache.cacheSizeBytes()

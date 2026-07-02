@@ -31,9 +31,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -42,6 +42,7 @@ import coil.compose.AsyncImagePainter
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import androidx.compose.ui.platform.LocalContext
+import com.slickstream.core.common.Img
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.ui.theme.Brand
@@ -63,7 +64,9 @@ fun PosterCard(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val scale by animateFloatAsState(
+    // Not delegated: read inside graphicsLayer's lambda so each spring frame is a draw-phase
+    // update — the old Modifier.scale(read-in-composition) recomposed the whole card per frame.
+    val scale = animateFloatAsState(
         targetValue = if (pressed) 0.96f else 1f,
         animationSpec = spring(),
         label = "poster-scale",
@@ -72,7 +75,10 @@ fun PosterCard(
     Box(
         modifier = modifier
             .width(132.dp)
-            .scale(scale)
+            .graphicsLayer {
+                scaleX = scale.value
+                scaleY = scale.value
+            }
             .clip(PosterShape)
             .background(Brand.Surface)
             .clickable(
@@ -94,17 +100,20 @@ fun PosterCard(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // Bottom scrim so a progress bar / future captions stay legible over art.
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            0.7f to Color.Transparent,
-                            1f to Color(0xAA000000),
+            // Bottom scrim ONLY when a badge / progress bar actually sits on it (pure overdraw
+            // otherwise — the TV card already gates it this way).
+            if (item.voteAverage > 0.0 || (progress != null && progress > 0f)) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                0.7f to Color.Transparent,
+                                1f to Color(0xAA000000),
+                            ),
                         ),
-                    ),
-            )
+                )
+            }
 
             if (item.voteAverage > 0.0) {
                 RatingBadge(
@@ -140,7 +149,8 @@ fun BackdropCard(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    val scale by animateFloatAsState(
+    // Draw-phase scale — see PosterCard.
+    val scale = animateFloatAsState(
         targetValue = if (pressed) 0.97f else 1f,
         animationSpec = spring(),
         label = "backdrop-scale",
@@ -149,7 +159,10 @@ fun BackdropCard(
     Box(
         modifier = modifier
             .width(232.dp)
-            .scale(scale)
+            .graphicsLayer {
+                scaleX = scale.value
+                scaleY = scale.value
+            }
             .clip(BackdropShape)
             .background(Brand.Surface)
             .clickable(
@@ -163,7 +176,8 @@ fun BackdropCard(
                 .aspectRatio(16f / 9f),
         ) {
             MediaImage(
-                url = item.backdropUrl ?: item.posterUrl,
+                // w780 card variant — this ~232dp tile doesn't need the hero-sized w1280 download.
+                url = Img.cardBackdrop(item.backdropUrl) ?: item.posterUrl,
                 contentDescription = item.title,
                 fallbackTitle = item.title,
                 mediaType = item.mediaType,
@@ -229,17 +243,20 @@ private fun MediaImage(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val painter = rememberAsyncImagePainter(
-        model = ImageRequest.Builder(context)
+    // Remembered so recompositions (press scale used to trigger these every frame) don't rebuild
+    // the request. No crossfade: the alpha gate below already snaps shimmer -> image, and the two
+    // together were a redundant double fade compositing every card in a freshly-loaded row.
+    val request = remember(url, wide) {
+        ImageRequest.Builder(context)
             .data(url)
             // Cap the decode resolution to roughly the tile's footprint so we don't
             // decode full-res TMDB bitmaps for small cards (the source of scroll jank).
             .apply {
                 if (wide) size(480, 270) else size(360, 540)
             }
-            .crossfade(true)
-            .build(),
-    )
+            .build()
+    }
+    val painter = rememberAsyncImagePainter(model = request)
     // painter.state is backed by a MutableState, so reading it here is recomposition-safe.
     val state = painter.state
 

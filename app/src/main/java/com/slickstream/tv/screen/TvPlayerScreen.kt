@@ -125,7 +125,11 @@ fun TvPlayerScreen(
     viewModel: PlayerViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
-    val player by viewModel.player.collectAsStateWithLifecycle()
+    // currentPlayer, NOT player: `player` is the ExoPlayer-ONLY flow, which goes null on the libVLC
+    // fallback — the TV surface then got view.player = null (audio with a black screen) and the
+    // `player is VlcPlayer` shutter check below could never be true. The phone screen already
+    // collects currentPlayer; this brings TV in line.
+    val player by viewModel.currentPlayer.collectAsStateWithLifecycle()
     val sources by viewModel.sources.collectAsStateWithLifecycle()
     val currentSource by viewModel.currentSource.collectAsStateWithLifecycle()
     val title by viewModel.title.collectAsStateWithLifecycle()
@@ -186,7 +190,9 @@ fun TvPlayerScreen(
     // Keep the TV awake while actively playing or loading (the screensaver was kicking in mid-playback
     // because nothing held the screen on). A paused/idle player lets the screen sleep normally.
     com.slickstream.feature.player.KeepScreenOn(
-        enabled = isPlaying || uiState is PlayerUiState.Buffering,
+        // rebuffering covers the mid-playback stall: uiState stays Playing but isPlaying goes false
+        // while ExoPlayer re-buffers, which used to drop the flag and let the screensaver start.
+        enabled = isPlaying || uiState is PlayerUiState.Buffering || rebuffering != null,
     )
 
     val anyPanelOpen = panelOpen || subsPanelOpen || audioPanelOpen || episodesPanelOpen
@@ -225,8 +231,15 @@ fun TvPlayerScreen(
             onBack()   // finished the available series and picked nothing → back to the UI
         }
     }
+    // Retry past the slide-in animation, same as the up-next card below — a single requestFocus can
+    // fire before the bar's first tile is attached, leaving OK presses dead while the countdown runs.
     LaunchedEffect(showSimilarBar) {
-        if (showSimilarBar) runCatching { movieBarFocus.requestFocus() }
+        if (showSimilarBar) {
+            repeat(12) {
+                kotlinx.coroutines.delay(50)
+                if (runCatching { movieBarFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            }
+        }
     }
 
     // Poll position ~1/s to learn when we've crossed UP_NEXT_PCT. Movies / no-next never qualify.
@@ -326,7 +339,9 @@ fun TvPlayerScreen(
                 when (event.key) {
                     Key.MediaPlay -> { p?.let { it.playWhenReady = true }; controlsVisible = true; true }
                     Key.MediaPause -> { p?.let { it.playWhenReady = false }; controlsVisible = true; true }
-                    Key.MediaPlayPause -> { p?.let { it.playWhenReady = !it.isPlaying }; controlsVisible = true; true }
+                    // Toggle playWhenReady (the INTENT), not isPlaying: during a rebuffer isPlaying is
+                    // false while playWhenReady is true, so !isPlaying was a no-op — couldn't pause a stall.
+                    Key.MediaPlayPause -> { p?.let { it.playWhenReady = !it.playWhenReady }; controlsVisible = true; true }
                     Key.MediaFastForward -> { p?.let { it.seekTo(it.currentPosition + 10_000) }; controlsVisible = true; true }
                     Key.MediaRewind -> { p?.let { it.seekTo((it.currentPosition - 10_000).coerceAtLeast(0)) }; controlsVisible = true; true }
                     Key.MediaStop -> { onBack(); true }
@@ -436,7 +451,8 @@ fun TvPlayerScreen(
                     onScrubbingChange = { scrubbing = it },
                     playPauseFocus = playPauseFocus,
                     onPlayPause = {
-                        player?.let { it.playWhenReady = !it.isPlaying }
+                        // playWhenReady, not isPlaying — see the MediaPlayPause key handler above.
+                        player?.let { it.playWhenReady = !it.playWhenReady }
                         controlsVisible = true
                     },
                     onSeekBack = {

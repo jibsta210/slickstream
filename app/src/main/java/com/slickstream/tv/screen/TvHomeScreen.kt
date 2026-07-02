@@ -23,6 +23,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
@@ -50,6 +51,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Scale
 import com.slickstream.core.model.MediaItem
+import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.feature.home.HomeUiState
 import com.slickstream.feature.home.HomeViewModel
@@ -103,14 +105,20 @@ private fun HomeContent(
     val carouselItems: List<MediaItem> = remember(state.rows, state.featured) {
         state.rows.firstOrNull { it.title == "Trending" }?.items
             ?.filter { !it.backdropUrl.isNullOrBlank() }
-            ?.take(8)
+            // 4, not 8: hero bitmaps are the biggest images in the app, and 8 of them cycling
+            // through the low-RAM box's small memory cache evicted the row posters (and each
+            // other) — posters re-decoded every time you scrolled back up.
+            ?.take(4)
             ?: listOfNotNull(state.featured)
     }
     // continueWatching is already RESOLVED in HomeViewModel (a finished episode points at the next aired
     // one at 0%; a finished/last episode is gone), so read progress directly — the tile, its bar, and the
     // play action all agree.
-    val progressByMediaId: Map<Int, Float> = remember(state.continueWatching) {
-        state.continueWatching.associate { it.media.id to it.progress.percent }
+    // Keyed by (type, id), NOT bare id: TMDB movie and TV ids are separate namespaces that overlap
+    // numerically, and rawHistory dedupes by (id, type) — so a movie and a show with the same id can
+    // both be on the rail. An id-only map silently drops one and cross-wires resume/progress.
+    val progressByMediaId: Map<Pair<MediaType, Int>, Float> = remember(state.continueWatching) {
+        state.continueWatching.associate { (it.media.mediaType to it.media.id) to it.progress.percent }
     }
     val continueItems: List<MediaItem> = remember(state.continueWatching) {
         // Surface the specific episode on the tile (e.g. "Game of Thrones · S1E3") instead of just the
@@ -126,11 +134,11 @@ private fun HomeContent(
     // season/episode (history is one row per show), or the player resolves the show with no episode
     // and finds no sources — the "Continue Watching breaks for TV shows" bug. The list is deduped to
     // one row per show, so a media.id lookup is unambiguous.
-    val historyByMediaId: Map<Int, WatchHistoryItem> = remember(state.continueWatching) {
-        state.continueWatching.associateBy { it.media.id }
+    val historyByMediaId: Map<Pair<MediaType, Int>, WatchHistoryItem> = remember(state.continueWatching) {
+        state.continueWatching.associateBy { it.media.mediaType to it.media.id }
     }
     val onContinueClick: (MediaItem) -> Unit = remember(historyByMediaId, onResume) {
-        { item -> historyByMediaId[item.id]?.let(onResume) }
+        { item -> historyByMediaId[item.mediaType to item.id]?.let(onResume) }
     }
 
     // "New Episodes": favourites you're caught up on that just dropped a fresh episode. progress already
@@ -142,11 +150,11 @@ private fun HomeContent(
             if (s != null && e != null) h.media.copy(title = "${h.media.title} · New S${s}E$e") else h.media
         }
     }
-    val newEpisodeById: Map<Int, WatchHistoryItem> = remember(state.newEpisodes) {
-        state.newEpisodes.associateBy { it.media.id }
+    val newEpisodeById: Map<Pair<MediaType, Int>, WatchHistoryItem> = remember(state.newEpisodes) {
+        state.newEpisodes.associateBy { it.media.mediaType to it.media.id }
     }
     val onNewEpisodeClick: (MediaItem) -> Unit = remember(newEpisodeById, onResume) {
-        { item -> newEpisodeById[item.id]?.let(onResume) }
+        { item -> newEpisodeById[item.mediaType to item.id]?.let(onResume) }
     }
 
     // The hero Play button keeps a focus requester so D-pad RIGHT from the nav rail lands on it, but we
@@ -190,12 +198,18 @@ private fun HomeContent(
                     items = continueItems,
                     onItemClick = onContinueClick,
                     wide = true,
-                    progressFor = { progressByMediaId[it.id] },
+                    progressFor = { progressByMediaId[it.mediaType to it.id] },
                 )
             }
         }
 
-        itemsIndexed(state.rows, key = { _, row -> row.title }) { _, row: MediaRowUi ->
+        itemsIndexed(
+            state.rows,
+            key = { _, row -> row.title },
+            // All catalog rows share one shape — declare it so LazyColumn reuses row nodes when
+            // scrolling instead of composing each row from scratch.
+            contentType = { _, _ -> "media-row" },
+        ) { _, row: MediaRowUi ->
             TvMediaRow(
                 title = row.title,
                 items = row.items,
@@ -260,6 +274,10 @@ internal fun FeaturedCarousel(
     Carousel(
         itemCount = items.size,
         carouselState = carouselState,
+        // Default 5s auto-advance decoded a fresh ~1MB hero + ran a full-width crossfade while the
+        // user browses rows below — periodic jank spikes on an idle Home. 15s keeps it alive
+        // without the constant churn.
+        autoScrollDurationMillis = 15_000,
         modifier = Modifier
             .fillMaxWidth()
             .height(420.dp)
@@ -292,37 +310,45 @@ private fun FeaturedSlide(
             .fillMaxSize()
             .background(Brand.Surface, RoundedCornerShape(20.dp)),
     ) {
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
+        val context = LocalContext.current
+        // Remembered so the slide's recompositions don't rebuild the request, and capped at
+        // 960x540 — the hero sits under a heavy scrim at 10 feet, so 720p-class decode is
+        // invisible while costing ~half the bitmap memory of the old 1280x720.
+        val heroRequest = remember(item.backdropUrl, item.posterUrl) {
+            ImageRequest.Builder(context)
                 .data(item.backdropUrl ?: item.posterUrl)
-                .size(1280, 720) // hard decode ceiling so a 4K panel doesn't decode at 2x
+                .size(960, 540)
                 .scale(Scale.FILL)
-                .build(),
+                .build()
+        }
+        AsyncImage(
+            model = heroRequest,
             contentDescription = item.title,
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize(),
         )
-        // Left-to-right + bottom scrim so text sits on a readable surface.
+        // Left-to-right + bottom scrim so text sits on a readable surface. ONE draw node painting
+        // both gradients (was two stacked full-slide Boxes = an extra full-area composite layer).
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
+                .drawWithCache {
+                    val horizontal = Brush.horizontalGradient(
                         0f to Color(0xF20B0B0F),
                         0.55f to Color(0x880B0B0F),
                         1f to Color.Transparent,
-                    ),
-                ),
-        )
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
+                        endX = size.width,
+                    )
+                    val vertical = Brush.verticalGradient(
                         0.55f to Color.Transparent,
                         1f to Color(0xCC0B0B0F),
-                    ),
-                ),
+                        endY = size.height,
+                    )
+                    onDrawBehind {
+                        drawRect(horizontal)
+                        drawRect(vertical)
+                    }
+                },
         )
 
         Column(

@@ -5,10 +5,12 @@ import com.google.firebase.firestore.ListenerRegistration
 import com.slickstream.core.repository.LibraryRepository
 import com.slickstream.core.repository.ProfileRepository
 import com.slickstream.data.settings.SettingsRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
 import com.slickstream.data.local.entity.ProfileEntity
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
@@ -59,9 +61,15 @@ class LibrarySyncCoordinator @Inject constructor(
         if (running || !sync.isAvailable || sync.uid() == null) return
         running = true
         jobs += scope.launch {
-            runCatching { syncProfiles() }.onFailure { Log.w(TAG, "profile sync failed", it) }
-            runCatching { syncSettings() }.onFailure { Log.w(TAG, "settings sync failed", it) }
-            runCatching { initialMerge() }.onFailure { Log.w(TAG, "initial sync failed", it) }
+            // Rethrow cancellation out of each stage: stop() (sign-out) cancels THIS job, but a bare
+            // runCatching swallowed the CancellationException mid-suspend and the zombie coroutine
+            // then re-registered listeners + relaunched pushes on the still-live scope AFTER stop()
+            // had cleared them — a leaked Firestore listener per sign-in/out cycle.
+            runCatching { syncProfiles() }.onFailure { if (it is CancellationException) throw it; Log.w(TAG, "profile sync failed", it) }
+            runCatching { syncSettings() }.onFailure { if (it is CancellationException) throw it; Log.w(TAG, "settings sync failed", it) }
+            runCatching { initialMerge() }.onFailure { if (it is CancellationException) throw it; Log.w(TAG, "initial sync failed", it) }
+            // Belt-and-braces for cancellation swallowed deeper down (FirebaseSync wraps its awaits).
+            if (!running || !isActive) return@launch
             startFavoritePush()
             startHistoryPush()
             favListener = sync.listenFavorites { pid, item ->
@@ -86,6 +94,7 @@ class LibrarySyncCoordinator @Inject constructor(
         reconcileDuplicateProfiles()
         profiles.allProfiles().forEach { sync.pushProfileNow(it) }
         lastProfileSigs = profiles.allProfiles().associate { it.id to it.updatedAt }
+        if (!running) return   // signed out mid-sync — don't register pushes/listeners stop() can't see
         startProfilePush()
         profileListener = sync.listenProfiles { p ->
             scope.launch {
@@ -157,6 +166,7 @@ class LibrarySyncCoordinator @Inject constructor(
         } else {
             pushSettingsNow()
         }
+        if (!running) return   // signed out mid-sync — same guard as syncProfiles
         startSettingsPush()
         settingsListener = sync.listenSettings { remoteMap ->
             scope.launch {

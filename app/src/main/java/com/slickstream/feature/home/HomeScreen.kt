@@ -25,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.slickstream.core.model.MediaItem
+import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.ui.components.ErrorRetry
 import com.slickstream.ui.components.HeroBanner
@@ -95,11 +96,13 @@ private fun HomeContent(
     // continueWatching change (mirrors TvHomeScreen) so scrolling doesn't rebuild these maps.
     // continueWatching is already RESOLVED in HomeViewModel (a finished episode points at the next aired
     // one at 0%; a finished/last episode is gone), so read progress directly.
-    val progressByMediaId: Map<Int, Float> = remember(state.continueWatching) {
-        state.continueWatching.associate { it.media.id to it.progress.percent }
+    // Keyed by (type, id), NOT bare id: TMDB movie and TV ids overlap numerically, and the rail can
+    // hold a movie and a show with the same id — an id-only map cross-wires their resume/progress.
+    val progressByMediaId: Map<Pair<MediaType, Int>, Float> = remember(state.continueWatching) {
+        state.continueWatching.associate { (it.media.mediaType to it.media.id) to it.progress.percent }
     }
-    val historyByMediaId: Map<Int, WatchHistoryItem> = remember(state.continueWatching) {
-        state.continueWatching.associateBy { it.media.id }
+    val historyByMediaId: Map<Pair<MediaType, Int>, WatchHistoryItem> = remember(state.continueWatching) {
+        state.continueWatching.associateBy { it.media.mediaType to it.media.id }
     }
     val continueItems: List<MediaItem> = remember(state.continueWatching) {
         // Show the specific episode on the tile (e.g. "Game of Thrones · S1E3"), not just the show
@@ -113,10 +116,10 @@ private fun HomeContent(
 
     // Stable lambdas so MediaRow stays skippable across recompositions (e.g. while scrolling).
     val onContinueClick: (MediaItem) -> Unit = remember(historyByMediaId, onResumeClick) {
-        { item -> historyByMediaId[item.id]?.let(onResumeClick) }
+        { item -> historyByMediaId[item.mediaType to item.id]?.let(onResumeClick) }
     }
     val continueProgressFor: (MediaItem) -> Float? = remember(progressByMediaId) {
-        { item -> progressByMediaId[item.id] }
+        { item -> progressByMediaId[item.mediaType to item.id] }
     }
 
     // "New Episodes": favourites you're caught up on that just got a fresh episode. progress already
@@ -128,11 +131,11 @@ private fun HomeContent(
             if (s != null && e != null) h.media.copy(title = "${h.media.title} · New S${s}E$e") else h.media
         }
     }
-    val newEpisodeById: Map<Int, WatchHistoryItem> = remember(state.newEpisodes) {
-        state.newEpisodes.associateBy { it.media.id }
+    val newEpisodeById: Map<Pair<MediaType, Int>, WatchHistoryItem> = remember(state.newEpisodes) {
+        state.newEpisodes.associateBy { it.media.mediaType to it.media.id }
     }
     val onNewEpisodeClick: (MediaItem) -> Unit = remember(newEpisodeById, onResumeClick) {
-        { item -> newEpisodeById[item.id]?.let(onResumeClick) }
+        { item -> newEpisodeById[item.mediaType to item.id]?.let(onResumeClick) }
     }
 
     LazyColumn(

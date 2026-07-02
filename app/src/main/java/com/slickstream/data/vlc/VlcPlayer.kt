@@ -9,6 +9,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
 import androidx.media3.common.VideoSize
@@ -58,6 +59,7 @@ class VlcPlayer(
     private var playbackStateField: @Player.State Int = Player.STATE_IDLE
     private var videoSize: VideoSize = VideoSize.UNKNOWN
     private var isLoadingField: Boolean = false
+    private var playerErrorField: PlaybackException? = null
 
     /** Position (ms) to apply once playback actually starts, or -1 if none. */
     private var pendingSeekMs: Long = -1L
@@ -127,6 +129,15 @@ class VlcPlayer(
             MediaPlayer.Event.EncounteredError -> {
                 Log.e(TAG, "libVLC EncounteredError for ${mediaItemField?.mediaId}")
                 isLoadingField = false
+                // Surface a real Media3 error (state must be IDLE when a playerError is set) so the
+                // owning listener's onPlayerError fires and can fail over. Swallowing it here left the
+                // player wedged in BUFFERING/READY forever with nothing watching for it.
+                playbackStateField = Player.STATE_IDLE
+                playerErrorField = PlaybackException(
+                    "libVLC playback error",
+                    null,
+                    PlaybackException.ERROR_CODE_UNSPECIFIED,
+                )
                 runCatching { mediaPlayer.stop() }
             }
 
@@ -206,6 +217,7 @@ class VlcPlayer(
                     .build()
             )
             .setPlaybackState(playbackStateField)
+            .setPlayerError(playerErrorField)
             .setPlayWhenReady(
                 playWhenReadyField,
                 Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST,
@@ -270,11 +282,13 @@ class VlcPlayer(
 
         durationMs = C.TIME_UNSET
         videoSize = VideoSize.UNKNOWN
+        playerErrorField = null   // new media -> the player is reusable after a prior error
         invalidateState()
         return Futures.immediateVoidFuture()
     }
 
     override fun handlePrepare(): ListenableFuture<*> {
+        playerErrorField = null
         if (mediaItemField != null) {
             playbackStateField = Player.STATE_BUFFERING
             isLoadingField = true

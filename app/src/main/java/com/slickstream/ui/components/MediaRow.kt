@@ -40,6 +40,7 @@ fun MediaRow(
             items(
                 items = items,
                 key = { "${it.mediaType.name}-${it.id}" },
+                contentType = { if (wide) "wide" else "poster" },
             ) { item ->
                 val progress = progressFor?.invoke(item)
                 if (wide) {

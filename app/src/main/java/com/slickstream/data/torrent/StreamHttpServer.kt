@@ -56,10 +56,13 @@ class StreamHttpServer(
         val mime = mimeOf(file.name)
         val rangeHeader = session.headers["range"]
 
-        // HEAD request: just advertise capabilities + length.
+        // HEAD request: just advertise capabilities + length. The declared length MUST be the real
+        // file length — declaring 0 made NanoHTTPD emit "Content-Length: 0", so HEAD-probing clients
+        // (cast receivers, some players) sized the resource as empty. NanoHTTPD suppresses the body
+        // for HEAD, so the empty stream is never actually sent.
         if (session.method == Method.HEAD) {
             val empty: InputStream = ByteArray(0).inputStream()
-            return newFixedLengthResponse(Response.Status.OK, mime, empty, 0L).apply {
+            return newFixedLengthResponse(Response.Status.OK, mime, empty, totalLength).apply {
                 addCommonHeaders(this, totalLength)
             }
         }

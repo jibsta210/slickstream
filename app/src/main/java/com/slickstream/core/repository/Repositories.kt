@@ -161,6 +161,13 @@ interface TorrentStreamer {
     suspend fun clearCache()
     fun cacheSizeBytes(): Long
 
+    /**
+     * System memory pressure (onTrimMemory): evict the on-disk cache down to [maxBytes] on a
+     * background thread, protecting only the currently-streaming + warmed torrents. Non-blocking —
+     * safe to call from the main thread.
+     */
+    fun onMemoryPressure(maxBytes: Long)
+
     /** Length (bytes) of the selected file for a stream, or 0 until known. */
     fun fileLength(infoHash: String): Long
 

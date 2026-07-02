@@ -298,12 +298,16 @@ class DetailsViewModel @Inject constructor(
                             episodes = result.data,
                             episodesError = null,
                         )
-                        loadEpisodeProgress(seasonNumber, result.data)
+                        // Await the progress map BEFORE picking the prewarm target — reading
+                        // _uiState.episodeProgress here raced the async DB load (the map was just
+                        // reset to empty), so the prewarm always warmed episode 1 while Play
+                        // targeted the user's actual mid-season episode cold.
+                        val progress = loadEpisodeProgress(seasonNumber, result.data)
                         // Prewarm the first not-yet-finished episode of this season so Play is fast.
                         val d = _uiState.value.details
                         if (d != null) {
                             val firstUnwatched = result.data
-                                .firstOrNull { (_uiState.value.episodeProgress[it.episodeNumber] ?: 0f) < 0.92f }
+                                .firstOrNull { (progress[it.episodeNumber] ?: 0f) < 0.92f }
                                 ?: result.data.firstOrNull()
                             warmSource(d, season = seasonNumber, episode = firstUnwatched?.episodeNumber ?: 1)
                         }
@@ -328,25 +332,24 @@ class DetailsViewModel @Inject constructor(
      * so returning to details reflects newly-watched episodes. Stale if the user has since
      * switched seasons, so the result is dropped unless the season still matches.
      */
-    private fun loadEpisodeProgress(seasonNumber: Int, episodes: List<Episode>) {
-        viewModelScope.launch {
-            val progress = buildMap {
-                for (ep in episodes) {
-                    val saved = libraryRepository.getProgress(
-                        mediaId,
-                        MediaType.TV,
-                        ep.seasonNumber,
-                        ep.episodeNumber,
-                    )
-                    if (saved != null && saved.percent > 0f) {
-                        put(ep.episodeNumber, saved.percent)
-                    }
+    private suspend fun loadEpisodeProgress(seasonNumber: Int, episodes: List<Episode>): Map<Int, Float> {
+        val progress = buildMap {
+            for (ep in episodes) {
+                val saved = libraryRepository.getProgress(
+                    mediaId,
+                    MediaType.TV,
+                    ep.seasonNumber,
+                    ep.episodeNumber,
+                )
+                if (saved != null && saved.percent > 0f) {
+                    put(ep.episodeNumber, saved.percent)
                 }
             }
-            if (_uiState.value.selectedSeasonNumber == seasonNumber) {
-                _uiState.value = _uiState.value.copy(episodeProgress = progress)
-            }
         }
+        if (_uiState.value.selectedSeasonNumber == seasonNumber) {
+            _uiState.value = _uiState.value.copy(episodeProgress = progress)
+        }
+        return progress
     }
 
     /** Add/remove the current title from favourites. */
@@ -399,7 +402,9 @@ class DetailsViewModel @Inject constructor(
     private fun refreshEpisodeProgress() {
         val season = _uiState.value.selectedSeasonNumber ?: return
         val episodes = _uiState.value.episodes
-        if (episodes.isNotEmpty()) loadEpisodeProgress(season, episodes)
+        if (episodes.isNotEmpty()) {
+            viewModelScope.launch { loadEpisodeProgress(season, episodes) }
+        }
     }
 
     /** Re-read the movie's saved row and publish its watched state. */

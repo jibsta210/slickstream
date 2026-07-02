@@ -43,12 +43,24 @@ class TorrentCacheManager @Inject constructor(
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /** infoHash -> absolute path of its selected media file. The engine only knows paths for torrents
+     *  added THIS process; without persisting them, evicting a cold cached torrent (after a restart)
+     *  could delete only its bookkeeping and orphan the multi-GB payload on disk forever. */
+    private val pathPrefs: SharedPreferences =
+        context.getSharedPreferences(PATHS_PREFS_NAME, Context.MODE_PRIVATE)
+
     private val cacheDir: File get() = engine.savePath
 
     /** Record that an info-hash was just used (resets its LRU position). */
     fun touch(infoHash: String) {
         prefs.edit().putLong(infoHash, System.currentTimeMillis()).apply()
+        // Snapshot the media-file path while the engine still knows it, for post-restart eviction.
+        engine.filePath(infoHash)?.let { pathPrefs.edit().putString(infoHash, it).apply() }
     }
+
+    /** The media file for [hash]: the live engine's path, else the persisted one from a prior run. */
+    private fun mediaFileFor(hash: String): File? =
+        (engine.filePath(hash) ?: pathPrefs.getString(hash, null))?.let { File(it) }
 
     /** Info-hashes that currently have a directory/resume entry on disk. */
     fun cachedTorrents(): List<String> {
@@ -65,31 +77,10 @@ class TorrentCacheManager @Inject constructor(
     /** Total bytes occupied by the torrents cache dir (excludes nothing — whole subtree). */
     fun cacheSizeBytes(): Long = dirSize(cacheDir)
 
-    /**
-     * Enforce the size budget. Evicts LRU torrents (never the [protectedHash]) until the
-     * cache is under [maxBytes]. Returns the number of bytes freed.
-     */
-    @Synchronized
-    fun enforceBudget(maxBytes: Long = configuredMaxBytes, protectedHash: String? = null): Long {
-        var total = cacheSizeBytes()
-        if (total <= maxBytes) return 0L
-
-        var freed = 0L
-        val candidates = cachedTorrents()
-            .filter { it != protectedHash && !engine.isActive(it) }
-            .sortedBy { lastAccess(it) } // oldest first
-
-        for (hash in candidates) {
-            if (total - freed <= maxBytes) break
-            val size = sizeOf(hash)
-            evict(hash)
-            freed += size
-            Log.i(TAG, "Evicted $hash, freed $size bytes")
-        }
-        return freed
-    }
-
-    /** As [enforceBudget] but protects a SET of info-hashes (e.g. the playing + prefetched ones). */
+    /** Enforce the size budget, protecting a SET of info-hashes (the playing + prefetched ones).
+     *  Evicts LRU-first until the cache is under [maxBytes]. Returns the number of bytes freed.
+     *  (The old single-hash overload also filtered out engine.isActive() torrents — but paused-in-
+     *  session partials all have valid handles, so it could never evict anything. Deleted.) */
     @Synchronized
     fun enforceBudget(protectedHashes: Set<String>, maxBytes: Long = configuredMaxBytes): Long {
         var total = cacheSizeBytes()
@@ -119,17 +110,32 @@ class TorrentCacheManager @Inject constructor(
      *  caller already removed it from the session (streamer.stop(removeFiles=true)), this is a no-op. */
     fun evict(hash: String) {
         runCatching { engine.stop(hash, removeFiles = true) }
-        engine.filePath(hash)?.let { runCatching { File(it).delete() } }
+        // engine.stop only deletes what the LIVE session knows; for a cold torrent from a prior run
+        // the persisted path is the only route to its payload.
+        mediaFileFor(hash)?.let { runCatching { it.delete() } }
         deleteTorrentArtifacts(hash)
         prefs.edit().remove(hash).apply()
+        pathPrefs.edit().remove(hash).apply()
     }
 
-    /** Wipe the entire torrents cache and all LRU bookkeeping. */
+    /** Wipe the torrents cache and all LRU bookkeeping. Every known torrent is first removed from
+     *  the live session (a blanket file delete under a still-valid handle leaves libtorrent claiming
+     *  pieces exist — a later re-open then serves zeros from a recreated sparse file). Hashes in
+     *  [protectedHashes] (currently streaming) are left completely untouched. */
     @Synchronized
-    fun clearCache() {
-        cacheDir.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
-        File(cacheDir, ".resume").mkdirs()
-        prefs.edit().clear().apply()
+    fun clearCache(protectedHashes: Set<String> = emptySet()) {
+        val known = cachedTorrents()
+        known.filterNot { it in protectedHashes }.forEach { runCatching { engine.stop(it, removeFiles = true) } }
+        if (protectedHashes.isEmpty()) {
+            cacheDir.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
+            File(cacheDir, ".resume").mkdirs()
+            prefs.edit().clear().apply()
+            pathPrefs.edit().clear().apply()
+        } else {
+            // Something is streaming right now — evict everything else individually and keep the
+            // stream's files + bookkeeping intact.
+            known.filterNot { it in protectedHashes }.forEach { evict(it) }
+        }
     }
 
     private fun lastAccess(hash: String): Long = prefs.getLong(hash, 0L)
@@ -143,7 +149,7 @@ class TorrentCacheManager @Inject constructor(
     /** Bytes used by a given torrent: its media file plus its resume/torrent artifacts. */
     private fun sizeOf(hash: String): Long {
         var size = 0L
-        engine.filePath(hash)?.let { size += File(it).length() }
+        mediaFileFor(hash)?.let { size += it.length() }
         val resumeDir = File(cacheDir, ".resume")
         size += File(resumeDir, "$hash.resume").length()
         size += File(resumeDir, "$hash.torrent").length()
@@ -166,6 +172,7 @@ class TorrentCacheManager @Inject constructor(
     companion object {
         private const val TAG = "TorrentCacheManager"
         private const val PREFS_NAME = "torrent_cache_lru"
+        private const val PATHS_PREFS_NAME = "torrent_cache_paths"
 
         /** Default cache budget ~4 GB. */
         const val DEFAULT_MAX_BYTES = 4L * 1024L * 1024L * 1024L

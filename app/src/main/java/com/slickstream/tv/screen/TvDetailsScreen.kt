@@ -23,6 +23,7 @@ import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.focusRequester
@@ -49,6 +50,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.size.Scale
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.hasAired
 import com.slickstream.core.model.MediaItem
@@ -118,40 +120,48 @@ private fun DetailsContent(
     val details = state.details ?: return
     val item = details.item
 
-    Box(modifier = modifier.fillMaxSize().background(Brand.Background)) {
+    // No screen-level background — TvApp's shell already fills Brand.Background.
+    Box(modifier = modifier.fillMaxSize()) {
         // Backdrop fills the top of the screen, fading into the background.
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
+        val context = LocalContext.current
+        val backdropRequest = remember(item.backdropUrl, item.posterUrl) {
+            ImageRequest.Builder(context)
                 .data(item.backdropUrl ?: item.posterUrl)
                 .size(1280, 720) // hard decode ceiling so a 4K panel doesn't decode at 2x
                 .scale(Scale.FILL)
-                .build(),
+                .build()
+        }
+        AsyncImage(
+            model = backdropRequest,
             contentDescription = item.title,
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(560.dp),
         )
+        // Both scrims in ONE draw node, bounded to the 560dp hero (the horizontal one used to be a
+        // fillMaxSize layer under the scrolling list — a full-screen composite re-blended every
+        // scroll frame for a gradient that's transparent past 60% anyway).
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(560.dp)
-                .background(
-                    Brush.verticalGradient(
+                .drawWithCache {
+                    val vertical = Brush.verticalGradient(
                         0.3f to Color.Transparent,
                         1f to Brand.Background,
-                    ),
-                ),
-        )
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
+                        endY = size.height,
+                    )
+                    val horizontal = Brush.horizontalGradient(
                         0f to Color(0xCC0B0B0F),
                         0.6f to Color.Transparent,
-                    ),
-                ),
+                        endX = size.width,
+                    )
+                    onDrawBehind {
+                        drawRect(horizontal)
+                        drawRect(vertical)
+                    }
+                },
         )
 
         LazyColumn(

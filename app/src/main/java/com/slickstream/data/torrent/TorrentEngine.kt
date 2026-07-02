@@ -280,7 +280,13 @@ class TorrentEngine @Inject constructor(
         // instead of re-resolving (a second metadata fetch on an added torrent dead-latches 60s).
         parsedHash?.let { h ->
             torrents[h]?.takeIf { it.handle?.isValid == true }?.let { existing ->
-                existing.handle?.let { applySequentialAndPriority(it, existing) }
+                existing.handle?.let { handle ->
+                    // Season pack: the SAME infoHash carries every episode, distinguished only by
+                    // fileIndex. A re-attach that skips selectFile keeps the PREVIOUS episode's file
+                    // selected — the HTTP server then serves E5's bytes under E6's title.
+                    reselectFileIfNeeded(handle, existing, preferredFileIndex)
+                    applySequentialAndPriority(handle, existing)
+                }
                 return h
             }
         }
@@ -322,21 +328,34 @@ class TorrentEngine @Inject constructor(
         // active-download slots, so its ut_metadata fetch never starts: the "spins 45 s on N seeders,
         // never buffers, fails over" stall. Unmanaging + resuming makes metadata fetch immediately, just
         // as the old fetchMagnet did implicitly.
-        runCatching {
-            handle.unsetFlags(
-                TorrentFlags.AUTO_MANAGED.or_(TorrentFlags.PAUSED).or_(TorrentFlags.UPLOAD_MODE),
-            )
-            handle.resume()
-        }.onFailure { Log.w(TAG, "force-active failed for $infoHash", it) }
+        // Serialized: another stream's cache eviction can session.remove this handle concurrently
+        // (this hash isn't in streamingHashes yet), and a handle call racing a remove is a native
+        // use-after-free SIGSEGV (see nativeLock).
+        synchronized(nativeLock) {
+            runCatching {
+                handle.unsetFlags(
+                    TorrentFlags.AUTO_MANAGED.or_(TorrentFlags.PAUSED).or_(TorrentFlags.UPLOAD_MODE),
+                )
+                handle.resume()
+            }.onFailure { Log.w(TAG, "force-active failed for $infoHash", it) }
+        }
 
         val info = awaitMetadataFromHandle(handle) ?: run {
             // Cold/dead magnet: free the session slot + map entry instead of stranding a live torrent.
             runCatching { stop(infoHash, removeFiles = true) }
             error("Timed out fetching torrent metadata")
         }
-        selectFile(handle, info, active, preferredFileIndex)
+        try {
+            selectFile(handle, info, active, preferredFileIndex)
+        } catch (t: Throwable) {
+            // No playable file (RAR/disc release): tear the torrent down like the metadata-timeout
+            // branch, or the force-resumed add keeps downloading the whole multi-GB archive (no file
+            // priorities were ever applied) long after the player failed over to another source.
+            runCatching { stop(infoHash, removeFiles = true) }
+            throw t
+        }
         applySequentialAndPriority(handle, active)
-        handle.resume()
+        synchronized(nativeLock) { runCatching { handle.resume() } }
         return infoHash
     }
 
@@ -345,7 +364,11 @@ class TorrentEngine @Inject constructor(
     private suspend fun addWithInfo(info: TorrentInfo, preferredFileIndex: Int?): String {
         val infoHash = info.infoHash().toHex().lowercase()
         torrents[infoHash]?.takeIf { it.handle?.isValid == true }?.let { existing ->
-            existing.handle?.let { applySequentialAndPriority(it, existing) }
+            existing.handle?.let { handle ->
+                // Same season-pack re-select as addMagnet's fast path.
+                reselectFileIfNeeded(handle, existing, preferredFileIndex)
+                applySequentialAndPriority(handle, existing)
+            }
             return infoHash
         }
         val active = torrents.getOrPut(infoHash) { ActiveTorrent(infoHash) }
@@ -355,9 +378,15 @@ class TorrentEngine @Inject constructor(
         session.download(info, savePath, resumeFile, null, null, TorrentFlags.AUTO_MANAGED)
         val handle = awaitHandle(infoHash) ?: error("Failed to obtain torrent handle for $infoHash")
         active.handle = handle
-        selectFile(handle, info, active, preferredFileIndex)
+        try {
+            selectFile(handle, info, active, preferredFileIndex)
+        } catch (t: Throwable) {
+            // Same cleanup as addMagnet — never strand an un-prioritized torrent downloading ALL files.
+            runCatching { stop(infoHash, removeFiles = true) }
+            throw t
+        }
         applySequentialAndPriority(handle, active)
-        handle.resume()
+        synchronized(nativeLock) { runCatching { handle.resume() } }
         return infoHash
     }
 
@@ -385,8 +414,14 @@ class TorrentEngine @Inject constructor(
         val deadline = System.currentTimeMillis() + METADATA_TIMEOUT_SECONDS * 1000L
         while (System.currentTimeMillis() < deadline) {
             if (!handle.isValid) return null
-            val hasMeta = runCatching { handle.status().hasMetadata() }.getOrDefault(false)
-            if (hasMeta) return runCatching { handle.torrentFile() }.getOrNull()
+            // Serialized like every other handle read — a concurrent eviction's session.remove
+            // racing this status() call is a native use-after-free (see nativeLock).
+            val info = synchronized(nativeLock) {
+                runCatching {
+                    if (handle.status().hasMetadata()) handle.torrentFile() else null
+                }.getOrNull()
+            }
+            if (info != null) return info
             delay(HANDLE_POLL_INTERVAL_MS)
         }
         return null
@@ -409,6 +444,23 @@ class TorrentEngine @Inject constructor(
 
     private fun findHandle(infoHash: String): TorrentHandle? =
         session.find(Sha1Hash.parseHex(infoHash))
+
+    /**
+     * Fast-path re-attach helper: if the caller asked for a DIFFERENT (valid, non-sample video) file
+     * than the one currently selected — the season-pack next-episode case — re-run [selectFile] so the
+     * piece range, path and priorities move to the requested episode. A null/invalid preferred index
+     * keeps the existing selection untouched.
+     */
+    private fun reselectFileIfNeeded(handle: TorrentHandle, active: ActiveTorrent, preferredFileIndex: Int?) {
+        if (preferredFileIndex == null || preferredFileIndex == active.fileIndex) return
+        val info = synchronized(nativeLock) { runCatching { handle.torrentFile() }.getOrNull() } ?: return
+        val files = info.files()
+        val valid = preferredFileIndex in 0 until files.numFiles() &&
+            isVideoFile(files.fileName(preferredFileIndex)) &&
+            !isSampleFile(files.fileName(preferredFileIndex))
+        if (!valid) return
+        selectFile(handle, info, active, preferredFileIndex)
+    }
 
     /** Choose the file to stream: explicit index if valid, else the largest video file. */
     private fun selectFile(
@@ -460,7 +512,7 @@ class TorrentEngine @Inject constructor(
         // piece priority and would wipe the head/tail deadlines.
         val priorities = Array(numFiles) { Priority.IGNORE }
         priorities[chosen] = Priority.DEFAULT
-        handle.prioritizeFiles(priorities)
+        synchronized(nativeLock) { handle.prioritizeFiles(priorities) }
     }
 
     private fun applySequentialAndPriority(handle: TorrentHandle, active: ActiveTorrent) {
@@ -471,7 +523,7 @@ class TorrentEngine @Inject constructor(
         // gives the in-order steady-state buffer-ahead playback relies on; the staggered head/tail
         // deadlines (prioritizeHeadAndTail) ride ON TOP to pull the first pieces + the moov/cues to the
         // front of that order.
-        runCatching {
+        synchronized(nativeLock) { runCatching {
             handle.unsetFlags(
                 TorrentFlags.UPLOAD_MODE
                     .or_(TorrentFlags.PAUSED)
@@ -489,7 +541,7 @@ class TorrentEngine @Inject constructor(
             }.isSuccess
             if (!ranged) handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
             handle.resume()
-        }.onFailure { Log.w(TAG, "set streaming flags failed", it) }
+        }.onFailure { Log.w(TAG, "set streaming flags failed", it) } }
         prioritizeHeadAndTail(active)
     }
 
@@ -860,7 +912,7 @@ class TorrentEngine @Inject constructor(
     fun resume(infoHash: String) {
         val active = torrents[infoHash] ?: return
         active.handle?.takeIf { it.isValid }?.let {
-            it.resume()
+            synchronized(nativeLock) { runCatching { it.resume() } }
             applySequentialAndPriority(it, active)
         }
     }
@@ -872,11 +924,13 @@ class TorrentEngine @Inject constructor(
      */
     fun saveResume(infoHash: String) {
         val handle = torrents[infoHash]?.handle?.takeIf { it.isValid } ?: return
-        if (!handle.status().hasMetadata()) return
-        runCatching {
-            resumeDir.mkdirs()
-            handle.saveResumeData()
-        }.onFailure { Log.w(TAG, "saveResume failed for $infoHash", it) }
+        synchronized(nativeLock) {
+            runCatching {
+                if (!handle.status().hasMetadata()) return
+                resumeDir.mkdirs()
+                handle.saveResumeData()
+            }.onFailure { Log.w(TAG, "saveResume failed for $infoHash", it) }
+        }
     }
 
     /**
