@@ -804,8 +804,19 @@ class PlayerViewModel @Inject constructor(
         if (leavingDirect) directFailoverCount++ else failoverCount++
         val pref = currentNetworkMaxTier ?: networkQualityPreference().maxTier
         val sizePref = settingsRepository.current().streamSize
-        val next = StreamPicker.pick(remaining, pref, sizePref, deviceProfile.isLowPower)
-            ?: remaining.first()
+        // Prefer another DIRECT (RD/file-server) link before dropping to a torrent — an expired/revoked
+        // RD URL mid-stream should retry the next INSTANT RD source, not silently downshift to a slow
+        // swarm (StreamPicker ranks by seeders, which directs have 0 of, so a torrent always won). Mirrors
+        // the file-server-first pickPreferred(). Falls through to the torrent health-pick only when no
+        // untried direct remains — the correct final fallback.
+        val directs = remaining.filter { it.isDirect }
+        val next = if (directs.isNotEmpty()) {
+            val cap = if (deviceProfile.isLowPower) minOf(pref, QualityPreference.FHD_1080.maxTier) else pref
+            directs.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { directs }
+                .maxByOrNull { it.rank } ?: directs.first()
+        } else {
+            StreamPicker.pick(remaining, pref, sizePref, deviceProfile.isLowPower) ?: remaining.first()
+        }
         _suggestSmaller.value = false
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
