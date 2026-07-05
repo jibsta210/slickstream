@@ -1226,12 +1226,31 @@ class PlayerViewModel @Inject constructor(
 
             override fun onPlayerError(error: PlaybackException) {
                 val p = _player.value
-                // A DIRECT link either works or it doesn't — a 403/404/redirect/dead host won't recover
-                // by re-preparing the same URL (that retry budget is for torrents whose bytes arrive
-                // late) and isn't a codec problem VLC can fix. Drop STRAIGHT to the next source (which
-                // may be a torrent) so a dead direct URL never strands the user on a spinner — the
-                // "found sources, none played, had to manually revert to torrent" bug.
                 if (_currentSource.value?.isDirect == true && !_isCasting.value) {
+                    val isIoErr = error.errorCode in 2000..2999
+                    // MID-PLAYBACK on a direct link (it already reached Playing): a transient IO blip — an
+                    // RD/CDN hiccup, a 5xx, a momentary network drop — recovers by re-preparing the SAME
+                    // url at the same position. DON'T nuke a working stream 80% in and revert to torrent
+                    // (the "played fine then suddenly switched to a torrent, and every stream reverted"
+                    // bug: one network wobble tripped every direct source's startup-style failover). Retry
+                    // a few times first; only fall over once it's genuinely dead.
+                    if (hasReachedPlaying && isIoErr && p != null && sourceErrorRetries < MAX_SOURCE_RETRIES) {
+                        sourceErrorRetries++
+                        _uiState.value = PlayerUiState.Buffering(
+                            percent = 0,
+                            seeders = 0,
+                            downloadRateBytes = 0,
+                            label = "Reconnecting…",
+                        )
+                        viewModelScope.launch {
+                            delay(SOURCE_RETRY_BACKOFF_MS * sourceErrorRetries)
+                            if (_player.value === p) runCatching { p.prepare(); p.playWhenReady = true }
+                        }
+                        return
+                    }
+                    // STARTUP failure (a dead link that never played) OR retries exhausted: a 403/404/
+                    // redirect/dead host won't recover by re-preparing, and isn't a codec VLC can fix. Drop
+                    // STRAIGHT to the next source so a dead direct URL never strands the user on a spinner.
                     viewModelScope.launch {
                         if (!failoverToNext()) {
                             _uiState.value = PlayerUiState.Error(friendlyPlaybackError(error))
