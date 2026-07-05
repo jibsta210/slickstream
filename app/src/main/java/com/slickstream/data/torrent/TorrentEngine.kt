@@ -1022,6 +1022,13 @@ class TorrentEngine @Inject constructor(
         val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
         val tailFrom = active.lastPiece - tailPieces + 1
         synchronized(nativeLock) { runCatching {
+            // Move the SEQUENTIAL-download cursor to FOLLOW the read head, so libtorrent's bulk fill
+            // proceeds FROM the current play position forward — not from the file front. Without this the
+            // cursor stayed parked at firstPiece (set once at add time): resuming/seeking to 80% deadlined
+            // the immediate pieces but the sequential fill kept pulling front pieces the user is already
+            // past ("fell back to torrent at 80% but downloaded from the front"). On a backward seek this
+            // correctly re-includes the earlier pieces. The head/tail deadlines still ride on top.
+            handle.setSequentialRange(curPiece, active.lastPiece)
             if (prev >= 0) {
                 for (p in prev until curPiece) {
                     if (p in active.firstPiece..active.lastPiece && p < tailFrom) {
