@@ -497,6 +497,12 @@ class PlayerViewModel @Inject constructor(
      */
     private fun armSustainedRebufferWatchdog() {
         if (!hasReachedPlaying) return   // startup is the failover watchdog's job, not the downshift's
+        // NEVER downshift a DIRECT (RD/file-server) stream. The downshift exists for a starved TORRENT
+        // swarm; a direct stream isn't bandwidth-limited by peers, so a rebuffer near the end is just RD
+        // serving the tail slowly — it recovers on its own. Downshifting here picked the smallest TORRENT
+        // and restarted from scratch: the "RD movie ~80% in suddenly reverts to a torrent, every RD does
+        // it" bug. A genuinely-dead RD link surfaces as onPlayerError (retried in place), not here.
+        if (_currentSource.value?.isDirect == true) return
         if (rebufferWatchdogJob?.isActive == true) return
         rebufferWatchdogJob = viewModelScope.launch {
             delay(SUSTAINED_REBUFFER_TIMEOUT_MS)
@@ -510,6 +516,9 @@ class PlayerViewModel @Inject constructor(
      *  position (selectSource saves progress first; maybeSeekToResume restores on the new player). No-op
      *  when nothing smaller qualifies — we then just keep waiting on the current source. */
     private fun failoverToSmaller() {
+        // A DIRECT source has no swarm to downshift away from, and latestStatus is null for it (so the
+        // near-complete guard below can't protect it) — never downshift a direct stream to a torrent.
+        if (_currentSource.value?.isDirect == true) return
         // NEVER downshift when the file is already (nearly) fully downloaded — the bytes are on disk, so
         // a stall is a DECODE / transient hiccup, not bandwidth. Switching to a smaller source would
         // pointlessly restart playback and re-download from scratch (the "Protector: 100% downloaded,
@@ -960,6 +969,7 @@ class PlayerViewModel @Inject constructor(
      * [suggestSmaller] hint. Fires at most once per source ([suggestedSmallerForSource]).
      */
     private fun maybeSuggestSmaller(downloadRateBytes: Int) {
+        if (_currentSource.value?.isDirect == true) return   // "try a smaller stream" is a torrent concept
         if (suggestedSmallerForSource) return
         if (bufferingSinceMs == 0L) return
         val elapsed = android.os.SystemClock.elapsedRealtime() - bufferingSinceMs
