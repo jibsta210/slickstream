@@ -11,6 +11,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.StreamSource
+import com.slickstream.core.model.StreamState
 import com.slickstream.core.repository.CatalogRepository
 import com.slickstream.core.repository.ProfileRepository
 import com.slickstream.core.repository.SourceRepository
@@ -29,6 +30,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -203,26 +205,32 @@ class DownloadManager @Inject constructor(
 
     private suspend fun downloadTorrent(d: Download, source: StreamSource) {
         var lastWrite = 0L
-        torrentStreamer.start(source).collect { status ->
-            val now = System.currentTimeMillis()
-            if (now - lastWrite > PROGRESS_WRITE_MS || status.progress >= 0.999f) {
-                lastWrite = now
-                dao.updateProgress(
-                    d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
-                    DownloadStatus.DOWNLOADING.name, status.downloadedBytes, status.totalBytes,
-                    engine.filePath(source.infoHash),
-                )
+        // first { done } CANCELS the (hot, never-completing) streamer flow the instant the file is fully
+        // downloaded — releasing workLock so the next queued item (e.g. the rest of a season) can run.
+        // A plain collect{ return@collect } would loop forever and jam the queue. A terminal ERROR
+        // throws out to kick()'s runCatching, which marks the row FAILED.
+        val finalStatus = torrentStreamer.start(source)
+            .onEach { status ->
+                if (status.state == StreamState.ERROR) {
+                    throw java.io.IOException(status.errorMessage ?: "torrent error")
+                }
+                val now = System.currentTimeMillis()
+                if (now - lastWrite > PROGRESS_WRITE_MS) {
+                    lastWrite = now
+                    dao.updateProgress(
+                        d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
+                        DownloadStatus.DOWNLOADING.name, status.downloadedBytes, status.totalBytes,
+                        engine.filePath(source.infoHash),
+                    )
+                }
             }
-            if (status.progress >= 0.999f && status.totalBytes > 0) {
-                cache.pin(source.infoHash)
-                dao.updateProgress(
-                    d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
-                    DownloadStatus.COMPLETED.name, status.totalBytes, status.totalBytes,
-                    engine.filePath(source.infoHash),
-                )
-                return@collect
-            }
-        }
+            .first { it.progress >= 0.999f && it.totalBytes > 0 }
+        cache.pin(source.infoHash)
+        dao.updateProgress(
+            d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
+            DownloadStatus.COMPLETED.name, finalStatus.totalBytes, finalStatus.totalBytes,
+            engine.filePath(source.infoHash),
+        )
     }
 
     private suspend fun downloadDirect(d: Download, source: StreamSource) {
