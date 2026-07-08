@@ -31,6 +31,11 @@ data class StreamSource(
      *  CDNs return 403 and the stream starts but never plays. Carried to the ExoPlayer/libVLC data
      *  source for direct sources; empty for torrents. */
     val requestHeaders: Map<String, String> = emptyMap(),
+    /** True when [directUrl] is a local `file://` path from a completed offline download. The player
+     *  hands it straight to ExoPlayer (no HTTP HEAD validation, no failover, no network) — the whole
+     *  point of "downloaded for the plane". Still [isDirect] (directUrl != null), so all the
+     *  direct-source guards (never-downshift, no swarm UI) apply for free. */
+    val isOffline: Boolean = false,
 ) {
     /** True for a direct HTTP/HLS source (no torrent). */
     val isDirect: Boolean get() = directUrl != null

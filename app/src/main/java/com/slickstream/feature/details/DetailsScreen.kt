@@ -24,6 +24,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -80,6 +82,7 @@ fun DetailsScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val isFavorite by viewModel.isFavorite.collectAsStateWithLifecycle()
+    val downloadState by viewModel.downloadState.collectAsStateWithLifecycle()
 
     Box(modifier = modifier.fillMaxSize().background(Brand.Background)) {
         when {
@@ -87,6 +90,9 @@ fun DetailsScreen(
                 details = state.details!!,
                 state = state,
                 isFavorite = isFavorite,
+                downloadState = downloadState,
+                onDownloadMovie = viewModel::downloadMovie,
+                onDownloadSeason = viewModel::downloadSeason,
                 onPlay = onPlay,
                 onToggleFavorite = viewModel::toggleFavorite,
                 onSelectSeason = viewModel::selectSeason,
@@ -127,6 +133,9 @@ private fun DetailsContent(
     details: MediaDetails,
     state: DetailsUiState,
     isFavorite: Boolean,
+    downloadState: com.slickstream.core.model.Download?,
+    onDownloadMovie: () -> Unit,
+    onDownloadSeason: () -> Unit,
     onPlay: OnPlay,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
@@ -197,6 +206,12 @@ private fun DetailsContent(
                     FavoriteHeart(
                         isFavorite = isFavorite,
                         onToggle = onToggleFavorite,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    DownloadAction(
+                        state = downloadState,
+                        isTv = isTv,
+                        onClick = { if (isTv) onDownloadSeason() else onDownloadMovie() },
                     )
                 }
                 // Movies: an explicit Mark watched / unwatched toggle next to Play/Favourite.
@@ -363,6 +378,36 @@ private fun BackdropHeader(details: MediaDetails) {
                     ),
                 ),
         )
+    }
+}
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun DownloadAction(
+    state: com.slickstream.core.model.Download?,
+    isTv: Boolean,
+    onClick: () -> Unit,
+) {
+    val status = state?.status
+    val icon = if (status == com.slickstream.core.model.DownloadStatus.COMPLETED) Icons.Rounded.DownloadDone else Icons.Rounded.Download
+    val tint = when (status) {
+        com.slickstream.core.model.DownloadStatus.COMPLETED -> Color(0xFF22C55E)
+        com.slickstream.core.model.DownloadStatus.DOWNLOADING, com.slickstream.core.model.DownloadStatus.QUEUED -> Brand.Cyan
+        else -> Brand.OnSurface
+    }
+    val enabled = status == null || status == com.slickstream.core.model.DownloadStatus.FAILED
+    androidx.compose.material3.IconButton(onClick = onClick, enabled = enabled) {
+        Box(contentAlignment = Alignment.Center) {
+            if (status == com.slickstream.core.model.DownloadStatus.DOWNLOADING) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    progress = { state?.progress ?: 0f },
+                    color = Brand.Cyan,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(34.dp),
+                )
+            }
+            Icon(imageVector = icon, contentDescription = if (isTv) "Download season" else "Download", tint = tint)
+        }
     }
 }
 

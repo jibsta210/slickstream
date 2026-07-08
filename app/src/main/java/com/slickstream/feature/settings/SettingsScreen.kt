@@ -122,6 +122,26 @@ fun SettingsScreen(
             Hint("Caps the quality of the source auto-picked when you hit Play, and how big a file to prefer within that quality (a 1080p episode can be 700 MB or 4 GB). You can still pick any source manually from the player's Quality sheet.")
         }
 
+        SettingsSection("Downloads") {
+            OptionGroup(
+                label = "Download quality",
+                options = QualityPreference.entries,
+                selected = settings.downloadQuality,
+                labelOf = { it.label },
+                onSelect = viewModel::setDownloadQuality,
+            )
+            Spacer(Modifier.height(16.dp))
+            OptionGroup(
+                label = "File size",
+                options = com.slickstream.data.settings.StreamSizePreference.entries,
+                selected = settings.downloadSize,
+                labelOf = { it.label },
+                onSelect = viewModel::setDownloadSize,
+            )
+            Spacer(Modifier.height(6.dp))
+            Hint("What to grab when you tap Download for offline. A whole season at 720p · Smallest is a few GB; 1080p · Best can be 40+ GB. Applies to movies and episodes.")
+        }
+
         SettingsSection("Streaming source") {
             val current = settings.customSourceUrl
             if (current.isNotBlank()) {

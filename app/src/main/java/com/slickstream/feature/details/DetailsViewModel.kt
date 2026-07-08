@@ -70,8 +70,32 @@ class DetailsViewModel @Inject constructor(
     private val torrentStreamer: TorrentStreamer,
     private val settingsRepository: SettingsRepository,
     private val deviceProfile: DeviceProfile,
+    private val downloadManager: com.slickstream.data.download.DownloadManager,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
+
+    /** This movie's download state (Downloaded / Downloading % / null). TV downloads are per-episode/
+     *  season, shown on the Downloads screen. */
+    val downloadState: StateFlow<com.slickstream.core.model.Download?> =
+        downloadManager.observe(
+            savedStateHandle.get<String>(NavArg.MEDIA_ID)?.toIntOrNull()
+                ?: savedStateHandle.get<Int>(NavArg.MEDIA_ID) ?: -1,
+            MediaType.fromName(savedStateHandle.get<String>(NavArg.MEDIA_TYPE)),
+            null, null,
+        ).stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Download this MOVIE at the user's download quality/size. */
+    fun downloadMovie() {
+        val item = _uiState.value.details?.item ?: return
+        if (item.mediaType == MediaType.MOVIE) downloadManager.download(item)
+    }
+
+    /** Download every aired episode of the currently-selected season. */
+    fun downloadSeason() {
+        val item = _uiState.value.details?.item ?: return
+        val season = _uiState.value.selectedSeasonNumber ?: return
+        downloadManager.downloadSeason(item, season)
+    }
 
     /** Single-flight prewarm job — cancelled+replaced on season switch so it can't stack. */
     private var warmJob: Job? = null

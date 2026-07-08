@@ -269,6 +269,7 @@ fun PhoneApp() {
                 ProfileScreen(
                     onSignIn = onSignIn,
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
+                    onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) { launchSingleTop = true } },
                     onSwitchProfile = { navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true } },
                     onBack = {
                         if (!navController.popBackStack()) {
@@ -299,6 +300,14 @@ fun PhoneApp() {
 
             composable(Routes.SETTINGS) {
                 SettingsScreen(onBack = { navController.popBackStack() })
+            }
+            composable(Routes.DOWNLOADS) {
+                com.slickstream.feature.downloads.DownloadsScreen(
+                    onBack = { navController.popBackStack() },
+                    onPlay = { type, id, season, episode ->
+                        navController.navigate(Routes.player(type, id, season, episode))
+                    },
+                )
             }
 
             composable(

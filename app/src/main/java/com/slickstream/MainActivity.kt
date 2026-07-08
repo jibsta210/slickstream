@@ -62,6 +62,9 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var addonRegistry: com.slickstream.data.source.AddonRegistry
 
+    @Inject
+    lateinit var downloadManager: com.slickstream.data.download.DownloadManager
+
     // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
     private val onTv: Boolean get() = deviceProfile.isTv
 
@@ -158,6 +161,9 @@ class MainActivity : ComponentActivity() {
         // Keep the free streaming-addon set current automatically (daily): discover + health-check, no
         // manual URLs. Background; torrents are the fallback if it finds nothing.
         lifecycleScope.launch { runCatching { addonRegistry.refreshIfStale() } }
+        // Re-queue any download that was mid-flight when the app was last killed, so "download a season
+        // for the plane" survives a swipe-away or a reboot instead of stalling half-done.
+        lifecycleScope.launch { runCatching { downloadManager.resumeInterrupted() } }
         setContent {
             val settings by settingsRepository.settings
                 .collectAsStateWithLifecycle(initialValue = AppSettings())

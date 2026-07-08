@@ -21,6 +21,7 @@ import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.material3.Button
@@ -63,6 +64,7 @@ import com.slickstream.ui.theme.Brand
 fun ProfileScreen(
     onSignIn: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenDownloads: () -> Unit,
     onSwitchProfile: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -122,6 +124,12 @@ fun ProfileScreen(
         Spacer(Modifier.height(24.dp))
 
         SectionHeader(title = "Preferences")
+        SettingRow(
+            icon = { Icon(Icons.Rounded.Download, contentDescription = null, tint = Brand.Cyan) },
+            title = "Downloads",
+            subtitle = "Movies & shows saved for offline (airplane) playback.",
+            onClick = onOpenDownloads,
+        )
         SettingRow(
             icon = { Icon(Icons.Rounded.Settings, contentDescription = null, tint = Brand.Cyan) },
             title = "Settings",

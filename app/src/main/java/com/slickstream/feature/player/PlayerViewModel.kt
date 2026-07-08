@@ -41,6 +41,7 @@ import com.slickstream.core.repository.LibraryRepository
 import com.slickstream.core.repository.SourceRepository
 import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.core.model.SubtitleTrack
+import com.slickstream.data.download.DownloadManager
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.settings.StreamSizePreference
@@ -134,6 +135,7 @@ class PlayerViewModel @Inject constructor(
     private val subtitleRepository: SubtitleRepository,
     private val deviceProfile: DeviceProfile,
     private val vlcEngine: VlcEngine,
+    private val downloadManager: DownloadManager,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
@@ -424,6 +426,29 @@ class PlayerViewModel @Inject constructor(
             viewModelScope.launch { loadEpisodeList() }
             if (isMovie) viewModelScope.launch { loadSimilarMovies() }
 
+            // OFFLINE FIRST: if this exact title/episode is fully downloaded, play the local file and
+            // skip source resolution entirely — no network, works on a plane. A file that vanished from
+            // disk (user cleared storage) falls through to normal online resolution.
+            val offlinePath = downloadManager.completedFilePath(mediaId, mediaType, currentSeason, currentEpisode)
+            if (offlinePath != null && java.io.File(offlinePath).exists()) {
+                val offline = StreamSource(
+                    title = "Downloaded",
+                    magnetUri = "",
+                    infoHash = "offline:$mediaId:${currentSeason ?: -1}:${currentEpisode ?: -1}",
+                    quality = "",
+                    sizeBytes = java.io.File(offlinePath).length(),
+                    seeders = null,
+                    provider = "Downloads",
+                    directUrl = android.net.Uri.fromFile(java.io.File(offlinePath)).toString(),
+                    isOffline = true,
+                )
+                _sources.value = listOf(offline)
+                triedInfoHashes.clear()
+                failoverCount = 0
+                startSource(offline)
+                return@launch
+            }
+
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
             val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {
                 is DataResult.Success -> r.data
@@ -627,11 +652,19 @@ class PlayerViewModel @Inject constructor(
         // to the player ("file-server-first"). onPlayerError still fails over to the next source (incl. a
         // torrent) if the direct link is dead; STATE_READY -> maybeSeekToResume restores position.
         if (source.isDirect) {
+            val directUrl = source.directUrl!!
+            // OFFLINE file:// — the bytes are already on disk. No HEAD probe (it's not HTTP), no failover
+            // (there's nowhere to fail over to), just hand it to the player.
+            if (source.isOffline) {
+                ensurePlayer(directUrl)
+                startProgressTicker()
+                armDirectWatchdog()
+                return
+            }
             // Pre-play validation: a quick HEAD (fallback ranged GET) catches DEAD RD links (4xx/5xx) and
             // few-second FAKE files (tiny Content-Length) BEFORE committing the player — so a poison link
             // fails over in ~1s instead of after the 12s watchdog, preserving the failover budget for real
             // alternates. Lenient on ambiguous responses so a good link is never wrongly rejected.
-            val directUrl = source.directUrl!!
             directValidationJob = viewModelScope.launch {
                 val valid = validateDirectUrl(directUrl, source.requestHeaders)
                 // The probe can take seconds and the buffering overlay offers "Switch source" the whole
