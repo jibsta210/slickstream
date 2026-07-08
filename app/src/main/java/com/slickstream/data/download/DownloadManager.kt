@@ -1,7 +1,9 @@
 package com.slickstream.data.download
 
 import android.content.Context
+import android.content.Intent
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.slickstream.core.model.DataResult
 import com.slickstream.core.model.Download
 import com.slickstream.core.model.DownloadStatus
@@ -63,6 +65,16 @@ class DownloadManager @Inject constructor(
     private val workLock = Mutex()
     private val http by lazy { OkHttpClient() }
 
+    /** Bring up the foreground service so downloads survive the app being backgrounded / screen off.
+     *  Safe to call repeatedly; the service self-stops once the queue drains. Called from every entry
+     *  point that enqueues work (user tap or launch resume) — all foreground-initiated, so Android 12+
+     *  background-start limits don't bite. */
+    private fun ensureService() {
+        runCatching {
+            ContextCompat.startForegroundService(context, Intent(context, DownloadService::class.java))
+        }.onFailure { Log.w(TAG, "startForegroundService failed", it) }
+    }
+
     private val downloadsDir: File by lazy {
         (context.getExternalFilesDir("downloads") ?: File(context.filesDir, "downloads")).apply { mkdirs() }
     }
@@ -78,10 +90,13 @@ class DownloadManager @Inject constructor(
     fun resumeInterrupted() {
         scope.launch {
             runCatching {
-                dao.getAll()
+                val pending = dao.getAll()
                     .map { it.toDownload() }
                     .filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING }
-                    .forEach { kick(it) }
+                if (pending.isNotEmpty()) {
+                    ensureService()
+                    pending.forEach { kick(it) }
+                }
             }.onFailure { Log.w(TAG, "resumeInterrupted failed", it) }
         }
     }
@@ -104,6 +119,7 @@ class DownloadManager @Inject constructor(
                     downloadedBytes = 0L, totalBytes = 0L, addedAt = System.currentTimeMillis(), profileId = profileId,
                 )
                 dao.upsert(row)
+                ensureService()
                 kick(row.toDownload())
             }.onFailure { Log.w(TAG, "download($item) failed", it) }
         }

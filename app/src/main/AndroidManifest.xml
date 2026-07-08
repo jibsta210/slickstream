@@ -51,6 +51,12 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Foreground service that keeps OFFLINE downloads alive when the app is backgrounded. -->
+        <service
+            android:name=".data.download.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Google Cast: points the framework at our CastOptions. -->
         <meta-data
             android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
