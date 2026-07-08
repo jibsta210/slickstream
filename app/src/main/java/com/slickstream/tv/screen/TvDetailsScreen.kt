@@ -18,6 +18,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -82,6 +84,7 @@ fun TvDetailsScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val isFavorite by viewModel.isFavorite.collectAsStateWithLifecycle()
+    val downloadState by viewModel.downloadState.collectAsStateWithLifecycle()
 
     when {
         state.isLoading && state.details == null -> TvLoading(modifier)
@@ -90,6 +93,7 @@ fun TvDetailsScreen(
         state.details != null -> DetailsContent(
             state = state,
             isFavorite = isFavorite,
+            downloadState = downloadState,
             onPlay = onPlay,
             onToggleFavorite = viewModel::toggleFavorite,
             onSelectSeason = viewModel::selectSeason,
@@ -98,6 +102,8 @@ fun TvDetailsScreen(
             onMarkEpisodeUnwatched = viewModel::markUnwatched,
             onMarkMovieWatched = viewModel::markMovieWatched,
             onMarkMovieUnwatched = viewModel::markMovieUnwatched,
+            onDownloadMovie = viewModel::downloadMovie,
+            onDownloadSeason = viewModel::downloadSeason,
             modifier = modifier,
         )
     }
@@ -107,6 +113,7 @@ fun TvDetailsScreen(
 private fun DetailsContent(
     state: DetailsUiState,
     isFavorite: Boolean,
+    downloadState: com.slickstream.core.model.Download?,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
@@ -115,6 +122,8 @@ private fun DetailsContent(
     onMarkEpisodeUnwatched: (season: Int, episode: Int) -> Unit,
     onMarkMovieWatched: () -> Unit,
     onMarkMovieUnwatched: () -> Unit,
+    onDownloadMovie: () -> Unit,
+    onDownloadSeason: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val details = state.details ?: return
@@ -173,10 +182,13 @@ private fun DetailsContent(
                 HeroBlock(
                     state = state,
                     isFavorite = isFavorite,
+                    downloadState = downloadState,
                     onPlay = onPlay,
                     onToggleFavorite = onToggleFavorite,
                     onMarkMovieWatched = onMarkMovieWatched,
                     onMarkMovieUnwatched = onMarkMovieUnwatched,
+                    onDownloadMovie = onDownloadMovie,
+                    onDownloadSeason = onDownloadSeason,
                 )
             }
 
@@ -301,10 +313,13 @@ private fun TvCastRow(cast: List<com.slickstream.core.model.CastMember>) {
 private fun HeroBlock(
     state: DetailsUiState,
     isFavorite: Boolean,
+    downloadState: com.slickstream.core.model.Download?,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
     onMarkMovieWatched: () -> Unit,
     onMarkMovieUnwatched: () -> Unit,
+    onDownloadMovie: () -> Unit,
+    onDownloadSeason: () -> Unit,
 ) {
     val details = state.details ?: return
     val item = details.item
@@ -436,6 +451,36 @@ private fun HeroBlock(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(if (watched) "Watched" else "Mark watched", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+
+            // Download for offline. Movie: stateful (Download → % → Downloaded). TV: kick off the
+            // selected season; progress lives on the Downloads screen.
+            if (state.isTv) {
+                val seasonLabel = state.selectedSeasonNumber?.let { "Download S$it" } ?: "Download season"
+                DetailsActionButton(onClick = onDownloadSeason) {
+                    Icon(Icons.Rounded.Download, contentDescription = seasonLabel, tint = Color.White, modifier = Modifier.size(24.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(seasonLabel, style = MaterialTheme.typography.labelLarge)
+                }
+            } else {
+                val done = downloadState?.isComplete == true
+                val downloading = downloadState?.status == com.slickstream.core.model.DownloadStatus.DOWNLOADING ||
+                    downloadState?.status == com.slickstream.core.model.DownloadStatus.QUEUED
+                val label = when {
+                    done -> "Downloaded"
+                    downloading -> "Downloading ${((downloadState?.progress ?: 0f) * 100).toInt()}%"
+                    else -> "Download"
+                }
+                DetailsActionButton(onClick = { if (!done && !downloading) onDownloadMovie() }) {
+                    Icon(
+                        imageVector = if (done) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                        contentDescription = label,
+                        tint = if (done) Brand.Cyan else Color.White,
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(label, style = MaterialTheme.typography.labelLarge)
                 }
             }
         }

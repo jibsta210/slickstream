@@ -94,6 +94,13 @@ fun TvSettingsScreen(
         }
 
         item {
+            TvSettingSection("Downloads") {
+                TvOptionRow("Download quality", QualityPreference.entries, settings.downloadQuality, { it.label }, viewModel::setDownloadQuality)
+                TvOptionRow("File size", com.slickstream.data.settings.StreamSizePreference.entries, settings.downloadSize, { it.label }, viewModel::setDownloadSize)
+            }
+        }
+
+        item {
             TvSettingSection("Streaming source") {
                 val current = settings.customSourceUrl
                 Text(

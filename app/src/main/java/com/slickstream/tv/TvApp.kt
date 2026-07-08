@@ -28,6 +28,7 @@ import com.slickstream.tv.screen.TvScreenCalibrationScreen
 import com.slickstream.tv.screen.TvSettingsScreen
 import com.slickstream.tv.screen.TvSportsScreen
 import com.slickstream.tv.screen.TvDetailsScreen
+import com.slickstream.tv.screen.TvDownloadsScreen
 import com.slickstream.tv.screen.TvFavoritesScreen
 import com.slickstream.tv.screen.TvHomeScreen
 import com.slickstream.tv.screen.TvPlayerScreen
@@ -203,6 +204,13 @@ fun TvApp() {
                             TvProfileScreen(
                                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                                 onSwitchProfile = { navController.navigate(Routes.PROFILE_PICKER) },
+                                onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) },
+                            )
+                        }
+
+                        composable(Routes.DOWNLOADS) {
+                            TvDownloadsScreen(
+                                onPlay = { type, id, season, episode -> openPlayer(type, id, season, episode) },
                             )
                         }
 

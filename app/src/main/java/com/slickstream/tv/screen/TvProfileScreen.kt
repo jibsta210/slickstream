@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
@@ -100,6 +101,7 @@ fun TvProfileScreen(
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
     onSwitchProfile: () -> Unit = {},
+    onOpenDownloads: () -> Unit = {},
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
@@ -160,6 +162,12 @@ fun TvProfileScreen(
                     focusRequester = firstFocus,
                 )
             }
+
+            ProfileAction(
+                icon = Icons.Rounded.Download,
+                label = "Downloads",
+                onClick = onOpenDownloads,
+            )
 
             ProfileAction(
                 icon = Icons.Rounded.Settings,
