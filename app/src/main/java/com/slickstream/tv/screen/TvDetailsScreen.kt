@@ -55,6 +55,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.hasAired
+import com.slickstream.core.model.isDownloadable
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.Season
@@ -85,6 +86,7 @@ fun TvDetailsScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val isFavorite by viewModel.isFavorite.collectAsStateWithLifecycle()
     val downloadState by viewModel.downloadState.collectAsStateWithLifecycle()
+    val seasonDownloads by viewModel.seasonDownloads.collectAsStateWithLifecycle()
 
     when {
         state.isLoading && state.details == null -> TvLoading(modifier)
@@ -94,6 +96,7 @@ fun TvDetailsScreen(
             state = state,
             isFavorite = isFavorite,
             downloadState = downloadState,
+            seasonDownloads = seasonDownloads,
             onPlay = onPlay,
             onToggleFavorite = viewModel::toggleFavorite,
             onSelectSeason = viewModel::selectSeason,
@@ -104,6 +107,7 @@ fun TvDetailsScreen(
             onMarkMovieUnwatched = viewModel::markMovieUnwatched,
             onDownloadMovie = viewModel::downloadMovie,
             onDownloadSeason = viewModel::downloadSeason,
+            onDownloadEpisode = { ep -> viewModel.downloadEpisode(ep.seasonNumber, ep.episodeNumber, ep.name) },
             modifier = modifier,
         )
     }
@@ -114,6 +118,7 @@ private fun DetailsContent(
     state: DetailsUiState,
     isFavorite: Boolean,
     downloadState: com.slickstream.core.model.Download?,
+    seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
@@ -124,6 +129,7 @@ private fun DetailsContent(
     onMarkMovieUnwatched: () -> Unit,
     onDownloadMovie: () -> Unit,
     onDownloadSeason: () -> Unit,
+    onDownloadEpisode: (Episode) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val details = state.details ?: return
@@ -183,6 +189,7 @@ private fun DetailsContent(
                     state = state,
                     isFavorite = isFavorite,
                     downloadState = downloadState,
+                    seasonDownloads = seasonDownloads,
                     onPlay = onPlay,
                     onToggleFavorite = onToggleFavorite,
                     onMarkMovieWatched = onMarkMovieWatched,
@@ -208,6 +215,8 @@ private fun DetailsContent(
                 item(key = "episodes") {
                     EpisodeList(
                         state = state,
+                        downloads = seasonDownloads,
+                        onDownloadEpisode = onDownloadEpisode,
                         onPlayEpisode = { ep ->
                             onPlay(MediaType.TV, item.id, ep.seasonNumber, ep.episodeNumber)
                         },
@@ -314,6 +323,7 @@ private fun HeroBlock(
     state: DetailsUiState,
     isFavorite: Boolean,
     downloadState: com.slickstream.core.model.Download?,
+    seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
     onMarkMovieWatched: () -> Unit,
@@ -455,11 +465,37 @@ private fun HeroBlock(
             }
 
             // Download for offline. Movie: stateful (Download → % → Downloaded). TV: kick off the
-            // selected season; progress lives on the Downloads screen.
+            // selected season, with a LIVE aggregate label so the tap visibly does something
+            // ("Downloading 2/8" → "Downloaded S1") instead of looking dead.
             if (state.isTv) {
-                val seasonLabel = state.selectedSeasonNumber?.let { "Download S$it" } ?: "Download season"
-                DetailsActionButton(onClick = onDownloadSeason) {
-                    Icon(Icons.Rounded.Download, contentDescription = seasonLabel, tint = Color.White, modifier = Modifier.size(24.dp))
+                // Same predicate downloadSeason enqueues with (aired OR unknown air date) — the
+                // aggregate must count exactly what a tap creates or the label lies/freezes.
+                val aired = state.episodes.filter { it.isDownloadable() }
+                val doneCount = aired.count { seasonDownloads[it.episodeNumber]?.isComplete == true }
+                val seasonActive = aired.any {
+                    val s = seasonDownloads[it.episodeNumber]?.status
+                    s == com.slickstream.core.model.DownloadStatus.QUEUED ||
+                        s == com.slickstream.core.model.DownloadStatus.DOWNLOADING
+                }
+                val allDone = aired.isNotEmpty() && doneCount == aired.size
+                val sn = state.selectedSeasonNumber
+                val seasonLabel = when {
+                    allDone -> "Downloaded" + (sn?.let { " S$it" } ?: "")
+                    seasonActive -> "Downloading $doneCount/${aired.size}"
+                    sn != null -> "Download S$sn"
+                    else -> "Download season"
+                }
+                DetailsActionButton(onClick = { if (!seasonActive && !allDone) onDownloadSeason() }) {
+                    Icon(
+                        imageVector = if (allDone) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                        contentDescription = seasonLabel,
+                        tint = when {
+                            allDone -> Brand.Cyan
+                            seasonActive -> Brand.Cyan
+                            else -> Color.White
+                        },
+                        modifier = Modifier.size(24.dp),
+                    )
                     Spacer(Modifier.width(8.dp))
                     Text(seasonLabel, style = MaterialTheme.typography.labelLarge)
                 }
@@ -583,6 +619,8 @@ private fun SeasonSelector(
 @Composable
 private fun EpisodeList(
     state: DetailsUiState,
+    downloads: Map<Int, com.slickstream.core.model.Download>,
+    onDownloadEpisode: (Episode) -> Unit,
     onPlayEpisode: (Episode) -> Unit,
     onToggleWatched: (Episode, watched: Boolean) -> Unit,
 ) {
@@ -611,8 +649,10 @@ private fun EpisodeList(
                 EpisodeCard(
                     episode = ep,
                     progress = state.episodeProgress[ep.episodeNumber],
+                    download = downloads[ep.episodeNumber],
                     onClick = { onPlayEpisode(ep) },
                     onToggleWatched = { watched -> onToggleWatched(ep, watched) },
+                    onDownload = { onDownloadEpisode(ep) },
                 )
             }
         }
@@ -637,8 +677,10 @@ internal fun formatAirDate(raw: String?): String? {
 private fun EpisodeCard(
     episode: Episode,
     progress: Float?,
+    download: com.slickstream.core.model.Download?,
     onClick: () -> Unit,
     onToggleWatched: (watched: Boolean) -> Unit,
+    onDownload: () -> Unit,
 ) {
     val shape = RoundedCornerShape(12.dp)
     // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode shows a check.
@@ -792,47 +834,103 @@ private fun EpisodeCard(
             }
         }
     }
-        // D-pad focusable Mark watched / unwatched toggle — a SEPARATE focus target placed BELOW the
-        // card. It used to be nested INSIDE the card's clickable Surface, which made it unreachable on TV:
-        // a clickable Surface is a single focus target and the D-pad can't descend into a nested clickable
-        // child, so focus never landed on it ("can't mark watched on TV"; touch on mobile ignores focus,
-        // so it worked there). DOWN from the card now focuses it. Aired episodes only.
-        if (aired) {
+        // D-pad focusable action pills — SEPARATE focus targets placed BELOW the card (a clickable
+        // Surface is a single focus target; the D-pad can't descend into nested clickable children, so
+        // pills nested inside the card were unreachable on TV). DOWN from the card focuses the row.
+        // Gated on isDownloadable (aired OR unknown date — matches what downloadSeason enqueues):
+        // Mark watched + a per-episode Download with live state.
+        if (episode.isDownloadable()) {
             val toggleShape = RoundedCornerShape(50)
-            Surface(
-                onClick = { onToggleWatched(isWatched) },
-                shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
-                colors = ClickableSurfaceDefaults.colors(
-                    containerColor = Brand.SurfaceVariant,
-                    focusedContainerColor = Brand.Violet,
-                    contentColor = Brand.OnSurface,
-                    focusedContentColor = Color.White,
-                ),
-                border = ClickableSurfaceDefaults.border(
-                    focusedBorder = Border(
-                        border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
-                        shape = toggleShape,
-                    ),
-                ),
-                scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+            Row(
                 modifier = Modifier.padding(start = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                Surface(
+                    onClick = { onToggleWatched(isWatched) },
+                    shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor = Brand.SurfaceVariant,
+                        focusedContainerColor = Brand.Violet,
+                        contentColor = Brand.OnSurface,
+                        focusedContentColor = Color.White,
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        focusedBorder = Border(
+                            border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
+                            shape = toggleShape,
+                        ),
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
                 ) {
-                    Icon(
-                        imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
-                        contentDescription = null,
-                        tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = if (isWatched) "Watched" else "Mark watched",
-                        style = MaterialTheme.typography.labelMedium,
-                        maxLines = 1,
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                            contentDescription = null,
+                            tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = if (isWatched) "Watched" else "Mark watched",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                        )
+                    }
+                }
+
+                val dlStatus = download?.status
+                val dlActive = dlStatus == com.slickstream.core.model.DownloadStatus.QUEUED ||
+                    dlStatus == com.slickstream.core.model.DownloadStatus.DOWNLOADING
+                val dlDone = dlStatus == com.slickstream.core.model.DownloadStatus.COMPLETED
+                Surface(
+                    onClick = { if (!dlActive && !dlDone) onDownload() },
+                    shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
+                    colors = ClickableSurfaceDefaults.colors(
+                        containerColor = Brand.SurfaceVariant,
+                        focusedContainerColor = Brand.Violet,
+                        contentColor = Brand.OnSurface,
+                        focusedContentColor = Color.White,
+                    ),
+                    border = ClickableSurfaceDefaults.border(
+                        focusedBorder = Border(
+                            border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
+                            shape = toggleShape,
+                        ),
+                    ),
+                    scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (dlDone) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                            contentDescription = null,
+                            tint = when {
+                                dlDone -> Color(0xFF22C55E)
+                                dlStatus == com.slickstream.core.model.DownloadStatus.FAILED -> Brand.Error
+                                dlActive -> Brand.Cyan
+                                else -> Brand.OnSurface
+                            },
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = when {
+                                dlDone -> "Downloaded"
+                                dlStatus == com.slickstream.core.model.DownloadStatus.DOWNLOADING ->
+                                    "${((download?.progress ?: 0f) * 100).toInt()}%"
+                                dlStatus == com.slickstream.core.model.DownloadStatus.QUEUED -> "Queued"
+                                dlStatus == com.slickstream.core.model.DownloadStatus.FAILED -> "Retry"
+                                else -> "Download"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                        )
+                    }
                 }
             }
         }

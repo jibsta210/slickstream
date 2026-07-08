@@ -58,6 +58,7 @@ import coil.request.ImageRequest
 import com.slickstream.core.model.CastMember
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.Genre
+import com.slickstream.core.model.isDownloadable
 import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
@@ -83,6 +84,7 @@ fun DetailsScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val isFavorite by viewModel.isFavorite.collectAsStateWithLifecycle()
     val downloadState by viewModel.downloadState.collectAsStateWithLifecycle()
+    val seasonDownloads by viewModel.seasonDownloads.collectAsStateWithLifecycle()
 
     Box(modifier = modifier.fillMaxSize().background(Brand.Background)) {
         when {
@@ -91,8 +93,10 @@ fun DetailsScreen(
                 state = state,
                 isFavorite = isFavorite,
                 downloadState = downloadState,
+                seasonDownloads = seasonDownloads,
                 onDownloadMovie = viewModel::downloadMovie,
                 onDownloadSeason = viewModel::downloadSeason,
+                onDownloadEpisode = { ep -> viewModel.downloadEpisode(ep.seasonNumber, ep.episodeNumber, ep.name) },
                 onPlay = onPlay,
                 onToggleFavorite = viewModel::toggleFavorite,
                 onSelectSeason = viewModel::selectSeason,
@@ -134,8 +138,10 @@ private fun DetailsContent(
     state: DetailsUiState,
     isFavorite: Boolean,
     downloadState: com.slickstream.core.model.Download?,
+    seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onDownloadMovie: () -> Unit,
     onDownloadSeason: () -> Unit,
+    onDownloadEpisode: (Episode) -> Unit,
     onPlay: OnPlay,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
@@ -207,12 +213,17 @@ private fun DetailsContent(
                         isFavorite = isFavorite,
                         onToggle = onToggleFavorite,
                     )
-                    Spacer(Modifier.width(8.dp))
-                    DownloadAction(
-                        state = downloadState,
-                        isTv = isTv,
-                        onClick = { if (isTv) onDownloadSeason() else onDownloadMovie() },
-                    )
+                    // Movies only — TV shows get a labeled "Download season" button in the Episodes
+                    // header (next to the season it acts on) plus per-episode buttons on each row. The
+                    // bare icon here gave zero feedback for shows and read as broken.
+                    if (!isTv) {
+                        Spacer(Modifier.width(8.dp))
+                        DownloadAction(
+                            state = downloadState,
+                            isTv = false,
+                            onClick = onDownloadMovie,
+                        )
+                    }
                 }
                 // Movies: an explicit Mark watched / unwatched toggle next to Play/Favourite.
                 if (!isTv) {
@@ -265,10 +276,17 @@ private fun DetailsContent(
         // --- Seasons + episodes (TV only) ---
         if (item.mediaType == MediaType.TV && state.seasons.isNotEmpty()) {
             item("seasons-header") {
-                SectionHeader(
-                    title = "Episodes",
-                    modifier = Modifier.padding(top = 20.dp),
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 20.dp, end = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    SectionHeader(title = "Episodes", modifier = Modifier.weight(1f))
+                    SeasonDownloadButton(
+                        episodes = state.episodes,
+                        downloads = seasonDownloads,
+                        onClick = onDownloadSeason,
+                    )
+                }
             }
             // Only show the season picker when there's an actual choice — a single-season show (a
             // limited series / miniseries) rendered one pointless chip labelled with the season's name.
@@ -309,6 +327,8 @@ private fun DetailsContent(
                     EpisodeRow(
                         episode = episode,
                         progress = progress,
+                        download = seasonDownloads[episode.episodeNumber],
+                        onDownload = { onDownloadEpisode(episode) },
                         onPlay = {
                             onPlay(
                                 item.mediaType,
@@ -626,6 +646,8 @@ private fun formatEpisodeAirDate(raw: String?): String? {
 private fun EpisodeRow(
     episode: Episode,
     progress: Float,
+    download: com.slickstream.core.model.Download?,
+    onDownload: () -> Unit,
     onPlay: () -> Unit,
     onToggleWatched: () -> Unit,
 ) {
@@ -739,6 +761,16 @@ private fun EpisodeRow(
                 )
             }
         }
+        // Per-episode download — idle arrow / progress ring / green done. Gated on the SAME predicate
+        // downloadSeason enqueues with (aired OR unknown date), so no downloadable episode lacks a button.
+        if (episode.isDownloadable()) {
+            Spacer(Modifier.width(8.dp))
+            EpisodeDownloadIcon(
+                download = download,
+                episodeNumber = episode.episodeNumber,
+                onClick = onDownload,
+            )
+        }
         // Mark watched / unwatched toggle — filled check when watched, outline when not.
         Spacer(Modifier.width(8.dp))
         Surface(
@@ -759,6 +791,120 @@ private fun EpisodeRow(
                     modifier = Modifier.size(24.dp),
                 )
             }
+        }
+    }
+}
+
+/** Per-episode download state button: idle ↓, queued/downloading progress ring, done green ✓,
+ *  failed red retry. Tap starts (or retries after FAILED); no-op while active or done. */
+@Composable
+private fun EpisodeDownloadIcon(
+    download: com.slickstream.core.model.Download?,
+    episodeNumber: Int,
+    onClick: () -> Unit,
+) {
+    val status = download?.status
+    val active = status == com.slickstream.core.model.DownloadStatus.QUEUED ||
+        status == com.slickstream.core.model.DownloadStatus.DOWNLOADING
+    val done = status == com.slickstream.core.model.DownloadStatus.COMPLETED
+    val failed = status == com.slickstream.core.model.DownloadStatus.FAILED
+    Surface(
+        onClick = { if (!active && !done) onClick() },
+        shape = CircleShape,
+        color = Color.Transparent,
+        modifier = Modifier.size(40.dp),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            if (status == com.slickstream.core.model.DownloadStatus.DOWNLOADING) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    progress = { download?.progress ?: 0f },
+                    color = Brand.Cyan,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(30.dp),
+                )
+            } else if (status == com.slickstream.core.model.DownloadStatus.QUEUED) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = Brand.Cyan.copy(alpha = 0.5f),
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(30.dp),
+                )
+            }
+            Icon(
+                imageVector = if (done) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                contentDescription = when {
+                    done -> "Episode $episodeNumber downloaded"
+                    active -> "Downloading episode $episodeNumber"
+                    failed -> "Retry download of episode $episodeNumber"
+                    else -> "Download episode $episodeNumber"
+                },
+                tint = when {
+                    done -> Color(0xFF22C55E)
+                    failed -> Brand.Error
+                    active -> Brand.Cyan
+                    else -> Brand.OnSurfaceDim
+                },
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+/** "Download season" pill in the Episodes header — shows live aggregate state so a tap visibly DOES
+ *  something ("Downloading 2/8", then "Downloaded"). Acts on the selected season's AIRED episodes. */
+@Composable
+private fun SeasonDownloadButton(
+    episodes: List<Episode>,
+    downloads: Map<Int, com.slickstream.core.model.Download>,
+    onClick: () -> Unit,
+) {
+    // Same predicate downloadSeason enqueues with — the counter must cover exactly what a tap creates.
+    val aired = episodes.filter { it.isDownloadable() }
+    if (aired.isEmpty()) return
+    val done = aired.count { downloads[it.episodeNumber]?.isComplete == true }
+    val active = aired.any {
+        val s = downloads[it.episodeNumber]?.status
+        s == com.slickstream.core.model.DownloadStatus.QUEUED || s == com.slickstream.core.model.DownloadStatus.DOWNLOADING
+    }
+    val allDone = done == aired.size
+    val label = when {
+        allDone -> "Downloaded"
+        active -> "Downloading $done/${aired.size}"
+        done > 0 -> "Download rest"
+        else -> "Download season"
+    }
+    Surface(
+        onClick = { if (!active && !allDone) onClick() },
+        shape = RoundedCornerShape(50),
+        color = if (allDone) Brand.Surface else Brand.SurfaceVariant,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (active) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = Brand.Cyan,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(14.dp),
+                )
+            } else {
+                Icon(
+                    imageVector = if (allDone) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                    contentDescription = null,
+                    tint = if (allDone) Color(0xFF22C55E) else Brand.OnSurface,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                color = when {
+                    allDone -> Color(0xFF22C55E)
+                    active -> Brand.Cyan
+                    else -> Brand.OnSurface
+                },
+            )
         }
     }
 }

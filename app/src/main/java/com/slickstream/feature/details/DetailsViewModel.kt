@@ -97,6 +97,12 @@ class DetailsViewModel @Inject constructor(
         downloadManager.downloadSeason(item, season)
     }
 
+    /** Download ONE episode of the currently-selected season. */
+    fun downloadEpisode(season: Int, episode: Int, name: String) {
+        val item = _uiState.value.details?.item ?: return
+        downloadManager.download(item, season, episode, name)
+    }
+
     /** Single-flight prewarm job — cancelled+replaced on season switch so it can't stack. */
     private var warmJob: Job? = null
 
@@ -118,6 +124,18 @@ class DetailsViewModel @Inject constructor(
                 started = SharingStarted.WhileSubscribed(5_000),
                 initialValue = false,
             )
+
+    /** Live download state for every episode of the SELECTED season (episodeNumber -> Download).
+     *  Drives the per-episode download buttons and the "Download season" aggregate label — without
+     *  this the season button gave ZERO feedback and read as broken. Declared AFTER [_uiState]
+     *  (initializer references it at construction). */
+    val seasonDownloads: StateFlow<Map<Int, com.slickstream.core.model.Download>> =
+        kotlinx.coroutines.flow.combine(downloadManager.downloads, _uiState) { all, ui ->
+            val season = ui.selectedSeasonNumber ?: return@combine emptyMap()
+            all.filter { it.mediaId == mediaId && it.mediaType == MediaType.TV && it.season == season }
+                .mapNotNull { d -> d.episode?.let { it to d } }
+                .toMap()
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
     init {
         load()

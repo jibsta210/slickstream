@@ -11,7 +11,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.StreamSource
-import com.slickstream.core.model.hasAired
+import com.slickstream.core.model.isDownloadable
 import com.slickstream.core.model.StreamState
 import com.slickstream.core.repository.CatalogRepository
 import com.slickstream.core.repository.ProfileRepository
@@ -161,8 +161,9 @@ class DownloadManager @Inject constructor(
             runCatching {
                 val eps = (catalogRepository.getEpisodes(show.id, seasonNumber) as? DataResult.Success)?.data ?: return@launch
                 // Skip episodes with a FUTURE air date — they have no sources yet and would just pile up
-                // as FAILED rows. Unknown (null) air dates are kept (some shows omit them).
-                eps.filter { it.airDate == null || it.hasAired() }
+                // as FAILED rows. Unknown (null) air dates are kept (some shows omit them). Same
+                // predicate the download UI gates/aggregates use — keep them in sync.
+                eps.filter { it.isDownloadable() }
                     .forEach { ep -> download(show, seasonNumber, ep.episodeNumber, ep.name) }
             }.onFailure { Log.w(TAG, "downloadSeason failed", it) }
         }
@@ -195,10 +196,11 @@ class DownloadManager @Inject constructor(
     // --- queue worker --------------------------------------------------------
 
     private fun kick(d: Download) {
-        // One worker per key. If it's already queued/running, don't double-launch (a re-kick of a
-        // QUEUED row must not spawn a second collector racing the first).
-        if (activeJobs.containsKey(d.key)) return
-        val job = scope.launch {
+        // One worker per key, ATOMICALLY. A plain containsKey→put is check-then-act: a double-tap (or
+        // a tap racing launch-resume) could slip two workers through, and the second put would
+        // overwrite the first job so delete() cancelled the wrong one. LAZY start = the loser of
+        // putIfAbsent never runs at all.
+        val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             workLock.withLock {
                 // Re-read the freshest state; skip if already done or removed.
                 val cur = dao.get(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1)?.toDownload() ?: return@withLock
@@ -212,8 +214,12 @@ class DownloadManager @Inject constructor(
                 }
             }
         }
-        activeJobs[d.key] = job
+        if (activeJobs.putIfAbsent(d.key, job) != null) {
+            job.cancel()   // never started (LAZY) — a worker for this key already exists
+            return
+        }
         job.invokeOnCompletion { activeJobs.remove(d.key, job) }
+        job.start()
     }
 
     private suspend fun runDownload(d: Download) {

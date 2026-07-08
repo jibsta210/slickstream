@@ -67,6 +67,12 @@ data class Episode(
  *  An episode with NO date (or a future date) has NOT aired — there's nothing to stream yet. */
 fun Episode.hasAired(today: String = isoToday()): Boolean = airDate?.let { it <= today } ?: false
 
+/** Downloadable = aired OR unknown air date (some shows omit dates but the release exists). MUST stay
+ *  in sync with DownloadManager.downloadSeason's enqueue filter — the download buttons/aggregate
+ *  counters gate on exactly the set the backend will enqueue, or the UI hides/undercounts rows the
+ *  season download actually creates. */
+fun Episode.isDownloadable(): Boolean = airDate == null || hasAired()
+
 /** Today as "YYYY-MM-DD" in local time — no java.time needed (works on every API level). */
 fun isoToday(): String =
     java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
