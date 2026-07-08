@@ -28,6 +28,10 @@ object StreamPicker {
         maxTier: Int,
         sizePref: StreamSizePreference,
         lowPower: Boolean,
+        /** Absolute minimum plausible size in bytes; 0 = disabled (player/prewarm default). Downloads
+         *  pass a movie/episode floor so SMALLEST means "smallest REAL release", not "the 2 MB fake" —
+         *  new releases attract tiny decoy torrents that would otherwise win the min-size sort. */
+        minPlausibleBytes: Long = 0L,
     ): StreamSource? {
         if (list.isEmpty()) return null
         val effectiveTier = if (lowPower) minOf(maxTier, QualityPreference.FHD_1080.maxTier) else maxTier
@@ -51,12 +55,22 @@ object StreamPicker {
         // raise the floor and knock out the real (lower-seeded) BluRay/WEB encode (same reason foreign /
         // unplayable are dropped pre-floor). Soft: fall back to CAMs only if there is literally nothing else.
         val notCam = singleFile.filterNot { it.isCam }.ifEmpty { singleFile }
+        // Fake/sample floor (opt-in): drop sources whose ADVERTISED size is implausibly small for real
+        // content. Runs BEFORE the health floor for the same reason CAMs do — fake torrents advertise
+        // huge seeder counts, and a 5000-"seeder" 2 MB decoy must not inflate the relative floor and
+        // knock out the real 200-seed encode (it would then also WIN the SMALLEST sort). Null sizes
+        // pass (missing metadata ≠ fake — the caller's post-download check is the backstop). Soft: if
+        // everything is sub-floor, keep the pool rather than strand the caller — downloads then reject
+        // the tiny result after the fact instead of never resolving.
+        val plausible = if (minPlausibleBytes <= 0L) notCam else {
+            notCam.filter { it.sizeBytes == null || it.sizeBytes >= minPlausibleBytes }.ifEmpty { notCam }
+        }
         // Health floor RELATIVE to the best swarm available: never pick a near-dead torrent when a
         // well-seeded one exists, even if the dead one is a little smaller (the old bug). The size
         // preference below then only ever chooses among genuinely healthy options.
-        val bestSeeders = notCam.maxOfOrNull { it.seeders ?: 0 } ?: 0
+        val bestSeeders = plausible.maxOfOrNull { it.seeders ?: 0 } ?: 0
         val floor = maxOf(MIN_SEEDERS, (bestSeeders * RELATIVE_HEALTH_FRACTION).toInt())
-        val healthy = notCam.filter { (it.seeders ?: 0) >= floor }.ifEmpty { notCam }
+        val healthy = plausible.filter { (it.seeders ?: 0) >= floor }.ifEmpty { plausible }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
                 healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))

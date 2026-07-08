@@ -98,9 +98,24 @@ class DownloadManager @Inject constructor(
     fun resumeInterrupted() {
         scope.launch {
             runCatching {
-                val pending = dao.getAll()
-                    .map { it.toDownload() }
-                    .filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING }
+                val all = dao.getAll().map { it.toDownload() }
+                // JUNK SWEEP: builds before the anti-fake floors could store a 2 MB fake as COMPLETED
+                // ("Downloaded" that plays seconds of junk). Purge the junk artifacts and RE-QUEUE — the
+                // user asked for this title, and with the floors + failover it now lands a real source.
+                val junk = all.filter { it.isComplete && it.totalBytes in 1 until minBytesFor(it) }
+                val junkKeys = junk.map { it.key }.toSet()
+                val keepHashes = all.filter { it.isComplete && it.key !in junkKeys }.mapNotNull { it.infoHash }.toSet()
+                junk.forEach { j ->
+                    Log.w(TAG, "junk sweep: re-queueing ${j.key} (${j.totalBytes} B)")
+                    // Same season-pack guard as delete(): never evict a hash a good sibling still uses.
+                    j.infoHash?.takeIf { it !in keepHashes }?.let { runCatching { cache.unpin(it); cache.evict(it) } }
+                    j.filePath?.let { p -> if (p.startsWith(downloadsDir.absolutePath)) runCatching { File(p).delete() } }
+                    dao.upsert(DownloadEntity.from(j.copy(
+                        status = DownloadStatus.QUEUED, downloadedBytes = 0L, totalBytes = 0L,
+                        filePath = null, infoHash = null, magnetUri = null, directUrl = null,
+                    )))
+                }
+                val pending = all.filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING } + junk
                 if (pending.isNotEmpty()) {
                     ensureService()
                     pending.forEach { kick(it) }
@@ -158,9 +173,17 @@ class DownloadManager @Inject constructor(
         runCatching {
             // Cancel first so the worker stops writing progress / re-pinning as we tear the row down.
             activeJobs.remove(d.key)?.cancel()
-            d.infoHash?.let { cache.unpin(it); cache.evict(it) }
-            d.filePath?.let { p -> if (p.startsWith(downloadsDir.absolutePath)) File(p).delete() }
+            // Drop the row BEFORE deciding on eviction so the still-referenced check below sees the
+            // remaining rows only.
             dao.deleteByKey(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1)
+            d.infoHash?.let { hash ->
+                // SEASON-PACK GUARD: every episode downloaded from one pack shares this infoHash, and
+                // evict() deletes ALL of the torrent's files. Only unpin+evict when no other download
+                // row still references the hash — otherwise deleting E02 would nuke E01's finished file.
+                val stillReferenced = dao.getAll().any { it.infoHash == hash }
+                if (!stillReferenced) { cache.unpin(hash); cache.evict(hash) }
+            }
+            d.filePath?.let { p -> if (p.startsWith(downloadsDir.absolutePath)) File(p).delete() }
         }
     }
 
@@ -181,6 +204,9 @@ class DownloadManager @Inject constructor(
                 val cur = dao.get(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1)?.toDownload() ?: return@withLock
                 if (cur.isComplete) return@withLock
                 runCatching { runDownload(cur) }.onFailure {
+                    // A cancelled worker (delete()/shutdown) must propagate, not be recorded as FAILED
+                    // on a row that's being torn down.
+                    if (it is kotlinx.coroutines.CancellationException) throw it
                     Log.w(TAG, "runDownload failed for ${cur.key}", it)
                     setStatus(cur, DownloadStatus.FAILED)
                 }
@@ -191,21 +217,50 @@ class DownloadManager @Inject constructor(
     }
 
     private suspend fun runDownload(d: Download) {
-        val source = d.pickedSource() ?: resolveSource(d) ?: run { setStatus(d, DownloadStatus.FAILED); return }
-        // Persist the chosen source on the row so a resume doesn't re-resolve.
-        val withSource = d.copy(
-            quality = source.quality, sizeBytes = source.sizeBytes ?: 0L,
-            infoHash = source.infoHash.takeIf { !source.isDirect }, magnetUri = source.magnetUri.takeIf { it.isNotBlank() },
-            directUrl = source.directUrl, status = DownloadStatus.DOWNLOADING,
-        )
-        dao.upsert(DownloadEntity.from(withSource))
-        if (source.isDirect) downloadDirect(withSource, source) else downloadTorrent(withSource, source)
+        // FAILOVER: new releases are riddled with fake/decoy sources (a 2 MB "movie" that downloads to
+        // an honest 100%). One junk source must advance to the next-best candidate, not strand the row
+        // as FAILED — and NEVER be presented as Downloaded. Each attempt persists its source + resets
+        // progress so the UI never shows a stale size from a junk try. User cancellation (delete())
+        // rethrows and stops the loop; only real failures fail over.
+        val minBytes = minBytesFor(d)
+        val tried = mutableSetOf<String>()
+        suspend fun attempt(source: StreamSource): Boolean {
+            tried += source.attemptKey()
+            val withSource = d.copy(
+                quality = source.quality, sizeBytes = source.sizeBytes ?: 0L,
+                infoHash = source.infoHash.takeIf { !source.isDirect }, magnetUri = source.magnetUri.takeIf { it.isNotBlank() },
+                directUrl = source.directUrl, status = DownloadStatus.DOWNLOADING,
+                downloadedBytes = 0L, totalBytes = 0L, filePath = null,
+            )
+            dao.upsert(DownloadEntity.from(withSource))
+            return try {
+                if (source.isDirect) downloadDirect(withSource, source, minBytes) else downloadTorrent(withSource, source, minBytes)
+                true
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "source failed for ${d.key} (${source.provider} ${source.quality} ${source.sizeBytes ?: "?"}B): ${e.message}")
+                false
+            }
+        }
+        // Resume path first (the persisted source), then fresh ranked candidates.
+        d.pickedSource()?.let { if (attempt(it)) return }
+        for (source in resolveCandidates(d, minBytes)) {
+            if (source.attemptKey() in tried) continue
+            if (attempt(source)) return
+        }
+        setStatus(d.copy(downloadedBytes = 0L, totalBytes = 0L), DownloadStatus.FAILED)
     }
+
+    /** Identity of an attempt for the failover tried-set: URL for directs, infoHash for torrents. */
+    private fun StreamSource.attemptKey(): String = directUrl ?: infoHash
 
     private fun Download.pickedSource(): StreamSource? {
         // Rebuild the source from what we stored (resume path) — torrent has infoHash+magnet, direct has url.
         if (directUrl != null) {
-            return StreamSource(title = title, magnetUri = "", infoHash = infoHash ?: return null, quality = quality,
+            // infoHash is null for persisted directs (only torrents store it) and unused on the direct
+            // path — attemptKey() and the player key directs off the URL. Don't let it block the resume.
+            return StreamSource(title = title, magnetUri = "", infoHash = infoHash ?: "", quality = quality,
                 sizeBytes = sizeBytes.takeIf { it > 0 }, seeders = null, provider = "Download", directUrl = directUrl)
         }
         if (infoHash != null && !magnetUri.isNullOrBlank()) {
@@ -215,39 +270,110 @@ class DownloadManager @Inject constructor(
         return null
     }
 
-    private suspend fun resolveSource(d: Download): StreamSource? {
+    /** Resolve once, then rank up to [MAX_SOURCE_ATTEMPTS] candidates by repeatedly asking the SAME
+     *  picker the player trusts (pick best → remove → pick next), so failover order == picker order.
+     *  The [minBytesFor] floor makes SMALLEST mean "smallest REAL release": a 2 MB fake no longer wins
+     *  the min-size sort just because it's tiny. */
+    private suspend fun resolveCandidates(d: Download, minBytes: Long): List<StreamSource> {
         val details: MediaDetails =
-            (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)?.data ?: return null
-        val list = (sourceRepository.resolve(details, d.season, d.episode) as? DataResult.Success)?.data ?: return null
-        if (list.isEmpty()) return null
+            (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)?.data ?: return emptyList()
+        val list = (sourceRepository.resolve(details, d.season, d.episode) as? DataResult.Success)?.data ?: return emptyList()
+        if (list.isEmpty()) return emptyList()
         val s = settings.current()
         val cap = s.downloadQuality.maxTier
         val capped = list.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { list }
-        return StreamPicker.pick(capped, cap, s.downloadSize, engine.isLowPower) ?: capped.firstOrNull()
+        val pool = capped.toMutableList()
+        val ranked = mutableListOf<StreamSource>()
+        while (ranked.size < MAX_SOURCE_ATTEMPTS && pool.isNotEmpty()) {
+            val next = StreamPicker.pick(pool, cap, s.downloadSize, engine.isLowPower, minBytes) ?: break
+            ranked += next
+            if (!pool.remove(next)) break   // defensive: picker returned something not in the pool
+        }
+        return ranked
     }
 
-    private suspend fun downloadTorrent(d: Download, source: StreamSource) {
+    /** Anti-fake floor for this download, RUNTIME-AWARE so legit short-form content is never rejected.
+     *  ~1 MB/min is far below any real encode (480p x265 runs 2–4 MB/min), so a 7-minute kids episode
+     *  (Bluey/Peppa, ~20 MB real) or a Pixar short passes, while the 2 MB fake class never does (10 MB
+     *  absolute floor). Unknown runtime falls back to conservative static ceilings (150 MB movie /
+     *  40 MB standard episode); known runtime is capped at those same ceilings so a 3-hour epic doesn't
+     *  demand more. */
+    private suspend fun minBytesFor(d: Download): Long {
+        val isEpisode = (d.episode ?: -1) >= 0
+        val ceiling = if (isEpisode) EPISODE_MIN_BYTES else MOVIE_MIN_BYTES
+        val runtimeMin: Int? = runCatching {
+            if (isEpisode) {
+                (catalogRepository.getEpisodes(d.mediaId, d.season ?: -1) as? DataResult.Success)
+                    ?.data?.firstOrNull { it.episodeNumber == d.episode }?.runtimeMinutes
+            } else {
+                (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)
+                    ?.data?.runtimeMinutes
+            }
+        }.getOrNull()
+        return if (runtimeMin != null && runtimeMin > 0) {
+            (runtimeMin * PER_MINUTE_MIN_BYTES).coerceIn(ABSOLUTE_MIN_BYTES, ceiling)
+        } else ceiling
+    }
+
+    private suspend fun downloadTorrent(d: Download, source: StreamSource, minBytes: Long) {
         var lastWrite = 0L
+        var lastBytes = -1L
+        var lastAdvanceAt = android.os.SystemClock.elapsedRealtime()
         // first { done } CANCELS the (hot, never-completing) streamer flow the instant the file is fully
         // downloaded — releasing workLock so the next queued item (e.g. the rest of a season) can run.
         // A plain collect{ return@collect } would loop forever and jam the queue. A terminal ERROR
-        // throws out to kick()'s runCatching, which marks the row FAILED.
-        val finalStatus = torrentStreamer.start(source)
-            .onEach { status ->
-                if (status.state == StreamState.ERROR) {
-                    throw java.io.IOException(status.errorMessage ?: "torrent error")
+        // throws out to the failover loop, which tries the next source.
+        val finalStatus = try {
+            torrentStreamer.start(source)
+                .onEach { status ->
+                    if (status.state == StreamState.ERROR) {
+                        throw java.io.IOException(status.errorMessage ?: "torrent error")
+                    }
+                    // FAKE-TORRENT GUARD: totalBytes is the SELECTED file's real size (or the advertised
+                    // size pre-metadata). Fake torrents ship a ~2 MB decoy .mkv that dodges the "sample"
+                    // name check, downloads to an honest 100%, and looked Downloaded. A movie can't be
+                    // 2 MB — abort the moment the size is known instead of saving junk.
+                    if (status.totalBytes in 1 until minBytes) {
+                        throw java.io.IOException("selected file too small to be real (${status.totalBytes} B < $minBytes B)")
+                    }
+                    // STALL GUARD: many fakes resolve metadata then deliver nothing (fabricated seeder
+                    // counts, dead swarm). Without an escape, first{} would hang forever, holding
+                    // workLock and jamming every queued download behind this one.
+                    val nowElapsed = android.os.SystemClock.elapsedRealtime()
+                    if (status.downloadedBytes > lastBytes) {
+                        lastBytes = status.downloadedBytes; lastAdvanceAt = nowElapsed
+                    } else if (nowElapsed - lastAdvanceAt > STALL_TIMEOUT_MS) {
+                        throw java.io.IOException("no progress in ${STALL_TIMEOUT_MS / 60_000} min — dead swarm")
+                    }
+                    val now = System.currentTimeMillis()
+                    if (now - lastWrite > PROGRESS_WRITE_MS) {
+                        lastWrite = now
+                        dao.updateProgress(
+                            d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
+                            DownloadStatus.DOWNLOADING.name, status.downloadedBytes, status.totalBytes,
+                            engine.filePath(source.infoHash),
+                        )
+                    }
                 }
-                val now = System.currentTimeMillis()
-                if (now - lastWrite > PROGRESS_WRITE_MS) {
-                    lastWrite = now
-                    dao.updateProgress(
-                        d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
-                        DownloadStatus.DOWNLOADING.name, status.downloadedBytes, status.totalBytes,
-                        engine.filePath(source.infoHash),
-                    )
+                .first { it.progress >= 0.999f && it.totalBytes > 0 }
+                // Belt-and-braces: never mark a sub-floor file COMPLETED. Inside the try so the same
+                // guarded cleanup below applies.
+                .also { fin ->
+                    if (fin.totalBytes < minBytes) {
+                        throw java.io.IOException("downloaded file too small to be real (${fin.totalBytes} B < $minBytes B)")
+                    }
                 }
+        } catch (e: Exception) {
+            // Rejected/failed torrent: drop its data so junk never lingers (or gets resumed) in the
+            // cache — but NEVER evict a PINNED hash. This failing attempt hasn't pinned (pin happens
+            // only after validation below), so an existing pin belongs to a COMPLETED sibling episode
+            // sharing this season-pack torrent: evicting would delete ALL the pack's files, including
+            // the sibling's finished episode. Skip on cancellation too — delete() does its own cleanup.
+            if (e !is kotlinx.coroutines.CancellationException && !cache.isPinned(source.infoHash)) {
+                runCatching { cache.evict(source.infoHash) }
             }
-            .first { it.progress >= 0.999f && it.totalBytes > 0 }
+            throw e
+        }
         cache.pin(source.infoHash)
         dao.updateProgress(
             d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
@@ -256,35 +382,59 @@ class DownloadManager @Inject constructor(
         )
     }
 
-    private suspend fun downloadDirect(d: Download, source: StreamSource) {
+    private suspend fun downloadDirect(d: Download, source: StreamSource, minBytes: Long) {
         val url = source.directUrl ?: return
         val out = File(downloadsDir, "${d.key}.mp4")
         val req = Request.Builder().url(url).apply {
             source.requestHeaders.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) header(k, v) }
         }.build()
-        http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw java.io.IOException("HTTP ${resp.code}")
-            val body = resp.body ?: throw java.io.IOException("empty body")
-            val total = body.contentLength().takeIf { it > 0 } ?: d.sizeBytes
-            var downloaded = 0L
-            var lastWrite = 0L
-            body.byteStream().use { input ->
-                out.outputStream().use { output ->
-                    val buf = ByteArray(256 * 1024)
-                    while (true) {
-                        val n = input.read(buf); if (n < 0) break
-                        output.write(buf, 0, n); downloaded += n
-                        val now = System.currentTimeMillis()
-                        if (now - lastWrite > PROGRESS_WRITE_MS) {
-                            lastWrite = now
-                            dao.updateProgress(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
-                                DownloadStatus.DOWNLOADING.name, downloaded, total, out.absolutePath)
+        try {
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) throw java.io.IOException("HTTP ${resp.code}")
+                val body = resp.body ?: throw java.io.IOException("empty body")
+                // DEAD/PLACEHOLDER GUARD: expired RD links and "configure this addon" placeholders come
+                // back HTTP 200 with an HTML/JSON body — that used to be saved as a 2 MB ".mp4" and
+                // shown as Downloaded. Reject non-media bodies and implausibly small advertised sizes
+                // BEFORE wasting the transfer.
+                val ct = body.contentType()?.toString()?.lowercase() ?: ""
+                if (ct.startsWith("text/") || ct.contains("json") || ct.contains("xml") || ct.contains("html")) {
+                    throw java.io.IOException("non-media response: $ct")
+                }
+                val declared = body.contentLength()
+                if (declared in 1 until minBytes) {
+                    throw java.io.IOException("response too small to be real ($declared B < $minBytes B)")
+                }
+                val total = declared.takeIf { it > 0 } ?: d.sizeBytes
+                var downloaded = 0L
+                var lastWrite = 0L
+                body.byteStream().use { input ->
+                    out.outputStream().use { output ->
+                        val buf = ByteArray(256 * 1024)
+                        while (true) {
+                            val n = input.read(buf); if (n < 0) break
+                            output.write(buf, 0, n); downloaded += n
+                            val now = System.currentTimeMillis()
+                            if (now - lastWrite > PROGRESS_WRITE_MS) {
+                                lastWrite = now
+                                dao.updateProgress(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
+                                    DownloadStatus.DOWNLOADING.name, downloaded, total, out.absolutePath)
+                            }
                         }
                     }
                 }
+                // ACTUAL-size floor: catches sources that lie in their metadata (advertise 2 GB, deliver
+                // 2 MB) and chunked responses with no Content-Length. Never present junk as Downloaded.
+                if (downloaded < minBytes) {
+                    throw java.io.IOException("downloaded file too small to be real ($downloaded B < $minBytes B)")
+                }
+                dao.updateProgress(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
+                    DownloadStatus.COMPLETED.name, downloaded, downloaded, out.absolutePath)
             }
-            dao.updateProgress(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
-                DownloadStatus.COMPLETED.name, downloaded, downloaded, out.absolutePath)
+        } catch (e: Exception) {
+            // Any failure (including the guards above): remove the junk/partial file so a rejected
+            // download can't masquerade in the downloads dir, then let the failover loop try the next.
+            runCatching { out.delete() }
+            throw e
         }
     }
 
@@ -294,5 +444,22 @@ class DownloadManager @Inject constructor(
     private companion object {
         const val TAG = "DownloadManager"
         const val PROGRESS_WRITE_MS = 1_500L
+
+        /** Anti-fake floor ceilings (used directly when runtime is unknown): a real FEATURE is never
+         *  under ~300 MB even at 480p; a real STANDARD (40+ min) episode never under ~60 MB. Well below
+         *  those so no legitimate release is rejected, well above the 2–150 MB fake/sample/error-page
+         *  class. Short-form content gets a runtime-scaled floor instead — see [minBytesFor]. */
+        const val MOVIE_MIN_BYTES = 150L * 1024 * 1024   // 150 MB
+        const val EPISODE_MIN_BYTES = 40L * 1024 * 1024  // 40 MB
+        const val PER_MINUTE_MIN_BYTES = 1L * 1024 * 1024 // 1 MB/min — under any real encode's bitrate
+        const val ABSOLUTE_MIN_BYTES = 10L * 1024 * 1024  // nothing real is under 10 MB
+
+        /** How many distinct sources to try before marking a download FAILED. New releases often lead
+         *  with fakes — a handful of alternates usually contains a real encode. */
+        const val MAX_SOURCE_ATTEMPTS = 4
+
+        /** No bytes for this long = dead/fake swarm → fail the attempt so the failover loop advances
+         *  (and releases workLock for the rest of the queue) instead of hanging forever. */
+        const val STALL_TIMEOUT_MS = 3L * 60 * 1000
     }
 }
