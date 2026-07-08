@@ -7,6 +7,7 @@ import com.slickstream.core.repository.ProfileRepository
 import com.slickstream.data.local.LibraryRepositoryImpl
 import com.slickstream.data.local.ProfileRepositoryImpl
 import com.slickstream.data.local.SlickDatabase
+import com.slickstream.data.local.dao.DownloadDao
 import com.slickstream.data.local.dao.FavoriteDao
 import com.slickstream.data.local.dao.ProfileDao
 import com.slickstream.data.local.dao.WatchHistoryDao
@@ -29,7 +30,7 @@ object LocalModule {
         Room.databaseBuilder(context, SlickDatabase::class.java, SlickDatabase.NAME)
             // Preserve profiles/favourites/history across the avatarIndex addition; fall back to a
             // wipe only for version steps without an explicit migration.
-            .addMigrations(SlickDatabase.MIGRATION_3_4, SlickDatabase.MIGRATION_4_5)
+            .addMigrations(SlickDatabase.MIGRATION_3_4, SlickDatabase.MIGRATION_4_5, SlickDatabase.MIGRATION_5_6)
             .fallbackToDestructiveMigration()
             .build()
 
@@ -41,6 +42,9 @@ object LocalModule {
 
     @Provides
     fun provideProfileDao(db: SlickDatabase): ProfileDao = db.profileDao()
+
+    @Provides
+    fun provideDownloadDao(db: SlickDatabase): DownloadDao = db.downloadDao()
 }
 
 /** Binds the [LibraryRepository] contract to its Room implementation. */

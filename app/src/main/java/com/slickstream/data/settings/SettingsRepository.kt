@@ -143,6 +143,12 @@ data class AppSettings(
      *  baked into the shipped APK) — but DOES sync to the user's other signed-in devices for convenience
      *  (painful to type a long URL on a TV remote). */
     val customSourceUrl: String = "",
+    /** Offline DOWNLOAD quality cap (separate from streaming): default ≤720p so a whole-season cache is
+     *  lean (~300 MB episodes), overridable per the size preference below. */
+    val downloadQuality: QualityPreference = QualityPreference.HD_720,
+    /** Within [downloadQuality], bias downloads toward smaller files vs best bitrate. Default SMALLEST
+     *  (the "cache a season in 720p/300 MB" case). */
+    val downloadSize: StreamSizePreference = StreamSizePreference.SMALLEST,
 )
 
 /** Screen-calibration triple (uniform scale + dp shift) used for the live, in-memory preview. */
@@ -207,6 +213,9 @@ class SettingsRepository @Inject constructor(
             screenOffsetX = (p[KEY_SCREEN_OFF_X] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
             screenOffsetY = (p[KEY_SCREEN_OFF_Y] ?: 0f).coerceIn(OFFSET_MIN, OFFSET_MAX),
             customSourceUrl = p[KEY_CUSTOM_SOURCE] ?: "",
+            downloadQuality = p[KEY_DL_QUALITY].toQuality(QualityPreference.HD_720),
+            downloadSize = p[KEY_DL_SIZE]?.let { runCatching { StreamSizePreference.valueOf(it) }.getOrNull() }
+                ?: StreamSizePreference.SMALLEST,
         )
     }
 
@@ -225,6 +234,8 @@ class SettingsRepository @Inject constructor(
     suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name; it.stampSynced() }
     suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name; it.stampSynced() }
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
+    suspend fun setDownloadQuality(q: QualityPreference) = dataStore.edit { it[KEY_DL_QUALITY] = q.name }
+    suspend fun setDownloadSize(s: StreamSizePreference) = dataStore.edit { it[KEY_DL_SIZE] = s.name }
     suspend fun setCustomSourceUrl(url: String) = dataStore.edit {
         it[KEY_CUSTOM_SOURCE] = url.trim()
         it.stampSynced()
@@ -315,6 +326,8 @@ class SettingsRepository @Inject constructor(
         val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
         val KEY_CUSTOM_SOURCE = stringPreferencesKey("custom_source_url")
+        val KEY_DL_QUALITY = stringPreferencesKey("download_quality")
+        val KEY_DL_SIZE = stringPreferencesKey("download_size")
         val KEY_UP_NEXT_PCT = intPreferencesKey("up_next_pct")
         val KEY_MOVIE_BAR_PCT = intPreferencesKey("movie_bar_pct")
         val KEY_SCREEN_SCALE = floatPreferencesKey("screen_scale")
