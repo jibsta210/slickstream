@@ -11,6 +11,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.StreamSource
+import com.slickstream.core.model.hasAired
 import com.slickstream.core.model.StreamState
 import com.slickstream.core.repository.CatalogRepository
 import com.slickstream.core.repository.ProfileRepository
@@ -67,6 +68,11 @@ class DownloadManager @Inject constructor(
     private val workLock = Mutex()
     private val http by lazy { OkHttpClient() }
 
+    /** key -> its running/queued worker Job, so delete() can actually STOP an in-flight download
+     *  (cancel → the streamer flow's awaitClose pauses the torrent) instead of letting it keep eating
+     *  bandwidth and re-pinning the hash we just evicted. */
+    private val activeJobs = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
     /** Bring up the foreground service so downloads survive the app being backgrounded / screen off.
      *  Safe to call repeatedly; the service self-stops once the queue drains. Called from every entry
      *  point that enqueues work (user tap or launch resume) — all foreground-initiated, so Android 12+
@@ -107,6 +113,13 @@ class DownloadManager @Inject constructor(
     fun download(item: MediaItem, season: Int? = null, episode: Int? = null, episodeLabel: String? = null) {
         scope.launch {
             runCatching {
+                // Idempotent: a repeat tap (or "Download season" re-run over already-saved episodes) must
+                // NOT wipe an in-flight/finished row back to QUEUED. Only (re)start when absent or FAILED.
+                val existing = dao.get(item.id, item.mediaType, season ?: -1, episode ?: -1)?.toDownload()
+                if (existing != null && existing.status != DownloadStatus.FAILED) {
+                    if (existing.status == DownloadStatus.QUEUED) { ensureService(); kick(existing) }
+                    return@launch
+                }
                 val profileId = profiles.currentProfileId()
                 val subtitle = when {
                     season != null && episode != null ->
@@ -132,14 +145,19 @@ class DownloadManager @Inject constructor(
         scope.launch {
             runCatching {
                 val eps = (catalogRepository.getEpisodes(show.id, seasonNumber) as? DataResult.Success)?.data ?: return@launch
-                eps.forEach { ep -> download(show, seasonNumber, ep.episodeNumber, ep.name) }
+                // Skip episodes with a FUTURE air date — they have no sources yet and would just pile up
+                // as FAILED rows. Unknown (null) air dates are kept (some shows omit them).
+                eps.filter { it.airDate == null || it.hasAired() }
+                    .forEach { ep -> download(show, seasonNumber, ep.episodeNumber, ep.name) }
             }.onFailure { Log.w(TAG, "downloadSeason failed", it) }
         }
     }
 
-    /** Delete a download: unpin + remove its files + drop the row. */
+    /** Delete a download: STOP it if running, then unpin + remove its files + drop the row. */
     suspend fun delete(d: Download) = withContext(Dispatchers.IO) {
         runCatching {
+            // Cancel first so the worker stops writing progress / re-pinning as we tear the row down.
+            activeJobs.remove(d.key)?.cancel()
             d.infoHash?.let { cache.unpin(it); cache.evict(it) }
             d.filePath?.let { p -> if (p.startsWith(downloadsDir.absolutePath)) File(p).delete() }
             dao.deleteByKey(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1)
@@ -154,7 +172,10 @@ class DownloadManager @Inject constructor(
     // --- queue worker --------------------------------------------------------
 
     private fun kick(d: Download) {
-        scope.launch {
+        // One worker per key. If it's already queued/running, don't double-launch (a re-kick of a
+        // QUEUED row must not spawn a second collector racing the first).
+        if (activeJobs.containsKey(d.key)) return
+        val job = scope.launch {
             workLock.withLock {
                 // Re-read the freshest state; skip if already done or removed.
                 val cur = dao.get(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1)?.toDownload() ?: return@withLock
@@ -165,6 +186,8 @@ class DownloadManager @Inject constructor(
                 }
             }
         }
+        activeJobs[d.key] = job
+        job.invokeOnCompletion { activeJobs.remove(d.key, job) }
     }
 
     private suspend fun runDownload(d: Download) {
