@@ -43,6 +43,21 @@ class TorrentCacheManager @Inject constructor(
     private val prefs: SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /** Info-hashes PINNED by an offline download — NEVER evicted by the LRU budget, whatever the
+     *  caller's protected set. Backed by its own prefs so it survives restarts. */
+    private val pinPrefs: SharedPreferences =
+        context.getSharedPreferences(PINS_PREFS_NAME, Context.MODE_PRIVATE)
+
+    /** Pin a downloaded torrent so the cache never evicts it. */
+    fun pin(hash: String) = pinPrefs.edit().putBoolean(hash, true).apply()
+
+    /** Unpin (e.g. the user deleted the download) — it becomes normal LRU-evictable cache again. */
+    fun unpin(hash: String) = pinPrefs.edit().remove(hash).apply()
+
+    fun isPinned(hash: String): Boolean = pinPrefs.getBoolean(hash, false)
+
+    fun pinnedHashes(): Set<String> = pinPrefs.all.keys.toSet()
+
     /** infoHash -> absolute path of its selected media file. The engine only knows paths for torrents
      *  added THIS process; without persisting them, evicting a cold cached torrent (after a restart)
      *  could delete only its bookkeeping and orphan the multi-GB payload on disk forever. */
@@ -91,8 +106,9 @@ class TorrentCacheManager @Inject constructor(
         // isActive filter would make the WHOLE cache un-evictable -> unbounded growth/OOM. The active +
         // warmed streams are protected via [protectedHashes] (the callers pass streamingHashes + the
         // playing + warmed hash); everything else — including paused-in-session partials — is evictable.
+        val pinned = pinnedHashes()
         val candidates = cachedTorrents()
-            .filter { it !in protectedHashes }
+            .filter { it !in protectedHashes && it !in pinned }   // pinned downloads are never evicted
             .sortedBy { lastAccess(it) }
         for (hash in candidates) {
             if (total - freed <= maxBytes) break
@@ -124,17 +140,18 @@ class TorrentCacheManager @Inject constructor(
      *  [protectedHashes] (currently streaming) are left completely untouched. */
     @Synchronized
     fun clearCache(protectedHashes: Set<String> = emptySet()) {
+        // PINNED offline downloads survive a "Clear cache" — they're not streaming scratch space.
+        val keep = protectedHashes + pinnedHashes()
         val known = cachedTorrents()
-        known.filterNot { it in protectedHashes }.forEach { runCatching { engine.stop(it, removeFiles = true) } }
-        if (protectedHashes.isEmpty()) {
+        known.filterNot { it in keep }.forEach { runCatching { engine.stop(it, removeFiles = true) } }
+        if (keep.isEmpty()) {
             cacheDir.listFiles()?.forEach { runCatching { it.deleteRecursively() } }
             File(cacheDir, ".resume").mkdirs()
             prefs.edit().clear().apply()
             pathPrefs.edit().clear().apply()
         } else {
-            // Something is streaming right now — evict everything else individually and keep the
-            // stream's files + bookkeeping intact.
-            known.filterNot { it in protectedHashes }.forEach { evict(it) }
+            // Something is streaming or pinned — evict everything else individually and keep those files.
+            known.filterNot { it in keep }.forEach { evict(it) }
         }
     }
 
@@ -173,6 +190,7 @@ class TorrentCacheManager @Inject constructor(
         private const val TAG = "TorrentCacheManager"
         private const val PREFS_NAME = "torrent_cache_lru"
         private const val PATHS_PREFS_NAME = "torrent_cache_paths"
+        private const val PINS_PREFS_NAME = "torrent_cache_pins"
 
         /** Default cache budget ~4 GB. */
         const val DEFAULT_MAX_BYTES = 4L * 1024L * 1024L * 1024L
