@@ -14,6 +14,9 @@ plugins {
 // local-only (cloud sync no-ops gracefully). This keeps the project building with no Firebase setup.
 if (file("google-services.json").exists()) {
     apply(plugin = "com.google.gms.google-services")
+    // Crashlytics needs the google-services config, so it's applied on the same condition. Without
+    // Firebase set up, crash/breadcrumb reporting no-ops (Diagnostics guards every call).
+    apply(plugin = "com.google.firebase.crashlytics")
 }
 
 // Read secrets from local.properties (gitignored) with env-var fallback.
@@ -199,5 +202,6 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.firestore)
     implementation(libs.firebase.auth)
+    implementation(libs.firebase.crashlytics)
     implementation(libs.kotlinx.coroutines.play.services)
 }

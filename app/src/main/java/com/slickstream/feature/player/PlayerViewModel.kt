@@ -136,8 +136,17 @@ class PlayerViewModel @Inject constructor(
     private val deviceProfile: DeviceProfile,
     private val vlcEngine: VlcEngine,
     private val downloadManager: DownloadManager,
+    private val diagnostics: com.slickstream.core.diagnostics.Diagnostics,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
+
+    /** Compact, secret-free source descriptor for diagnostics breadcrumbs. */
+    private fun StreamSource?.diagTag(): String = when {
+        this == null -> "none"
+        isOffline -> "offline"
+        isDirect -> "direct/${quality}"
+        else -> "torrent/${quality}"
+    }
 
     // --- Nav args -----------------------------------------------------------
     private val mediaType: MediaType =
@@ -812,6 +821,14 @@ class PlayerViewModel @Inject constructor(
                 !transitionInFlight &&
                 _currentSource.value?.isOffline != true
             ) {
+                diagnostics.event(
+                    "player_no_first_frame",
+                    mapOf(
+                        "backend" to if (usingVlcForSource) "vlc" else "exo",
+                        "source" to _currentSource.value.diagTag(),
+                        "tv" to deviceProfile.isTv.toString(),
+                    ),
+                )
                 _forceSourcePanel.value = true
             }
         }
@@ -907,6 +924,14 @@ class PlayerViewModel @Inject constructor(
             StreamPicker.pick(remaining, pref, sizePref, deviceProfile.isLowPower) ?: remaining.first()
         }
         _suggestSmaller.value = false
+        diagnostics.event(
+            "player_failover",
+            mapOf(
+                "from" to _currentSource.value.diagTag(),
+                "to" to next.diagTag(),
+                "remaining" to remaining.size.toString(),
+            ),
+        )
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
             seeders = if (next.isDirect) 0 else next.seeders ?: 0,
@@ -1351,6 +1376,7 @@ class PlayerViewModel @Inject constructor(
 
             override fun onPlayerError(error: PlaybackException) {
                 val p = _player.value
+                diagnostics.breadcrumb("exoError code=${error.errorCode} src=${_currentSource.value.diagTag()} played=$hasReachedPlaying")
                 if (_currentSource.value?.isDirect == true && !_isCasting.value) {
                     val isIoErr = error.errorCode in 2000..2999
                     // MID-PLAYBACK on a direct link (it already reached Playing): a transient IO blip — an
@@ -1583,6 +1609,7 @@ class PlayerViewModel @Inject constructor(
      *  releases the slot on return. */
     private fun switchToVlc(url: String, startPositionMs: Long) {
         if (!beginTransition()) return   // a failover/select transition already owns the slot — let it win
+        diagnostics.event("player_vlc_fallback", mapOf("source" to _currentSource.value.diagTag()))
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
             seeders = if (_currentSource.value?.isDirect == true) 0 else _currentSource.value?.seeders ?: 0,
