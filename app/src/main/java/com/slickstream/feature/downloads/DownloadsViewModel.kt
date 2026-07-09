@@ -22,4 +22,6 @@ class DownloadsViewModel @Inject constructor(
     fun delete(d: Download) {
         viewModelScope.launch { downloadManager.delete(d) }
     }
+
+    fun retry(d: Download) = downloadManager.retry(d)
 }

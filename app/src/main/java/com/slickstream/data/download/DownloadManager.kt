@@ -102,7 +102,13 @@ class DownloadManager @Inject constructor(
                 // JUNK SWEEP: builds before the anti-fake floors could store a 2 MB fake as COMPLETED
                 // ("Downloaded" that plays seconds of junk). Purge the junk artifacts and RE-QUEUE — the
                 // user asked for this title, and with the floors + failover it now lands a real source.
-                val junk = all.filter { it.isComplete && it.totalBytes in 1 until minBytesFor(it) }
+                //
+                // Gate on the FIXED ABSOLUTE_MIN_BYTES (10 MB), NOT the runtime-aware minBytesFor: that
+                // makes a TMDB call which FAILS offline and then returns the higher static CEILING, so on
+                // a plane the sweep would flag a legit short download (a 20 MB Bluey episode) as junk and
+                // DELETE it — unrecoverable with no network. Every real completed file is ≥ its
+                // download-time floor ≥ ABSOLUTE_MIN_BYTES, so <10 MB can only be pre-fix junk. No network.
+                val junk = all.filter { it.isComplete && it.totalBytes in 1 until ABSOLUTE_MIN_BYTES }
                 val junkKeys = junk.map { it.key }.toSet()
                 val keepHashes = all.filter { it.isComplete && it.key !in junkKeys }.mapNotNull { it.infoHash }.toSet()
                 junk.forEach { j ->
@@ -169,6 +175,22 @@ class DownloadManager @Inject constructor(
         }
     }
 
+    /** Retry a FAILED (or any) download in place: reset the row to QUEUED, clear the dead source, and
+     *  re-enqueue — no need to delete and re-navigate to the title. */
+    fun retry(d: Download) {
+        scope.launch {
+            runCatching {
+                val reset = d.copy(
+                    status = DownloadStatus.QUEUED, downloadedBytes = 0L, totalBytes = 0L,
+                    filePath = null, infoHash = null, magnetUri = null, directUrl = null,
+                )
+                dao.upsert(DownloadEntity.from(reset))
+                ensureService()
+                kick(reset)
+            }.onFailure { Log.w(TAG, "retry(${d.key}) failed", it) }
+        }
+    }
+
     /** Delete a download: STOP it if running, then unpin + remove its files + drop the row. */
     suspend fun delete(d: Download) = withContext(Dispatchers.IO) {
         runCatching {
@@ -192,6 +214,11 @@ class DownloadManager @Inject constructor(
     suspend fun completedFilePath(mediaId: Int, type: MediaType, season: Int?, episode: Int?): String? =
         dao.get(mediaId, type, season ?: -1, episode ?: -1)
             ?.toDownload()?.takeIf { it.isComplete }?.filePath
+
+    /** The full completed download row (title/poster/path), or null. Lets the player render + play a
+     *  downloaded title with NO network — the row carries everything, so no TMDB fetch is needed. */
+    suspend fun completedDownload(mediaId: Int, type: MediaType, season: Int?, episode: Int?): Download? =
+        dao.get(mediaId, type, season ?: -1, episode ?: -1)?.toDownload()?.takeIf { it.isComplete }
 
     // --- queue worker --------------------------------------------------------
 
@@ -307,15 +334,19 @@ class DownloadManager @Inject constructor(
     private suspend fun minBytesFor(d: Download): Long {
         val isEpisode = (d.episode ?: -1) >= 0
         val ceiling = if (isEpisode) EPISODE_MIN_BYTES else MOVIE_MIN_BYTES
-        val runtimeMin: Int? = runCatching {
-            if (isEpisode) {
-                (catalogRepository.getEpisodes(d.mediaId, d.season ?: -1) as? DataResult.Success)
-                    ?.data?.firstOrNull { it.episodeNumber == d.episode }?.runtimeMinutes
-            } else {
-                (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)
-                    ?.data?.runtimeMinutes
-            }
-        }.getOrNull()
+        // Bounded so a hung TMDB request can't pin workLock (this runs inside the one-at-a-time queue).
+        // On timeout/failure the runtime is unknown → the static ceiling, same as the offline case.
+        val runtimeMin: Int? = kotlinx.coroutines.withTimeoutOrNull(TMDB_LOOKUP_TIMEOUT_MS) {
+            runCatching {
+                if (isEpisode) {
+                    (catalogRepository.getEpisodes(d.mediaId, d.season ?: -1) as? DataResult.Success)
+                        ?.data?.firstOrNull { it.episodeNumber == d.episode }?.runtimeMinutes
+                } else {
+                    (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)
+                        ?.data?.runtimeMinutes
+                }
+            }.getOrNull()
+        }
         return if (runtimeMin != null && runtimeMin > 0) {
             (runtimeMin * PER_MINUTE_MIN_BYTES).coerceIn(ABSOLUTE_MIN_BYTES, ceiling)
         } else ceiling
@@ -380,11 +411,29 @@ class DownloadManager @Inject constructor(
             }
             throw e
         }
-        cache.pin(source.infoHash)
+        // DURABLE RELOCATION: the torrent's file lives in the app CACHE dir, which the OS can reclaim
+        // under storage pressure — so "downloaded for the plane" could silently vanish. Copy it into the
+        // persistent downloads dir (same place direct downloads land) and point the row THERE, so offline
+        // playback reads a file the system won't delete. A short/failed copy is treated as an attempt
+        // failure (failover tries the next source) rather than a bogus COMPLETED.
+        val src = engine.filePath(source.infoHash)?.let { File(it) }
+            ?: throw java.io.IOException("engine reported no file for completed torrent")
+        val ext = src.name.substringAfterLast('.', "mkv")
+        val dest = File(downloadsDir, "${d.key}.$ext")
+        runCatching { if (dest.exists()) dest.delete(); src.copyTo(dest, overwrite = true) }
+            .onFailure { runCatching { dest.delete() }; throw java.io.IOException("failed to persist download: ${it.message}") }
+        if (dest.length() < minBytes || dest.length() < src.length()) {
+            runCatching { dest.delete() }
+            throw java.io.IOException("persisted copy incomplete (${dest.length()} of ${src.length()} B)")
+        }
+        // We now own a durable copy, so the cache torrent no longer needs protection — unpin and let the
+        // LRU reclaim it normally. Do NOT evict: a season-pack sibling may still be downloading from the
+        // same torrent, and evict() deletes ALL the torrent's files.
+        runCatching { cache.unpin(source.infoHash) }
         dao.updateProgress(
             d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
             DownloadStatus.COMPLETED.name, finalStatus.totalBytes, finalStatus.totalBytes,
-            engine.filePath(source.infoHash),
+            dest.absolutePath,
         )
     }
 
@@ -467,5 +516,8 @@ class DownloadManager @Inject constructor(
         /** No bytes for this long = dead/fake swarm → fail the attempt so the failover loop advances
          *  (and releases workLock for the rest of the queue) instead of hanging forever. */
         const val STALL_TIMEOUT_MS = 3L * 60 * 1000
+
+        /** Cap on the runtime lookup so a hung TMDB call can't pin the download queue's workLock. */
+        const val TMDB_LOOKUP_TIMEOUT_MS = 8_000L
     }
 }

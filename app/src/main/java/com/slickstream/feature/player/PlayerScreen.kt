@@ -437,7 +437,9 @@ fun PlayerScreen(
             }
 
             // Torrent chunk bar at the bottom, shown with the controls — watch the file fill in. Polled ~1/s.
-            if (uiState is PlayerUiState.Playing && !isCasting) {
+            // Skip for DIRECT/OFFLINE sources: there's no swarm/piece map, so it only ever read
+            // "Downloading…" — nonsense over a completed offline file playing from disk.
+            if (uiState is PlayerUiState.Playing && !isCasting && currentSource?.isDirect != true) {
                 var pieceMap by remember { mutableStateOf(FloatArray(0)) }
                 var playheadFrac by remember { mutableStateOf(0f) }
                 var stats by remember { mutableStateOf<StreamStats?>(null) }

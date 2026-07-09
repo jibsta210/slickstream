@@ -411,6 +411,40 @@ class PlayerViewModel @Inject constructor(
 
     private fun load() {
         viewModelScope.launch {
+            // OFFLINE FIRST — before ANY network call. If this exact title/episode is fully downloaded
+            // AND the file is on disk, play it straight from local storage. This MUST precede
+            // getDetails(): on a plane getDetails() fails ("Can't reach TMDB") and would return before we
+            // ever checked for the download. The download row carries title/poster, so no TMDB needed.
+            _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Loading…")
+            val completed = downloadManager.completedDownload(mediaId, mediaType, currentSeason, currentEpisode)
+            // Revalidate the file is actually on disk AND roughly the expected size — a truncated/partial
+            // file (interrupted copy, cleared cache) must fall through to online resolution, not play junk.
+            val offlineFile = completed?.filePath?.let { java.io.File(it) }
+                ?.takeIf { it.exists() && (completed.totalBytes <= 0 || it.length() >= completed.totalBytes * 0.99) }
+            if (completed != null && offlineFile != null) {
+                _title.value = buildOfflineTitle(completed)
+                _backdropUrl.value = completed.backdropUrl ?: completed.posterUrl
+                // Best-effort online extras — episode list / similar / subtitles. Each fails silently
+                // offline; playback does not depend on any of them.
+                viewModelScope.launch { runCatching { loadEpisodeList() } }
+                val offline = StreamSource(
+                    title = "Downloaded",
+                    magnetUri = "",
+                    infoHash = "offline:$mediaId:${currentSeason ?: -1}:${currentEpisode ?: -1}",
+                    quality = completed.quality,
+                    sizeBytes = offlineFile.length(),
+                    seeders = null,
+                    provider = "Downloads",
+                    directUrl = android.net.Uri.fromFile(offlineFile).toString(),
+                    isOffline = true,
+                )
+                _sources.value = listOf(offline)
+                triedInfoHashes.clear()
+                failoverCount = 0
+                startSource(offline)
+                return@launch
+            }
+
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Fetching details…")
             val d = when (val r = catalogRepository.getDetails(mediaId, mediaType)) {
                 is DataResult.Success -> r.data
@@ -425,29 +459,6 @@ class PlayerViewModel @Inject constructor(
             viewModelScope.launch { loadSubtitles(d) }
             viewModelScope.launch { loadEpisodeList() }
             if (isMovie) viewModelScope.launch { loadSimilarMovies() }
-
-            // OFFLINE FIRST: if this exact title/episode is fully downloaded, play the local file and
-            // skip source resolution entirely — no network, works on a plane. A file that vanished from
-            // disk (user cleared storage) falls through to normal online resolution.
-            val offlinePath = downloadManager.completedFilePath(mediaId, mediaType, currentSeason, currentEpisode)
-            if (offlinePath != null && java.io.File(offlinePath).exists()) {
-                val offline = StreamSource(
-                    title = "Downloaded",
-                    magnetUri = "",
-                    infoHash = "offline:$mediaId:${currentSeason ?: -1}:${currentEpisode ?: -1}",
-                    quality = "",
-                    sizeBytes = java.io.File(offlinePath).length(),
-                    seeders = null,
-                    provider = "Downloads",
-                    directUrl = android.net.Uri.fromFile(java.io.File(offlinePath)).toString(),
-                    isOffline = true,
-                )
-                _sources.value = listOf(offline)
-                triedInfoHashes.clear()
-                failoverCount = 0
-                startSource(offline)
-                return@launch
-            }
 
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
             val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {
@@ -656,9 +667,11 @@ class PlayerViewModel @Inject constructor(
             // OFFLINE file:// — the bytes are already on disk. No HEAD probe (it's not HTTP), no failover
             // (there's nowhere to fail over to), just hand it to the player.
             if (source.isOffline) {
+                // No watchdog: a local file has nowhere to fail over to, and the direct startup watchdog
+                // would force a "Playback failed" Error screen if the decoder is slow to start. onPlayerError
+                // still handles a genuinely corrupt file (ExoPlayer→VLC handoff).
                 ensurePlayer(directUrl)
                 startProgressTicker()
-                armDirectWatchdog()
                 return
             }
             // Pre-play validation: a quick HEAD (fallback ranged GET) catches DEAD RD links (4xx/5xx) and
@@ -750,6 +763,8 @@ class PlayerViewModel @Inject constructor(
     }
 
     private fun armDirectWatchdog() {
+        // An offline file:// source has nowhere to fail over — never let the startup watchdog error it out.
+        if (_currentSource.value?.isOffline == true) return
         bufferWatchdogJob?.cancel()
         bufferWatchdogJob = viewModelScope.launch {
             delay(DIRECT_STARTUP_TIMEOUT_MS)
@@ -1796,6 +1811,13 @@ class PlayerViewModel @Inject constructor(
         val s = currentSeason
         val e = currentEpisode
         return if (s != null && e != null) "$base · S${s}E${e}" else base
+    }
+
+    /** Player title from a downloaded row (offline path — no MediaDetails available). */
+    private fun buildOfflineTitle(dl: com.slickstream.core.model.Download): String {
+        val s = currentSeason
+        val e = currentEpisode
+        return if (s != null && e != null) "${dl.title} · S${s}E${e}" else dl.title
     }
 
     // --- Next-episode prefetch (TV only) ------------------------------------

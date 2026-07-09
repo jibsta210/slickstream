@@ -98,6 +98,7 @@ fun TvDownloadsScreen(
                         focusRequester = if (d.key == downloads.first().key) firstFocus else null,
                         onPlay = { onPlay(d.mediaType, d.mediaId, d.season, d.episode) },
                         onDelete = { viewModel.delete(d) },
+                        onRetry = { viewModel.retry(d) },
                     )
                 }
             }
@@ -111,12 +112,14 @@ private fun TvDownloadRow(
     focusRequester: FocusRequester?,
     onPlay: () -> Unit,
     onDelete: () -> Unit,
+    onRetry: () -> Unit,
 ) {
     val d = download
+    val failed = d.status == DownloadStatus.FAILED
     val shape = RoundedCornerShape(16.dp)
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
         Surface(
-            onClick = { if (d.isComplete) onPlay() },
+            onClick = { if (d.isComplete) onPlay() else if (failed) onRetry() },
             shape = ClickableSurfaceDefaults.shape(shape = shape),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = Brand.Surface,
@@ -156,7 +159,7 @@ private fun TvDownloadRow(
                             Spacer(Modifier.width(8.dp))
                             Text("Downloaded${d.quality.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}", style = MaterialTheme.typography.bodyMedium, color = Color(0xFF22C55E))
                         }
-                        DownloadStatus.FAILED -> Text("Failed — delete and retry", style = MaterialTheme.typography.bodyMedium, color = Brand.Error)
+                        DownloadStatus.FAILED -> Text("Failed — select to retry", style = MaterialTheme.typography.bodyMedium, color = Brand.Error)
                         DownloadStatus.QUEUED -> Text("Queued…", style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
                         else -> {
                             Box(

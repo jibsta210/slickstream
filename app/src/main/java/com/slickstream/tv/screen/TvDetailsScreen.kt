@@ -686,15 +686,17 @@ private fun EpisodeCard(
     // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode shows a check.
     val isWatched = (progress ?: 0f) >= 0.92f
     // A future/unreleased episode is shown (info + air date) but can't be played — disabling the
-    // Surface makes it non-clickable so the D-pad lands on the last AIRED episode instead.
+    // Surface makes it non-clickable so the D-pad lands on the last AIRED episode instead. BUT a
+    // downloaded episode is always playable (offline), even one with no/future air date.
     val aired = episode.hasAired()
+    val playable = aired || download?.isComplete == true
     Column(
         modifier = Modifier.width(300.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
     Surface(
         onClick = onClick,
-        enabled = aired,
+        enabled = playable,
         shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = Brand.Surface,

@@ -92,6 +92,7 @@ fun DownloadsScreen(
                         download = d,
                         onPlay = { onPlay(d.mediaType, d.mediaId, d.season, d.episode) },
                         onDelete = { viewModel.delete(d) },
+                        onRetry = { viewModel.retry(d) },
                     )
                 }
             }
@@ -100,14 +101,21 @@ fun DownloadsScreen(
 }
 
 @Composable
-private fun DownloadRow(download: Download, onPlay: () -> Unit, onDelete: () -> Unit) {
+private fun DownloadRow(download: Download, onPlay: () -> Unit, onDelete: () -> Unit, onRetry: () -> Unit) {
     val d = download
+    val failed = d.status == DownloadStatus.FAILED
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
             .background(Brand.Surface)
-            .then(if (d.isComplete) Modifier.clickable(onClick = onPlay) else Modifier)
+            .then(
+                when {
+                    d.isComplete -> Modifier.clickable(onClick = onPlay)
+                    failed -> Modifier.clickable(onClick = onRetry)   // tap a failed row to retry
+                    else -> Modifier
+                }
+            )
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -129,7 +137,7 @@ private fun DownloadRow(download: Download, onPlay: () -> Unit, onDelete: () -> 
                     Spacer(Modifier.width(6.dp))
                     Text("Downloaded${d.quality.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}${sizeSuffix(d.totalBytes)}", color = Color(0xFF22C55E), fontSize = 12.sp)
                 }
-                DownloadStatus.FAILED -> Text("Failed — tap delete and retry", color = Brand.Error, fontSize = 12.sp)
+                DownloadStatus.FAILED -> Text("Failed — tap to retry", color = Brand.Error, fontSize = 12.sp)
                 DownloadStatus.QUEUED -> Text("Queued…", color = Brand.OnSurfaceDim, fontSize = 12.sp)
                 else -> {
                     LinearProgressIndicator(
