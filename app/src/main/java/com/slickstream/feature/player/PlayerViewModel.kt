@@ -193,6 +193,20 @@ class PlayerViewModel @Inject constructor(
     private val _currentPlayer = MutableStateFlow<androidx.media3.common.Player?>(null)
     val currentPlayer: StateFlow<androidx.media3.common.Player?> = _currentPlayer.asStateFlow()
 
+    // First-frame guard: a source can report STATE_READY (uiState=Playing) yet never paint a frame — a
+    // botched surface hand-off on a mid-stream failover leaves AUDIO over a BLACK screen. onVideoSizeChanged
+    // (w>0,h>0) is the "a frame actually decoded" signal for BOTH backends. If it never fires, the watchdog
+    // forces the source panel open so the user always has an escape hatch (never stranded on black).
+    @Volatile private var firstFrameRendered = false
+    private var firstFrameWatchdogJob: Job? = null
+    private val _forceSourcePanel = MutableStateFlow(false)
+    /** Set true when a fresh source reaches "Playing" but never renders a frame — the UI opens the source
+     *  picker in response (an escape hatch that doesn't depend on D-pad focus). UI clears it via [consumeForceSourcePanel]. */
+    val forceSourcePanel: StateFlow<Boolean> = _forceSourcePanel.asStateFlow()
+
+    /** UI acknowledges it opened the source panel for [forceSourcePanel]. */
+    fun consumeForceSourcePanel() { _forceSourcePanel.value = false }
+
     private val _isCasting = MutableStateFlow(false)
     val isCasting: StateFlow<Boolean> = _isCasting.asStateFlow()
 
@@ -628,10 +642,12 @@ class PlayerViewModel @Inject constructor(
         triedInfoHashes.add(source.infoHash)
         transitionInFlight = false
         lastEmittedDownloadedBytes = 0L
-        // Fresh source -> reset the VLC-fallback latch and stop any prior VLC playback so it can't
-        // keep playing audio underneath the new source.
+        // Fresh source -> reset the VLC-fallback latch and RELEASE any prior VLC player (not just stop:
+        // a stopped VLC keeps its surface/vout latched and the next VLC source renders audio-only black).
+        // Load-bearing on the manual-select / initial-load paths, which reach startSource WITHOUT going
+        // through releaseLocalPlayer. The failover path already released it, so this is then a no-op.
         usingVlcForSource = false
-        vlcPlayer?.let { runCatching { it.stop() } }
+        releaseVlcPlayer()
         prefetchTriggeredForEpisode = false
         prefetchJob?.cancel()
         // Fresh source — re-arm the smaller-stream hint and start its buffering clock.
@@ -640,6 +656,8 @@ class PlayerViewModel @Inject constructor(
         _rebuffering.value = null
         rebufferWatchdogJob?.cancel()   // fresh source -> drop any pending downshift from the old one
         hasReachedPlaying = false       // new source starts in the STARTUP phase (failover watchdog owns it)
+        firstFrameRendered = false      // fresh source hasn't painted yet — re-arm the no-frame watchdog on READY
+        firstFrameWatchdogJob?.cancel()
         latestStatus = null
         firstReadyAtMs = 0L
         // The old source's audio-track list is meaningless for the new stream (and on the VLC path it
@@ -776,6 +794,29 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
+    /** A source can reach STATE_READY (uiState=Playing) yet never paint a frame — a botched surface
+     *  hand-off on a mid-stream failover plays AUDIO over a BLACK screen, and in Playing there's no
+     *  overlay, so the user is stranded with no switch-source button. If no frame renders within the
+     *  window, force the source panel open — the always-reachable escape hatch. We do NOT auto-failover
+     *  (a slow-but-fine stream might just be late to paint; let the user decide). Authoritative on the
+     *  [firstFrameRendered] FLAG, not the timer, so a stream that DID paint is never interrupted. */
+    private fun armFirstFrameWatchdog() {
+        firstFrameWatchdogJob?.cancel()
+        // Offline file:// has nowhere to switch to and can decode slowly on a cold codec — never nag it.
+        if (_currentSource.value?.isOffline == true) return
+        firstFrameWatchdogJob = viewModelScope.launch {
+            delay(FIRST_FRAME_TIMEOUT_MS)
+            if (!firstFrameRendered &&
+                _uiState.value is PlayerUiState.Playing &&
+                !_isCasting.value &&
+                !transitionInFlight &&
+                _currentSource.value?.isOffline != true
+            ) {
+                _forceSourcePanel.value = true
+            }
+        }
+    }
+
     /** Short-timeout client used only for the pre-play direct-link HEAD check. */
     private val validationClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -891,13 +932,26 @@ class PlayerViewModel @Inject constructor(
     private fun releaseLocalPlayer() {
         bufferWatchdogJob?.cancel()
         rebufferWatchdogJob?.cancel()
+        firstFrameWatchdogJob?.cancel()
         progressTickJob?.cancel()
         val exo = _player.value
         playerListener?.let { exo?.removeListener(it) }
         exo?.release()
         _player.value = null
-        vlcPlayer?.let { runCatching { it.stop() } }
+        // RELEASE (not just stop) the VLC player, and do it AFTER the UI unbinds. The old code only
+        // stop()'d it, so its vout/surface state stayed latched: on a later source that remounted the
+        // TV PlayerView with a fresh SurfaceView, VLC's stale "already attached" latch skipped the
+        // re-attach and the new surface got NO video — audio-only BLACK (the reported "double player").
+        // Releasing forces the next VLC use to build a virgin player that attaches cleanly. Defer the
+        // release ~80ms (mirrors the Exo hand-off in ensureVlcPlayer) so PlayerView detaches its surface
+        // from a LIVE player first — releasing synchronously would clearVideoSurfaceView on a freed
+        // native player and crash.
+        val outgoingVlc = vlcPlayer
+        vlcPlayer = null
         if (!_isCasting.value) _currentPlayer.value = null
+        outgoingVlc?.let { v ->
+            viewModelScope.launch { try { delay(80) } finally { runCatching { v.release() } } }
+        }
         currentMediaUrl = null
         sourceErrorRetries = 0
     }
@@ -1203,6 +1257,7 @@ class PlayerViewModel @Inject constructor(
                             rebufferWatchdogJob?.cancel()
                             hasReachedPlaying = true
                             _uiState.value = PlayerUiState.Playing
+                            if (!firstFrameRendered) armFirstFrameWatchdog()
                             maybeStartThumbnails(exo)
                         }
                     }
@@ -1255,6 +1310,7 @@ class PlayerViewModel @Inject constructor(
                 val w = videoSize.width
                 val h = videoSize.height
                 if (w > 0 && h > 0) {
+                    firstFrameRendered = true   // a real frame decoded -> the no-frame watchdog stands down
                     val par = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
                     _videoAspect.value = (w * par) / h
                 }
@@ -1460,6 +1516,7 @@ class PlayerViewModel @Inject constructor(
                     rebufferWatchdogJob?.cancel()
                     hasReachedPlaying = true
                     _uiState.value = PlayerUiState.Playing
+                    if (!firstFrameRendered) armFirstFrameWatchdog()
                 }
                 Player.STATE_BUFFERING -> {
                     if (_uiState.value !is PlayerUiState.Playing) {
@@ -1497,6 +1554,7 @@ class PlayerViewModel @Inject constructor(
             val w = videoSize.width
             val h = videoSize.height
             if (w > 0 && h > 0) {
+                firstFrameRendered = true   // VLC decoded a real frame -> the no-frame watchdog stands down
                 val par = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
                 _videoAspect.value = (w * par) / h
             }
@@ -1532,8 +1590,14 @@ class PlayerViewModel @Inject constructor(
             label = "Switching player…",
         )
         currentMediaUrl = null   // force ensureVlcPlayer to (re)load even if the url matches
-        ensureVlcPlayer(url, startPositionMs)
-        transitionInFlight = false   // the Exo->VLC swap completed synchronously; release the slot
+        // try/finally: a throw from native libVLC construction/prepare must NOT leak the transition slot
+        // true forever — that permanently no-ops selectSource() and failoverToNext(), which is the
+        // "switch-source button does nothing from every state" wedge.
+        try {
+            ensureVlcPlayer(url, startPositionMs)
+        } finally {
+            transitionInFlight = false   // the Exo->VLC swap completed synchronously; release the slot
+        }
     }
 
     /** Release the VLC fallback player, if any. */
@@ -2103,6 +2167,11 @@ class PlayerViewModel @Inject constructor(
         /** A direct link must reach Playing within this budget or it's failed over (no swarm watchdog
          *  covers direct sources). Short: a live host starts fast; a dead one shouldn't stall the user. */
         const val DIRECT_STARTUP_TIMEOUT_MS = 12_000L
+
+        /** A source that says "Playing" but hasn't painted a frame within this window is black (bad
+         *  surface hand-off / failed decode) — surface the source picker so the user can escape. Long
+         *  enough that a cold libVLC vout attach on a low-power TV box isn't cut off. */
+        const val FIRST_FRAME_TIMEOUT_MS = 8_000L
 
         /** Auto-pick floor: don't choose a torrent under this many seeders if a healthier one exists. */
         const val MIN_SEEDERS = 8

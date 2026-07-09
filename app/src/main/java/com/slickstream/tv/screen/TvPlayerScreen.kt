@@ -297,10 +297,30 @@ fun TvPlayerScreen(
     // receives any D-pad press and re-shows the transport. ONLY while Playing — the Buffering/Error
     // overlays own their own focus (Back / Switch source / Retry); stealing it to the invisible root
     // Box is exactly what left the loading screen unfocused with a dead D-pad.
-    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showSimilarBar, uiState) {
-        if (uiState is PlayerUiState.Playing &&
+    LaunchedEffect(controlsVisible, anyPanelOpen, showUpNext, showSimilarBar, uiState, player) {
+        if (uiState is PlayerUiState.Playing && player != null &&
             !controlsVisible && !anyPanelOpen && !showUpNext && !showSimilarBar) {
-            rootFocus.requestFocus()
+            // RETRY, don't fire once: a single requestFocus() raced the AndroidView remount after a
+            // mid-stream failover and silently no-op'd, orphaning focus so NO D-pad press reached
+            // onPreviewKeyEvent — the "couldn't access the switch stream button anymore" wedge. Gated on
+            // player != null (skip the surface-unmounted window) and self-cancels the moment state shifts.
+            repeat(12) {
+                if (uiState !is PlayerUiState.Playing || controlsVisible || anyPanelOpen) return@LaunchedEffect
+                if (runCatching { rootFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                kotlinx.coroutines.delay(50)
+            }
+        }
+    }
+
+    // Escape hatch from a black "Playing" frame: the VM's no-first-frame watchdog fires this when a
+    // fresh source reports Playing but never paints. Open the source picker with NO dependency on D-pad
+    // focus (which may be orphaned by the failover), so the user is never stranded on a black screen.
+    val forceSourcePanel by viewModel.forceSourcePanel.collectAsStateWithLifecycle()
+    LaunchedEffect(forceSourcePanel) {
+        if (forceSourcePanel) {
+            panelOpen = true
+            controlsVisible = true
+            viewModel.consumeForceSourcePanel()
         }
     }
 
@@ -345,6 +365,10 @@ fun TvPlayerScreen(
                     Key.MediaFastForward -> { p?.let { it.seekTo(it.currentPosition + 10_000) }; controlsVisible = true; true }
                     Key.MediaRewind -> { p?.let { it.seekTo((it.currentPosition - 10_000).coerceAtLeast(0)) }; controlsVisible = true; true }
                     Key.MediaStop -> { onBack(); true }
+                    // Dedicated escape hatch: MENU always opens the source picker, from ANY state —
+                    // so a black stream that reports "Playing" (no overlay, no visible switch button)
+                    // is never a dead end.
+                    Key.Menu -> { panelOpen = true; controlsVisible = true; true }
                     Key.Back -> false   // never swallow Back, or buffering/error states would trap the user
                     else -> {
                         // Any other D-pad press just re-shows the transport (while playing) — UNLESS the

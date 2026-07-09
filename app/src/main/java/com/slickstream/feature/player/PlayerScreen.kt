@@ -153,6 +153,12 @@ fun PlayerScreen(
     var scrubPreviewMs by remember { mutableStateOf<Long?>(null) }
 
     var showSources by remember { mutableStateOf(false) }
+    // Escape hatch from a black "Playing" frame (VM's no-first-frame watchdog): open the source sheet
+    // so a stream that plays audio over black is never a dead end — same signal the TV screen consumes.
+    val forceSourcePanel by viewModel.forceSourcePanel.collectAsState()
+    LaunchedEffect(forceSourcePanel) {
+        if (forceSourcePanel) { showSources = true; viewModel.consumeForceSourcePanel() }
+    }
     var showSubtitles by remember { mutableStateOf(false) }
     var showAudio by remember { mutableStateOf(false) }
     var showEpisodes by remember { mutableStateOf(false) }

@@ -382,19 +382,26 @@ class VlcPlayer(
     private val surfaceCallback = object : SurfaceHolder.Callback {
         override fun surfaceCreated(holder: SurfaceHolder) {}
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            // Already attached to this surface → just re-tell VLC the window size (cheap, no flicker);
-            // attach for real only the first time the surface goes valid.
-            if (voutAttached) applyWindowSize(width, height)
-            else currentSurfaceView?.let { doAttach(it, width, height) }
+            // Re-attach whenever the vout isn't bound to THIS exact surface. A mid-stream failover
+            // remounts PlayerView with a FRESH SurfaceView; a stale voutAttached==true latch (from the
+            // previous surface) used to make this a no-op resize, so the new surface never got a vout —
+            // AUDIO played over a BLACK screen. The identity check forces a real re-attach.
+            val sv = currentSurfaceView
+            if (voutAttached && attachedSurface === sv) applyWindowSize(width, height)
+            else sv?.let { doAttach(it, width, height) }
         }
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             voutAttached = false
+            attachedSurface = null
             runCatching { mediaPlayer.vlcVout.detachViews() }
         }
     }
 
     /** True once VLC's vout is attached to the current surface (so surfaceChanged can just resize). */
     private var voutAttached = false
+    /** The exact SurfaceView the vout is currently attached to — so a remounted (different-identity)
+     *  surface forces a real re-attach even if [voutAttached] is stale-true. */
+    private var attachedSurface: SurfaceView? = null
 
     /**
      * libVLC reports the decoded video layout here. We re-assert the FULL surface as the window so VLC
@@ -433,6 +440,7 @@ class VlcPlayer(
             vout.attachViews(videoLayoutListener)
             vout.setWindowSize(width.coerceAtLeast(1), height.coerceAtLeast(1))
             voutAttached = true
+            attachedSurface = surfaceView
             // Black out the SurfaceView buffer until VLC paints its first frame — otherwise the
             // uninitialised surface buffer shows through as the Android-TV "blue box" while buffering
             // (a slow source that never decodes a frame left the whole screen blue). Cleared to
@@ -448,6 +456,7 @@ class VlcPlayer(
         currentSurfaceView?.holder?.removeCallback(surfaceCallback)
         currentSurfaceView = null
         voutAttached = false
+        attachedSurface = null
         runCatching { mediaPlayer.vlcVout.detachViews() }
     }
 
