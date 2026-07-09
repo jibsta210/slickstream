@@ -85,6 +85,22 @@ class Diagnostics @Inject constructor(
         }
     }
 
+    /** Fire ONE verifiable report per app version per install — a Firestore `diagnostics_online` event
+     *  AND a Crashlytics non-fatal — so the pipeline can be confirmed live WITHOUT waiting for a real
+     *  crash or player event. Once per versionName per device = negligible noise; each update re-proves
+     *  it. No-ops in debug (collection off + Firestore skipped). */
+    fun heartbeatOncePerVersion() {
+        val current = BuildConfig.VERSION_NAME
+        if (prefs.getString(KEY_HEARTBEAT_VERSION, null) == current) return
+        prefs.edit().putString(KEY_HEARTBEAT_VERSION, current).apply()
+        event("diagnostics_online", mapOf("via" to "heartbeat"))
+        nonFatal(DiagnosticsHeartbeat(current), mapOf("kind" to "heartbeat"))
+    }
+
+    /** Non-fatal marker for [heartbeatOncePerVersion] — a distinct type so it groups on its own in the
+     *  Crashlytics console (clearly a self-test, not a real error). */
+    private class DiagnosticsHeartbeat(version: String) : Exception("Diagnostics online — v$version")
+
     /** A recovered-but-notable error we want a stack + aggregation for (shows up as a Crashlytics
      *  non-fatal issue, grouped across installs). */
     fun nonFatal(t: Throwable, data: Map<String, String> = emptyMap()) {
@@ -98,5 +114,6 @@ class Diagnostics @Inject constructor(
 
     private companion object {
         const val KEY_INSTALL_ID = "install_id"
+        const val KEY_HEARTBEAT_VERSION = "heartbeat_version"
     }
 }

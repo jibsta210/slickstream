@@ -65,6 +65,9 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var downloadManager: com.slickstream.data.download.DownloadManager
 
+    @Inject
+    lateinit var diagnostics: com.slickstream.core.diagnostics.Diagnostics
+
     // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
     private val onTv: Boolean get() = deviceProfile.isTv
 
@@ -164,6 +167,9 @@ class MainActivity : ComponentActivity() {
         // Re-queue any download that was mid-flight when the app was last killed, so "download a season
         // for the plane" survives a swipe-away or a reboot instead of stalling half-done.
         lifecycleScope.launch { runCatching { downloadManager.resumeInterrupted() } }
+        // One verifiable diagnostics report per version per device (proves crash + breadcrumb reporting
+        // is live without waiting for a real crash). No-op in debug.
+        runCatching { diagnostics.heartbeatOncePerVersion() }
         setContent {
             val settings by settingsRepository.settings
                 .collectAsStateWithLifecycle(initialValue = AppSettings())
