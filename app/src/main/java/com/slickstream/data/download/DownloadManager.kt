@@ -117,7 +117,9 @@ class DownloadManager @Inject constructor(
                 // download-time floor ≥ ABSOLUTE_MIN_BYTES, so <10 MB can only be pre-fix junk. No network.
                 val junk = all.filter { it.isComplete && it.totalBytes in 1 until ABSOLUTE_MIN_BYTES }
                 val junkKeys = junk.map { it.key }.toSet()
-                val keepHashes = all.filter { it.isComplete && it.key !in junkKeys }.mapNotNull { it.infoHash }.toSet()
+                // Protect the hash of EVERY non-junk row (any status), not just completed ones — an
+                // in-progress season-pack sibling shares the torrent and must not lose its files.
+                val keepHashes = all.filter { it.key !in junkKeys }.mapNotNull { it.infoHash }.toSet()
                 junk.forEach { j ->
                     Log.w(TAG, "junk sweep: re-queueing ${j.key} (${j.totalBytes} B)")
                     // Same season-pack guard as delete(): never evict a hash a good sibling still uses.
@@ -125,7 +127,7 @@ class DownloadManager @Inject constructor(
                     j.filePath?.let { p -> if (p.startsWith(downloadsDir.absolutePath)) runCatching { File(p).delete() } }
                     dao.upsert(DownloadEntity.from(j.copy(
                         status = DownloadStatus.QUEUED, downloadedBytes = 0L, totalBytes = 0L,
-                        filePath = null, infoHash = null, magnetUri = null, directUrl = null,
+                        filePath = null, infoHash = null, magnetUri = null, fileIndex = null, directUrl = null,
                     )))
                 }
                 val pending = all.filter { it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING } + junk
@@ -189,7 +191,7 @@ class DownloadManager @Inject constructor(
             runCatching {
                 val reset = d.copy(
                     status = DownloadStatus.QUEUED, downloadedBytes = 0L, totalBytes = 0L,
-                    filePath = null, infoHash = null, magnetUri = null, directUrl = null,
+                    filePath = null, infoHash = null, magnetUri = null, fileIndex = null, directUrl = null,
                 )
                 dao.upsert(DownloadEntity.from(reset))
                 ensureService()
@@ -269,6 +271,7 @@ class DownloadManager @Inject constructor(
             val withSource = d.copy(
                 quality = source.quality, sizeBytes = source.sizeBytes ?: 0L,
                 infoHash = source.infoHash.takeIf { !source.isDirect }, magnetUri = source.magnetUri.takeIf { it.isNotBlank() },
+                fileIndex = source.fileIndex.takeIf { !source.isDirect },
                 directUrl = source.directUrl, status = DownloadStatus.DOWNLOADING,
                 downloadedBytes = 0L, totalBytes = 0L, filePath = null,
             )
@@ -304,8 +307,10 @@ class DownloadManager @Inject constructor(
                 sizeBytes = sizeBytes.takeIf { it > 0 }, seeders = null, provider = "Download", directUrl = directUrl)
         }
         if (infoHash != null && !magnetUri.isNullOrBlank()) {
+            // Carry the stored fileIndex so a resumed SEASON-PACK episode re-selects the exact file
+            // instead of the largest one (which would silently download the wrong episode).
             return StreamSource(title = title, magnetUri = magnetUri, infoHash = infoHash, quality = quality,
-                sizeBytes = sizeBytes.takeIf { it > 0 }, seeders = null, provider = "Download")
+                sizeBytes = sizeBytes.takeIf { it > 0 }, seeders = null, provider = "Download", fileIndex = fileIndex)
         }
         return null
     }
@@ -409,11 +414,11 @@ class DownloadManager @Inject constructor(
                 }
         } catch (e: Exception) {
             // Rejected/failed torrent: drop its data so junk never lingers (or gets resumed) in the
-            // cache — but NEVER evict a PINNED hash. This failing attempt hasn't pinned (pin happens
-            // only after validation below), so an existing pin belongs to a COMPLETED sibling episode
-            // sharing this season-pack torrent: evicting would delete ALL the pack's files, including
-            // the sibling's finished episode. Skip on cancellation too — delete() does its own cleanup.
-            if (e !is kotlinx.coroutines.CancellationException && !cache.isPinned(source.infoHash)) {
+            // cache — but NEVER evict a hash another download ROW still uses. Season-pack episodes share
+            // one torrent, so evicting would delete ALL the pack's files, killing a sibling that's
+            // downloading or already finished from the same torrent. Skip on cancellation (delete()
+            // handles its own cleanup).
+            if (e !is kotlinx.coroutines.CancellationException && !hashUsedByOtherRow(source.infoHash, d.key)) {
                 runCatching { cache.evict(source.infoHash) }
             }
             throw e
@@ -503,6 +508,11 @@ class DownloadManager @Inject constructor(
             throw e
         }
     }
+
+    /** True when a download row OTHER than [exceptKey] still references [hash] — evicting it would
+     *  delete the shared season-pack torrent's files out from under that sibling. */
+    private suspend fun hashUsedByOtherRow(hash: String, exceptKey: String): Boolean =
+        dao.getAll().any { it.infoHash == hash && it.toDownload().key != exceptKey }
 
     private suspend fun setStatus(d: Download, status: DownloadStatus) =
         dao.updateProgress(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1, status.name, d.downloadedBytes, d.totalBytes, d.filePath)

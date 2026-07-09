@@ -30,7 +30,10 @@ object LocalModule {
         Room.databaseBuilder(context, SlickDatabase::class.java, SlickDatabase.NAME)
             // Preserve profiles/favourites/history across the avatarIndex addition; fall back to a
             // wipe only for version steps without an explicit migration.
-            .addMigrations(SlickDatabase.MIGRATION_3_4, SlickDatabase.MIGRATION_4_5, SlickDatabase.MIGRATION_5_6)
+            .addMigrations(
+                SlickDatabase.MIGRATION_3_4, SlickDatabase.MIGRATION_4_5,
+                SlickDatabase.MIGRATION_5_6, SlickDatabase.MIGRATION_6_7,
+            )
             .fallbackToDestructiveMigration()
             .build()
 

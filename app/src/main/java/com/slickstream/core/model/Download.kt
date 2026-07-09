@@ -23,6 +23,7 @@ data class Download(
     val sizeBytes: Long,       // expected total from the chosen source (0 if unknown)
     val infoHash: String?,     // torrent source (null for a direct/RD download)
     val magnetUri: String?,
+    val fileIndex: Int?,       // which file inside a multi-file (season-pack) torrent; null = single-file
     val directUrl: String?,    // direct/RD source (null for a torrent download)
     val filePath: String?,     // local file once known
     val status: DownloadStatus,

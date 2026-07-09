@@ -26,6 +26,7 @@ data class DownloadEntity(
     val sizeBytes: Long,
     val infoHash: String?,
     val magnetUri: String?,
+    val fileIndex: Int? = null,
     val directUrl: String?,
     val filePath: String?,
     val status: String,       // DownloadStatus.name
@@ -48,6 +49,7 @@ data class DownloadEntity(
         sizeBytes = sizeBytes,
         infoHash = infoHash,
         magnetUri = magnetUri,
+        fileIndex = fileIndex,
         directUrl = directUrl,
         filePath = filePath,
         status = runCatching { DownloadStatus.valueOf(status) }.getOrDefault(DownloadStatus.QUEUED),
@@ -72,6 +74,7 @@ data class DownloadEntity(
             sizeBytes = d.sizeBytes,
             infoHash = d.infoHash,
             magnetUri = d.magnetUri,
+            fileIndex = d.fileIndex,
             directUrl = d.directUrl,
             filePath = d.filePath,
             status = d.status.name,

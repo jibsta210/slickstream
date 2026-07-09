@@ -21,7 +21,9 @@ import com.slickstream.data.local.entity.WatchHistoryEntity
     // so existing profiles/favourites/history are NOT wiped.
     // v5: profiles gain updatedAt (last-write-wins for cross-device profile edits) — MIGRATION_4_5.
     // v6: a downloads table (offline downloads) — MIGRATION_5_6 (additive CREATE TABLE).
-    version = 6,
+    // v7: downloads.fileIndex — which file inside a season-pack torrent, so a resumed pack episode
+    //     re-selects the RIGHT file instead of the largest — MIGRATION_6_7 (additive column).
+    version = 7,
     exportSchema = false,
 )
 @TypeConverters(MediaTypeConverter::class)
@@ -63,6 +65,14 @@ abstract class SlickDatabase : RoomDatabase() {
                         "totalBytes INTEGER NOT NULL, addedAt INTEGER NOT NULL, profileId TEXT NOT NULL, " +
                         "PRIMARY KEY(mediaId, mediaType, season, episode))",
                 )
+            }
+        }
+
+        /** Add downloads.fileIndex (nullable) so a resumed season-pack episode re-selects the exact
+         *  file instead of falling back to the largest one. Additive; existing rows get NULL. */
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE downloads ADD COLUMN fileIndex INTEGER")
             }
         }
     }
