@@ -66,7 +66,14 @@ class DownloadManager @Inject constructor(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val workLock = Mutex()
-    private val http by lazy { OkHttpClient() }
+    // Explicit read timeout so a stalled/slow-drip direct host can't jam the one-at-a-time queue: a
+    // gap longer than this throws, the failover loop advances, and workLock is released.
+    private val http by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
 
     /** key -> its running/queued worker Job, so delete() can actually STOP an in-flight download
      *  (cancel → the streamer flow's awaitClose pauses the torrent) instead of letting it keep eating
@@ -439,7 +446,11 @@ class DownloadManager @Inject constructor(
 
     private suspend fun downloadDirect(d: Download, source: StreamSource, minBytes: Long) {
         val url = source.directUrl ?: return
-        val out = File(downloadsDir, "${d.key}.mp4")
+        // Keep the real container extension so ExoPlayer infers the right extractor for offline play
+        // (a downloaded .mkv saved as .mp4 could mis-sniff). Fall back to mp4 when the URL has none.
+        val ext = url.substringBefore('?').substringAfterLast('.', "")
+            .lowercase().takeIf { it in setOf("mp4", "mkv", "webm", "mov", "m4v", "avi", "ts") } ?: "mp4"
+        val out = File(downloadsDir, "${d.key}.$ext")
         val req = Request.Builder().url(url).apply {
             source.requestHeaders.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) header(k, v) }
         }.build()

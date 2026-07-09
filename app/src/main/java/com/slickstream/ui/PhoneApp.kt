@@ -216,6 +216,7 @@ fun PhoneApp() {
                     onMediaClick = { item -> navController.navigateToDetails(item) },
                     onPlayClick = { item -> navController.navigateToPlayer(item) },
                     onResumeClick = { history -> navController.navigateToPlayer(history) },
+                    onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) { launchSingleTop = true } },
                 )
             }
 

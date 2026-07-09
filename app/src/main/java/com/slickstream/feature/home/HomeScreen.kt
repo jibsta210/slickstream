@@ -47,9 +47,11 @@ fun HomeScreen(
     onPlayClick: (MediaItem) -> Unit,
     onResumeClick: (WatchHistoryItem) -> Unit,
     modifier: Modifier = Modifier,
+    onOpenDownloads: () -> Unit = {},
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val hasDownloads by viewModel.hasDownloads.collectAsStateWithLifecycle()
 
     when {
         state.isLoading && state.isEmpty -> {
@@ -58,9 +60,13 @@ fun HomeScreen(
 
         state.errorMessage != null && state.isEmpty -> {
             ErrorRetry(
-                message = state.errorMessage!!,
+                message = if (hasDownloads)
+                    "You're offline. Browsing needs a connection — but your downloads are ready to watch."
+                else state.errorMessage!!,
                 onRetry = viewModel::refresh,
                 modifier = modifier.fillMaxSize(),
+                secondaryLabel = if (hasDownloads) "View downloads" else null,
+                onSecondary = if (hasDownloads) onOpenDownloads else null,
             )
         }
 

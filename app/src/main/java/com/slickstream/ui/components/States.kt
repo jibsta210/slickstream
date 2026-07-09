@@ -16,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -49,6 +50,10 @@ fun ErrorRetry(
     message: String,
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Optional secondary action (e.g. "View downloads" when the network is down but offline content
+     *  exists) — rendered as a ghost button under the primary Try again. */
+    secondaryLabel: String? = null,
+    onSecondary: (() -> Unit)? = null,
 ) {
     Box(
         modifier = modifier.fillMaxSize(),
@@ -91,6 +96,24 @@ fun ErrorRetry(
                     style = MaterialTheme.typography.labelLarge,
                     modifier = Modifier.padding(start = 8.dp),
                 )
+            }
+            if (secondaryLabel != null && onSecondary != null) {
+                androidx.compose.material3.TextButton(
+                    onClick = onSecondary,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.textButtonColors(contentColor = Brand.Cyan),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Download,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Text(
+                        text = secondaryLabel,
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
             }
         }
     }

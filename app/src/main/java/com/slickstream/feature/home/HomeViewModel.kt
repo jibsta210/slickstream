@@ -70,10 +70,19 @@ class HomeViewModel @Inject constructor(
     private val libraryRepository: LibraryRepository,
     private val profileRepository: ProfileRepository,
     private val settingsRepository: SettingsRepository,
+    downloadManager: com.slickstream.data.download.DownloadManager,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+
+    /** True when the user has at least one download — used to offer "View downloads" on the offline
+     *  error screen, since the whole catalog UI is TMDB-gated and dead with no network. */
+    val hasDownloads: StateFlow<Boolean> =
+        downloadManager.downloads
+            .map { it.isNotEmpty() }
+            .distinctUntilChanged()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     /**
      * Live "Continue Watching" feed from the local library — the user's full watch history, scrollable,
