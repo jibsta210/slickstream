@@ -815,22 +815,34 @@ class PlayerViewModel @Inject constructor(
         if (_currentSource.value?.isOffline == true) return
         firstFrameWatchdogJob = viewModelScope.launch {
             delay(FIRST_FRAME_TIMEOUT_MS)
-            if (!firstFrameRendered &&
-                _uiState.value is PlayerUiState.Playing &&
-                !_isCasting.value &&
-                !transitionInFlight &&
-                _currentSource.value?.isOffline != true
-            ) {
-                diagnostics.event(
-                    "player_no_first_frame",
-                    mapOf(
-                        "backend" to if (usingVlcForSource) "vlc" else "exo",
-                        "source" to _currentSource.value.diagTag(),
-                        "tv" to deviceProfile.isTv.toString(),
-                    ),
-                )
-                _forceSourcePanel.value = true
+            if (firstFrameRendered ||
+                _uiState.value !is PlayerUiState.Playing ||
+                _isCasting.value ||
+                transitionInFlight ||
+                _currentSource.value?.isOffline == true
+            ) return@launch
+            // Audio (and subtitles) play but no frame ever painted: the video decoder can't render this
+            // stream — almost always a codec/profile ExoPlayer's hardware path rejects (HEVC 10-bit / HDR
+            // / AVC High level the TV won't decode).
+            diagnostics.event(
+                "player_no_first_frame",
+                mapOf(
+                    "backend" to if (usingVlcForSource) "vlc" else "exo",
+                    "source" to _currentSource.value.diagTag(),
+                    "tv" to deviceProfile.isTv.toString(),
+                ),
+            )
+            if (!usingVlcForSource) {
+                // libVLC bundles software decoders for everything ExoPlayer's hardware path can't do —
+                // hand it the SAME source at the live position. This actually FIXES the black screen
+                // (the "every codec plays" fallback) instead of only offering a manual escape.
+                val url = currentMediaUrl
+                val pos = _currentPlayer.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                if (url != null) { switchToVlc(url, pos); return@launch }
             }
+            // Already on VLC and STILL no frame (or no url) — a genuinely broken stream: open the source
+            // picker so the user is never stranded on black (always-reachable, focus-independent).
+            _forceSourcePanel.value = true
         }
     }
 
@@ -1335,10 +1347,17 @@ class PlayerViewModel @Inject constructor(
                 val w = videoSize.width
                 val h = videoSize.height
                 if (w > 0 && h > 0) {
-                    firstFrameRendered = true   // a real frame decoded -> the no-frame watchdog stands down
+                    // NOTE: dimensions known != a frame PAINTED. A profile the TV decoder rejects
+                    // (HEVC Main10 / HDR / unusual level) reports size here but never renders — audio +
+                    // subtitles play over a black screen. onRenderedFirstFrame below is the authoritative
+                    // "a frame actually reached the surface" signal that stands the watchdog down.
                     val par = videoSize.pixelWidthHeightRatio.takeIf { it > 0f } ?: 1f
                     _videoAspect.value = (w * par) / h
                 }
+            }
+
+            override fun onRenderedFirstFrame() {
+                firstFrameRendered = true   // a frame truly painted -> not a black screen
             }
 
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
