@@ -1524,6 +1524,11 @@ class PlayerViewModel @Inject constructor(
             vlcPlayer = built
             built.addListener(buildVlcListener(built))
         }
+        // Authoritative VLC "frames are rendering" signal (libVLC's Vout event) — the Media3
+        // onVideoSizeChanged proxy can miss on a late vout, and the watchdog then popped the source
+        // panel over a video that was playing FINE. Re-set on every (re)use: it's the current source's
+        // watchdog this must stand down.
+        vlc.onFirstFrame = { firstFrameRendered = true }
         // Reusing a VlcPlayer across a switch: drop its STALE surface binding so PlayerView's rebind
         // triggers a real re-attach. Without this, attachSurface() early-returns on the same SurfaceView
         // and the vout is never reattached -> the exact "audio plays but NO video" bug.

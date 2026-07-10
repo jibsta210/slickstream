@@ -51,6 +51,13 @@ class VlcPlayer(
         requestHeaders = headers
     }
 
+    /** Fired (on the main thread, once per vout creation) when libVLC reports a LIVE video output —
+     *  the authoritative "frames are rendering" signal. The VM's no-first-frame watchdog keys on this:
+     *  the Media3 onVideoSizeChanged proxy depends on track DIMENSIONS being parsed at Vout time, which
+     *  can lag or miss on a late (setVideoTrackEnabled-created) vout — and then the watchdog popped the
+     *  source panel over a video that was playing fine. */
+    var onFirstFrame: (() -> Unit)? = null
+
     // --- Mutable player state, all read back in getState() ---
     private var playWhenReadyField: Boolean = false
     private var mediaItemField: MediaItem? = null
@@ -151,6 +158,7 @@ class VlcPlayer(
 
             MediaPlayer.Event.Vout -> {
                 if (voutCount > 0) {
+                    onFirstFrame?.invoke()   // video output is LIVE — frames are rendering
                     if (playbackStateField == Player.STATE_BUFFERING) {
                         playbackStateField = Player.STATE_READY
                     }
