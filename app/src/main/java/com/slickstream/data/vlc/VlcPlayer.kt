@@ -393,6 +393,9 @@ class VlcPlayer(
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             voutAttached = false
             attachedSurface = null
+            // Disable the video track while there's no surface (mirrors the enable in doAttach) so the
+            // next attach's setVideoTrackEnabled(true) is a real transition that rebuilds the vout.
+            runCatching { mediaPlayer.setVideoTrackEnabled(false) }
             runCatching { mediaPlayer.vlcVout.detachViews() }
         }
     }
@@ -439,6 +442,14 @@ class VlcPlayer(
             // real video dimensions.
             vout.attachViews(videoLayoutListener)
             vout.setWindowSize(width.coerceAtLeast(1), height.coerceAtLeast(1))
+            // libVLC creates its video output at play() time. On the mid-stream Exo->VLC hand-off,
+            // ensureVlcPlayer play()s SYNCHRONOUSLY and the PlayerView rebind (-> this attach) lands a
+            // Compose frame LATER — so the session started with NO vout, and late attachViews alone
+            // never creates one: audio plays over a permanently BLACK surface. Re-asserting the video
+            // track after attach forces libVLC to (re)create the vout against the now-attached views —
+            // the same pattern VLC-android's own VideoPlayerActivity uses. No-op when playback hasn't
+            // started yet (the cold-start ordering), so the happy path is untouched.
+            runCatching { mediaPlayer.setVideoTrackEnabled(true) }
             voutAttached = true
             attachedSurface = surfaceView
             // Black out the SurfaceView buffer until VLC paints its first frame — otherwise the
@@ -457,6 +468,7 @@ class VlcPlayer(
         currentSurfaceView = null
         voutAttached = false
         attachedSurface = null
+        runCatching { mediaPlayer.setVideoTrackEnabled(false) }
         runCatching { mediaPlayer.vlcVout.detachViews() }
     }
 
