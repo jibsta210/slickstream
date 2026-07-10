@@ -63,6 +63,7 @@ class DownloadManager @Inject constructor(
     private val cache: TorrentCacheManager,
     private val settings: SettingsRepository,
     private val profiles: ProfileRepository,
+    private val deviceProfile: com.slickstream.core.common.DeviceProfile,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val workLock = Mutex()
@@ -325,7 +326,9 @@ class DownloadManager @Inject constructor(
         val list = (sourceRepository.resolve(details, d.season, d.episode) as? DataResult.Success)?.data ?: return emptyList()
         if (list.isEmpty()) return emptyList()
         val s = settings.current()
-        val cap = s.downloadQuality.maxTier
+        // Clamp downloads to what the panel can show too — a 4K file on a 1080p device wastes GBs of
+        // storage and often can't hardware-decode (black screen). Same rule as streaming.
+        val cap = minOf(s.downloadQuality.maxTier, deviceProfile.maxDisplayTier)
         val capped = list.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { list }
         val pool = capped.toMutableList()
         val ranked = mutableListOf<StreamSource>()

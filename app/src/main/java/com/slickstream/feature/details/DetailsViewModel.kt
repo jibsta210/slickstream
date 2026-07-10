@@ -297,7 +297,10 @@ class DetailsViewModel @Inject constructor(
                 }
                 if (list.isEmpty()) return@launch
                 val settings = settingsRepository.current()
-                val best = StreamPicker.pick(list, settings.wifiQuality.maxTier, settings.streamSize, deviceProfile.isLowPower)
+                // Same display clamp as the player's pickPreferred — the prewarm must warm the SAME
+                // source the player will pick, or the prefetch is wasted.
+                val warmTier = minOf(settings.wifiQuality.maxTier, deviceProfile.maxDisplayTier)
+                val best = StreamPicker.pick(list, warmTier, settings.streamSize, deviceProfile.isLowPower)
                     ?: return@launch
                 // The picker sinks CAMs below real encodes, so a CAM only wins when nothing better exists
                 // — flag it for the details UI ("CAM" badge: the only version out is a cinema rip).

@@ -154,6 +154,17 @@ class VlcPlayer(
                     if (playbackStateField == Player.STATE_BUFFERING) {
                         playbackStateField = Player.STATE_READY
                     }
+                    // Frames are rendering NOW — lift the black anti-"blue box" backing. It's a View
+                    // background painted OVER the SurfaceView's punched hole, and it was only cleared in
+                    // the OnNewVideoLayout callback — which does NOT re-fire when the vout is created
+                    // LATE via setVideoTrackEnabled (the mid-stream Exo->VLC rescue). Result: the video
+                    // played invisibly under a black view ("every video black, frames flash on
+                    // back-press"). Vout(count>0) is the authoritative "video output live" event, so
+                    // clear it here too and re-assert the window size so the picture fills the surface.
+                    currentSurfaceView?.let { sv ->
+                        sv.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                        if (sv.width > 0 && sv.height > 0) applyWindowSize(sv.width, sv.height)
+                    }
                     updateVideoSize()
                 }
             }

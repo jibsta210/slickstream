@@ -39,4 +39,30 @@ class DeviceProfile @Inject constructor(
             ?.isLowRamDevice == true
         isTv || lowRam
     }
+
+    /**
+     * The highest quality TIER this display can actually show (matches QualityPreference tiers:
+     * 4 = 2160p-class panel, 3 = 1080p, 2 = 720p, 1 = below). There's no point pulling a 4K source on
+     * a 1080p panel — bigger file, slower start, and on many TV boxes an undecodable HEVC Main10
+     * profile that ends in a black screen. The pickers clamp every quality preference to this.
+     *
+     * Read from the display's SUPPORTED MODES, not window metrics — TV boxes commonly render the app
+     * UI at 1080p while the panel (and the video pipeline) is genuinely 4K, so metrics under-report.
+     * Falls back to metrics if modes are unavailable.
+     */
+    val maxDisplayTier: Int = run {
+        val maxHeight = runCatching {
+            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as? android.hardware.display.DisplayManager
+            dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+                ?.supportedModes
+                ?.maxOfOrNull { minOf(it.physicalWidth, it.physicalHeight) }
+        }.getOrNull()
+            ?: context.resources.displayMetrics.let { minOf(it.widthPixels, it.heightPixels) }
+        when {
+            maxHeight >= 2000 -> 4  // 2160p-class
+            maxHeight >= 1000 -> 3  // 1080p (also the right cap for 1440p phones — no 1440p tier)
+            maxHeight >= 700 -> 2   // 720p
+            else -> 1
+        }
+    }
 }

@@ -602,18 +602,22 @@ class PlayerViewModel @Inject constructor(
      * profile (and the dominant cause of "playback failed" on TV). Quality only tiebreaks.
      */
     private suspend fun pickPreferred(list: List<StreamSource>, pref: QualityPreference): StreamSource {
-        currentNetworkMaxTier = pref.maxTier   // cache for the synchronous smaller-source scan
+        // Clamp the user's quality preference to what the PANEL can show: a 4K source on a 1080p screen
+        // is a bigger file, a slower start, and often an HEVC Main10 profile the box can't hardware-decode
+        // (the dominant "black screen with audio" trigger). Applies regardless of the settings tier.
+        val prefTier = minOf(pref.maxTier, deviceProfile.maxDisplayTier)
+        currentNetworkMaxTier = prefTier   // cache for the synchronous smaller-source scan
         // File-server-first: a DIRECT http/hls source plays INSTANTLY with no swarm, so always prefer the
         // best direct stream (within the quality cap) over any torrent. Only fall through to the torrent
         // health-pick when there's no direct source.
         val directs = list.filter { it.isDirect }
         if (directs.isNotEmpty()) {
-            val cap = if (deviceProfile.isLowPower) minOf(pref.maxTier, QualityPreference.FHD_1080.maxTier) else pref.maxTier
+            val cap = if (deviceProfile.isLowPower) minOf(prefTier, QualityPreference.FHD_1080.maxTier) else prefTier
             return directs.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { directs }
                 .maxByOrNull { it.rank } ?: directs.first()
         }
         val sizePref = settingsRepository.current().streamSize
-        return StreamPicker.pick(list, pref.maxTier, sizePref, deviceProfile.isLowPower) ?: list.first()
+        return StreamPicker.pick(list, prefTier, sizePref, deviceProfile.isLowPower) ?: list.first()
     }
 
     /**
@@ -920,7 +924,8 @@ class PlayerViewModel @Inject constructor(
         // leaves the guard stuck). Synchronous, before any suspension, so two triggers can't both fire.
         if (!beginTransition()) return true
         if (leavingDirect) directFailoverCount++ else failoverCount++
-        val pref = currentNetworkMaxTier ?: networkQualityPreference().maxTier
+        // currentNetworkMaxTier is already display-clamped by pickPreferred; clamp the fallback read too.
+        val pref = currentNetworkMaxTier ?: minOf(networkQualityPreference().maxTier, deviceProfile.maxDisplayTier)
         val sizePref = settingsRepository.current().streamSize
         // Prefer another DIRECT (RD/file-server) link before dropping to a torrent — an expired/revoked
         // RD URL mid-stream should retry the next INSTANT RD source, not silently downshift to a slow
