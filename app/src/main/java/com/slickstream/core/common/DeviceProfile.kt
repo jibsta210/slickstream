@@ -35,9 +35,15 @@ class DeviceProfile @Inject constructor(
     }
 
     val isLowPower: Boolean = run {
-        val lowRam = (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
-            ?.isLowRamDevice == true
-        isTv || lowRam
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        val lowRam = am?.isLowRamDevice == true
+        val totalRamBytes = ActivityManager.MemoryInfo().also { info ->
+            runCatching { am?.getMemoryInfo(info) }
+        }.totalMem
+        // Form factor is not a performance tier. Treating every TV as low-power throttled capable
+        // Shield/mini-PC class devices to one disk/hash worker and the smallest I/O queue. Keep the
+        // conservative profile for Android's own low-RAM classification and genuinely small TV boxes.
+        lowRam || (isTv && totalRamBytes in 1 until LOW_POWER_TV_RAM_BYTES)
     }
 
     /**
@@ -64,5 +70,10 @@ class DeviceProfile @Inject constructor(
             maxHeight >= 700 -> 2   // 720p
             else -> 1
         }
+    }
+
+    private companion object {
+        /** Boxes below ~2.5 GiB are where aggressive hashing/writeback commonly hurts video decode. */
+        const val LOW_POWER_TV_RAM_BYTES = 2560L * 1024L * 1024L
     }
 }

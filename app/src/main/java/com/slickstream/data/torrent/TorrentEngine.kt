@@ -5,9 +5,17 @@ import android.util.Log
 import com.slickstream.core.common.DeviceProfile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.libtorrent4j.AddTorrentParams
 import org.libtorrent4j.AlertListener
+import org.libtorrent4j.Entry
+import org.libtorrent4j.FileStorage
 import org.libtorrent4j.Priority
+import org.libtorrent4j.PieceIndexBitfield
 import org.libtorrent4j.SessionManager
 import org.libtorrent4j.SessionParams
 import org.libtorrent4j.SettingsPack
@@ -22,6 +30,7 @@ import org.libtorrent4j.alerts.SaveResumeDataFailedAlert
 import org.libtorrent4j.alerts.TorrentRemovedAlert
 import org.libtorrent4j.swig.session_handle
 import org.libtorrent4j.swig.settings_pack
+import org.libtorrent4j.swig.libtorrent
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -62,6 +71,17 @@ class TorrentEngine @Inject constructor(
 
     /** infoHash (lowercase hex) -> handle bookkeeping. */
     private val torrents = ConcurrentHashMap<String, ActiveTorrent>()
+    /** Serializes acquisition/metadata/file selection per hash without blocking unrelated torrents. */
+    private val acquisitionLocks = ConcurrentHashMap<String, Mutex>()
+    /** Bridges suspendable acquisition locks with synchronous cache eviction. An eviction claims the
+     *  hash before deletion; acquisitions wait for it, and eviction refuses while any add is in flight. */
+    private val acquisitionStateLock = Any()
+    private val acquisitionCounts = mutableMapOf<String, Int>()
+    private val streamingLeaseCounts = mutableMapOf<String, Int>()
+    private val evictingHashes = mutableSetOf<String>()
+    /** Hashes created by the old shared-root layout. They continue using that root until their normal
+     *  eviction, preserving every already-downloaded episode/padding file in a season pack. */
+    private val legacyLayoutHashes = ConcurrentHashMap.newKeySet<String>()
 
     /** infoHashes awaiting their SAVE_RESUME_DATA alert before being removed from the session. */
     private val pendingRemoval = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
@@ -95,11 +115,13 @@ class TorrentEngine @Inject constructor(
         @Volatile var lastPiece: Int = 0,
         @Volatile var fileOffset: Long = 0L,
         @Volatile var readHeadPiece: Int = -1,
+        @Volatile var startupTailArmed: Boolean = false,
     )
 
     @Synchronized
     fun ensureStarted() {
         if (started.get()) return
+        migrateLegacyStorageIfNeeded()
         // Android TV boxes / low-RAM devices choke on aggressive torrenting (hundreds of peer
         // connections + piece hashing + decode saturate a weak SoC and freeze the UI). Throttle.
         val lowPower = deviceProfile.isLowPower
@@ -117,9 +139,10 @@ class TorrentEngine @Inject constructor(
             setInteger(settings_pack.int_types.active_limit.swigValue(), if (lowPower) 8 else 16)
             setInteger(settings_pack.int_types.torrent_connect_boost.swigValue(), if (lowPower) 80 else 200)
             setInteger(settings_pack.int_types.connection_speed.swigValue(), if (lowPower) 80 else 300)
-            // Announce to only the first working tier on low-power (less inbound peer flood to crypt).
-            setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), !lowPower)
-            setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), !lowPower)
+            // A tracker can respond successfully with zero peers. Stopping at that tier strands thin
+            // swarms even when another tracker knows the only seed, so discovery must span all tiers.
+            setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), true)
+            setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), true)
             // Keep DHT (needed for poorly-seeded discovery), but drop LSD/UPnP/NAT-PMP background
             // network+CPU work a pure leech/stream TV client never needs.
             setBoolean(settings_pack.bool_types.enable_dht.swigValue(), true)
@@ -133,13 +156,17 @@ class TorrentEngine @Inject constructor(
                 )
             }
             setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), !lowPower)
-            setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), !lowPower)
-            setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), !lowPower)
-            // Cap upload to 100 KB/s on ALL devices. We're a streaming/leech client, not a seedbox —
-            // an uncapped upload saturates the (usually small) home upstream and tanks the whole
-            // connection while a cached torrent keeps seeding after you've watched. 100 KB/s is plenty
-            // for tit-for-tat peer reciprocity without choking the link.
-            setInteger(settings_pack.int_types.upload_rate_limit.swigValue(), UPLOAD_RATE_LIMIT)
+            // Port mapping is particularly valuable for obscure swarms: without it we can only reach
+            // outbound-connectable peers. Its steady-state CPU cost is negligible compared with hashing.
+            setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), true)
+            setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), true)
+            // Keep upload bounded, but leave enough for BitTorrent tit-for-tat. The old 100 KB/s cap
+            // caused leecher-heavy/old swarms to choke this client even when they had the needed pieces.
+            // An uncapped upload can still saturate a small home upstream, so this remains conservative.
+            setInteger(
+                settings_pack.int_types.upload_rate_limit.swigValue(),
+                if (lowPower) LOW_POWER_UPLOAD_RATE_LIMIT else UPLOAD_RATE_LIMIT,
+            )
             // Cap the DOWNLOAD on EVERY device. Under sequential streaming the engine pulls the WHOLE
             // file ahead at line rate in the background while you only play at the bitrate — uncapped on
             // a gigabit link that saturates the pipe and bufferbloats every other device in the house
@@ -163,8 +190,10 @@ class TorrentEngine @Inject constructor(
             // small steady batches instead of bursting the slow eMMC.
             if (lowPower) {
                 runCatching {
-                    setInteger(settings_pack.int_types.max_queued_disk_bytes.swigValue(), 1 * 1024 * 1024)
-                    setInteger(settings_pack.int_types.file_pool_size.swigValue(), 4)
+                    // 1 MB is smaller than a normal piece/request pipeline and hard-throttles libtorrent's
+                    // disk thread. Keep this bounded, but large enough to batch writes on slow flash.
+                    setInteger(settings_pack.int_types.max_queued_disk_bytes.swigValue(), 8 * 1024 * 1024)
+                    setInteger(settings_pack.int_types.file_pool_size.swigValue(), 16)
                     setBoolean(settings_pack.bool_types.no_atime_storage.swigValue(), true)
                     setInteger(settings_pack.int_types.unchoke_slots_limit.swigValue(), 4)
                 }
@@ -185,7 +214,7 @@ class TorrentEngine @Inject constructor(
             // deadlined head band dominate new requests. Tunable: raise toward 1500 if pickup throughput
             // regresses on fast links. Low-power TV stays 500.
             setInteger(settings_pack.int_types.max_out_request_queue.swigValue(), if (lowPower) 500 else 800)
-            setInteger(settings_pack.int_types.peer_connect_timeout.swigValue(), 8)
+            setInteger(settings_pack.int_types.peer_connect_timeout.swigValue(), 15)
             setInteger(settings_pack.int_types.request_timeout.swigValue(), 20)
             setInteger(settings_pack.int_types.predictive_piece_announce.swigValue(), 3)
             setInteger(
@@ -206,6 +235,26 @@ class TorrentEngine @Inject constructor(
         return
     }
 
+    /** Payloads before layout v2 shared one root. Moving only the selected path would orphan the other
+     *  downloaded episodes/padding in a pack, while moving a top-level folder can steal files shared by
+     *  another torrent. Keep known legacy hashes on their original save path until normal eviction;
+     *  every newly-seen hash uses the isolated v2 directory. */
+    private fun migrateLegacyStorageIfNeeded() {
+        val layoutPrefs = context.getSharedPreferences(STORAGE_LAYOUT_PREFS, Context.MODE_PRIVATE)
+        val legacyRoot = File(context.cacheDir, CACHE_DIR_NAME)
+        legacyRoot.mkdirs()
+        val pathPrefs = context.getSharedPreferences("torrent_cache_paths", Context.MODE_PRIVATE)
+        for ((hash, rawPath) in pathPrefs.all) {
+            if (!INFO_HASH_REGEX.matches(hash)) continue
+            val source = (rawPath as? String)?.let(::File) ?: continue
+            val relative = runCatching { source.relativeTo(legacyRoot) }.getOrNull() ?: continue
+            if (!relative.path.startsWith("$hash${File.separator}")) legacyLayoutHashes += hash
+        }
+        if (layoutPrefs.getInt(STORAGE_LAYOUT_VERSION_KEY, 0) < STORAGE_LAYOUT_VERSION) {
+            layoutPrefs.edit().putInt(STORAGE_LAYOUT_VERSION_KEY, STORAGE_LAYOUT_VERSION).commit()
+        }
+    }
+
     /** Android TV or a system-flagged low-RAM device — both warrant gentle torrent + read settings. */
     val isLowPower: Boolean get() = deviceProfile.isLowPower
 
@@ -220,7 +269,20 @@ class TorrentEngine @Inject constructor(
             when (alert) {
                 is TorrentRemovedAlert -> {
                     val ih = runCatching { alert.infoHashes.best.toHex().lowercase() }.getOrNull()
-                    if (ih != null) torrents.remove(ih)
+                    if (ih != null) {
+                        torrents[ih]?.let { current ->
+                            // A delayed alert for generation N must not erase a rapid replacement N+1.
+                            val replacementIsLive = synchronized(nativeLock) {
+                                current.handle?.let { h ->
+                                    runCatching { h.isValid && h.inSession() }.getOrDefault(false)
+                                } == true
+                            }
+                            // Null means generation N+1 is in session.download()/awaitHandle and has
+                            // intentionally published its slot before the async handle appears. An old
+                            // removal alert must never erase that acquisition window.
+                            if (current.handle != null && !replacementIsLive) torrents.remove(ih, current)
+                        }
+                    }
                 }
                 is SaveResumeDataAlert -> {
                     persistResumeBlob(alert)
@@ -243,11 +305,26 @@ class TorrentEngine @Inject constructor(
 
     private fun persistResumeBlob(alert: SaveResumeDataAlert) {
         runCatching {
+            val handle = alert.handle()
+            // An eviction can overtake an already-queued save alert. The wrapper may remain `isValid`
+            // briefly, but inSession() is false; writing that stale blob resurrects a cache entry whose
+            // payload and metadata were just deleted.
+            val stillCurrent = synchronized(nativeLock) {
+                runCatching { handle.isValid && handle.inSession() }.getOrDefault(false)
+            }
+            if (!stillCurrent) return
             val params = alert.params()
-            val ih = alert.handle().infoHash().toHex().lowercase()
+            val ih = handle.infoHash().toHex().lowercase()
+            if (torrents[ih]?.handle == null) return
             val buf = AddTorrentParams.writeResumeDataBuf(params)
-            resumeFileFor(ih).parentFile?.mkdirs()
-            resumeFileFor(ih).writeBytes(buf)
+            val target = resumeFileFor(ih)
+            target.parentFile?.mkdirs()
+            val tmp = File(target.parentFile, ".${target.name}.tmp")
+            tmp.writeBytes(buf)
+            if (!tmp.renameTo(target)) {
+                target.writeBytes(buf)
+                tmp.delete()
+            }
         }.onFailure { Log.w(TAG, "persistResumeBlob failed", it) }
     }
 
@@ -272,54 +349,101 @@ class TorrentEngine @Inject constructor(
      * cause of the "desktop streams in seconds, we take a minute" gap. The magnet is also tracker-
      * boosted so discovery isn't DHT-only.
      */
-    suspend fun addMagnet(magnetUri: String, preferredFileIndex: Int?): String {
+    suspend fun addMagnet(
+        magnetUri: String,
+        preferredFileIndex: Int?,
+        expectedSeason: Int? = null,
+        expectedEpisode: Int? = null,
+        acquireStreamingLease: Boolean = false,
+    ): String {
         ensureStarted()
+        val boosted = withTrackers(magnetUri)
         val parsedHash = parseInfoHash(magnetUri)
+        val infoHash = parsedHash
+            ?: runCatching { AddTorrentParams.parseMagnetUri(boosted).infoHashes.best.toHex().lowercase() }.getOrNull()
+            ?: error("Unparseable magnet (no info-hash)")
+        if (infoHash.length != 40) {
+            error("v2-only torrents are not supported by this libtorrent4j session wrapper")
+        }
+        beginAcquisition(infoHash)
+        try {
+            val result = acquisitionLocks.getOrPut(infoHash) { Mutex() }.withLock {
+                addMagnetLocked(
+                    boosted,
+                    infoHash,
+                    preferredFileIndex,
+                    expectedSeason,
+                    expectedEpisode,
+                )
+            }
+            // Transfer acquisition protection into a streaming lease before the acquisition count is
+            // released. This closes the tiny but destructive add-return -> streamer-ref TOCTOU window.
+            if (acquireStreamingLease) {
+                synchronized(acquisitionStateLock) {
+                    streamingLeaseCounts[result] = (streamingLeaseCounts[result] ?: 0) + 1
+                }
+            }
+            return result
+        } finally {
+            endAcquisition(infoHash)
+        }
+    }
+
+    private suspend fun addMagnetLocked(
+        boosted: String,
+        infoHash: String,
+        preferredFileIndex: Int?,
+        expectedSeason: Int?,
+        expectedEpisode: Int?,
+    ): String {
 
         // Fast path: a Details prewarm (or a prior open) already has this torrent live — re-attach
         // instead of re-resolving (a second metadata fetch on an added torrent dead-latches 60s).
-        parsedHash?.let { h ->
-            torrents[h]?.takeIf { it.handle?.isValid == true }?.let { existing ->
-                existing.handle?.let { handle ->
-                    // Season pack: the SAME infoHash carries every episode, distinguished only by
-                    // fileIndex. A re-attach that skips selectFile keeps the PREVIOUS episode's file
-                    // selected — the HTTP server then serves E5's bytes under E6's title.
-                    reselectFileIfNeeded(handle, existing, preferredFileIndex)
-                    applySequentialAndPriority(handle, existing)
-                }
-                return h
+        torrents[infoHash]?.let { existing ->
+            liveHandle(existing)?.let { handle ->
+                // Season pack: the SAME infoHash carries every episode, distinguished only by
+                // fileIndex. A re-attach that skips selectFile keeps the PREVIOUS episode's file
+                // selected — the HTTP server then serves E5's bytes under E6's title.
+                reselectFileIfNeeded(handle, existing, preferredFileIndex, expectedSeason, expectedEpisode)
+                applySequentialAndPriority(handle, existing)
+                return infoHash
             }
+            torrents.remove(infoHash, existing)
         }
 
         // Metadata cache hit (a torrent opened before this build cached its .torrent): add ONCE with
         // full info — peers are discovered a single time, straight into the download, no network
         // metadata fetch at all.
-        parsedHash?.let { loadCachedMetadata(it) }?.let { cachedInfo ->
-            Log.i(TAG, "metadata cache hit for $parsedHash")
-            return addWithInfo(cachedInfo, preferredFileIndex)
+        loadCachedMetadata(infoHash)?.let { cachedInfo ->
+            Log.i(TAG, "metadata cache hit for $infoHash")
+            return addWithInfo(cachedInfo, preferredFileIndex, expectedSeason, expectedEpisode)
         }
 
         // Cache miss (first watch): add the magnet LIVE, FORCE it active so its metadata fetch runs at
         // full tilt, read metadata off the handle, then stream — keeping every discovered peer (no
         // fetchMagnet discard-and-rediscover).
-        val boosted = withTrackers(magnetUri)
         // Resolve the info-hash up front (handles v1-hex AND base32/v2 magnets) and register it in the
         // map BEFORE adding, so a metadata timeout or VM failover can always find + remove the torrent —
         // a non-40-hex magnet used to be added to the session then orphaned with no removable key.
-        val infoHash = parsedHash
-            ?: runCatching { AddTorrentParams.parseMagnetUri(boosted).infoHashes.best.toHex().lowercase() }.getOrNull()
-            ?: error("Unparseable magnet (no info-hash)")
         val active = torrents.getOrPut(infoHash) { ActiveTorrent(infoHash) }
 
-        val handle = findHandle(infoHash)?.takeIf { it.isValid }
-            ?: run {
+        val handle = findHandle(infoHash)?.takeIf { it.isValid && runCatching { it.inSession() }.getOrDefault(false) }
+            ?: try {
                 // 3-arg live add: (magnet, saveDir, flags). flags must be non-null (libtorrent4j ORs them
                 // with no null guard). AUTO_MANAGED here is immediately overridden below.
-                session.download(boosted, savePath, TorrentFlags.AUTO_MANAGED)
+                synchronized(nativeLock) {
+                    session.download(boosted, torrentSavePath(infoHash), TorrentFlags.AUTO_MANAGED)
+                }
                 awaitHandle(infoHash) ?: run {
+                    findHandle(infoHash)?.takeIf { it.isValid }?.let { orphan ->
+                        synchronized(nativeLock) { runCatching { session.remove(orphan, session_handle.delete_files) } }
+                    }
                     torrents.remove(infoHash)
                     error("Failed to obtain torrent handle")
                 }
+            } catch (cancelled: CancellationException) {
+                cleanupCancelledAdd(infoHash, active, deleteFiles = true)
+                throw cancelled
             }
         active.handle = handle
 
@@ -340,18 +464,26 @@ class TorrentEngine @Inject constructor(
             }.onFailure { Log.w(TAG, "force-active failed for $infoHash", it) }
         }
 
-        val info = awaitMetadataFromHandle(handle) ?: run {
-            // Cold/dead magnet: free the session slot + map entry instead of stranding a live torrent.
-            runCatching { stop(infoHash, removeFiles = true) }
-            error("Timed out fetching torrent metadata")
+        val info = try {
+            awaitMetadataFromHandle(handle) ?: run {
+                // Cold/dead magnet: free the session slot + map entry instead of stranding a live torrent.
+                runCatching { removeTorrent(infoHash, removeFiles = true) }
+                error("Timed out fetching torrent metadata")
+            }
+        } catch (cancelled: CancellationException) {
+            // Details prewarms are routinely cancelled as the user navigates. The torrent was manually
+            // resumed above, so failing to remove our acquisition leaves an invisible full-speed download.
+            if (active.handle === handle) runCatching { removeTorrent(infoHash, removeFiles = true) }
+            throw cancelled
         }
+        persistMetadata(infoHash, info, handle)
         try {
-            selectFile(handle, info, active, preferredFileIndex)
+            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode)
         } catch (t: Throwable) {
             // No playable file (RAR/disc release): tear the torrent down like the metadata-timeout
             // branch, or the force-resumed add keeps downloading the whole multi-GB archive (no file
             // priorities were ever applied) long after the player failed over to another source.
-            runCatching { stop(infoHash, removeFiles = true) }
+            runCatching { removeTorrent(infoHash, removeFiles = true) }
             throw t
         }
         applySequentialAndPriority(handle, active)
@@ -361,28 +493,51 @@ class TorrentEngine @Inject constructor(
 
     /** Add a torrent we already have full [TorrentInfo] for (metadata cache hit / re-open), select the
      *  file and start sequential streaming. One add, peers discovered once. */
-    private suspend fun addWithInfo(info: TorrentInfo, preferredFileIndex: Int?): String {
+    private suspend fun addWithInfo(
+        info: TorrentInfo,
+        preferredFileIndex: Int?,
+        expectedSeason: Int?,
+        expectedEpisode: Int?,
+    ): String {
         val infoHash = info.infoHash().toHex().lowercase()
-        torrents[infoHash]?.takeIf { it.handle?.isValid == true }?.let { existing ->
-            existing.handle?.let { handle ->
+        torrents[infoHash]?.let { existing ->
+            liveHandle(existing)?.let { handle ->
                 // Same season-pack re-select as addMagnet's fast path.
-                reselectFileIfNeeded(handle, existing, preferredFileIndex)
+                reselectFileIfNeeded(handle, existing, preferredFileIndex, expectedSeason, expectedEpisode)
                 applySequentialAndPriority(handle, existing)
+                return infoHash
             }
-            return infoHash
+            torrents.remove(infoHash, existing)
         }
         val active = torrents.getOrPut(infoHash) { ActiveTorrent(infoHash) }
         val resumeFile = resumeFileFor(infoHash).takeIf { it.exists() }
         // 6-arg form: (info, saveDir, resumeFile, filePriorities, peers, flags). flags non-null (see
         // addMagnet). resumeFile re-checks the partial already on disk instead of re-downloading it.
-        session.download(info, savePath, resumeFile, null, null, TorrentFlags.AUTO_MANAGED)
-        val handle = awaitHandle(infoHash) ?: error("Failed to obtain torrent handle for $infoHash")
+        val handle = try {
+            synchronized(nativeLock) {
+                session.download(info, torrentSavePath(infoHash), resumeFile, null, null, TorrentFlags.AUTO_MANAGED)
+            }
+            awaitHandle(infoHash) ?: run {
+                findHandle(infoHash)?.takeIf { it.isValid }?.let { orphan ->
+                    synchronized(nativeLock) { runCatching { session.remove(orphan, session_handle.delete_files) } }
+                }
+                torrents.remove(infoHash)
+                error("Failed to obtain torrent handle for $infoHash")
+            }
+        } catch (cancelled: CancellationException) {
+            // This path reopens an existing payload from cached metadata/resume data. Cancel the native
+            // add, but never delete the partial the user expected to resume later.
+            cleanupCancelledAdd(infoHash, active, deleteFiles = false)
+            throw cancelled
+        }
         active.handle = handle
         try {
-            selectFile(handle, info, active, preferredFileIndex)
+            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode)
         } catch (t: Throwable) {
-            // Same cleanup as addMagnet — never strand an un-prioritized torrent downloading ALL files.
-            runCatching { stop(infoHash, removeFiles = true) }
+            // Cached metadata may be reopening gigabytes of valid partial payload (including other
+            // episodes in a pack). Remove the unprioritized handle, but preserve those bytes for a
+            // later correct selection/LRU eviction instead of deleting the entire hash directory.
+            cleanupCancelledAdd(infoHash, active, deleteFiles = false)
             throw t
         }
         applySequentialAndPriority(handle, active)
@@ -394,6 +549,30 @@ class TorrentEngine @Inject constructor(
     private fun loadCachedMetadata(hash: String): TorrentInfo? {
         val cached = metadataFileFor(hash).takeIf { it.exists() } ?: return null
         return runCatching { TorrentInfo.bdecode(cached.readBytes()) }.getOrNull()
+    }
+
+    /** Persist a minimal .torrent immediately after the first successful metadata exchange. Without
+     *  this, the separately-saved resume blob is unreachable after process death because reopening a
+     *  magnet first needs the same metadata all over again. */
+    private fun persistMetadata(infoHash: String, info: TorrentInfo, handle: TorrentHandle) {
+        runCatching {
+            val params = AddTorrentParams().apply {
+                setTorrentInfo(info)
+                val announce = synchronized(nativeLock) {
+                    runCatching { handle.trackers().map { it.url() }.distinct() }.getOrDefault(emptyList())
+                }
+                if (announce.isNotEmpty()) setTrackers(announce)
+            }
+            val bytes = Entry(libtorrent.write_torrent_file(params.swig())).bencode()
+            val target = metadataFileFor(infoHash)
+            target.parentFile?.mkdirs()
+            val tmp = File(target.parentFile, ".${target.name}.tmp")
+            tmp.writeBytes(bytes)
+            if (!tmp.renameTo(target)) {
+                target.writeBytes(bytes)
+                tmp.delete()
+            }
+        }.onFailure { Log.w(TAG, "persistMetadata failed for $infoHash", it) }
     }
 
     /**
@@ -411,17 +590,35 @@ class TorrentEngine @Inject constructor(
 
     /** Poll an already-added torrent's handle for its metadata (avoids the dead-latch fetchMagnet). */
     private suspend fun awaitMetadataFromHandle(handle: TorrentHandle): TorrentInfo? {
-        val deadline = System.currentTimeMillis() + METADATA_TIMEOUT_SECONDS * 1000L
+        val startedAt = System.currentTimeMillis()
+        val deadline = startedAt + METADATA_TIMEOUT_SECONDS * 1000L
+        var lastReannounce = 0L
         while (System.currentTimeMillis() < deadline) {
             if (!handle.isValid) return null
             // Serialized like every other handle read — a concurrent eviction's session.remove
             // racing this status() call is a native use-after-free (see nativeLock).
             val info = synchronized(nativeLock) {
                 runCatching {
-                    if (handle.status().hasMetadata()) handle.torrentFile() else null
+                    if (handle.status().hasMetadata()) {
+                        // The plain torrentFile() view may omit v2/hybrid piece layers, making
+                        // write_torrent_file fail and silently defeating cold metadata reuse.
+                        handle.torrentFileWithHashes() ?: handle.torrentFile()
+                    } else null
                 }.getOrNull()
             }
             if (info != null) return info
+            val now = System.currentTimeMillis()
+            if (now - startedAt >= METADATA_REANNOUNCE_AFTER_MS &&
+                now - lastReannounce >= METADATA_REANNOUNCE_INTERVAL_MS
+            ) {
+                synchronized(nativeLock) {
+                    runCatching {
+                        handle.forceReannounce()
+                        handle.forceDHTAnnounce()
+                    }
+                }
+                lastReannounce = now
+            }
             delay(HANDLE_POLL_INTERVAL_MS)
         }
         return null
@@ -443,7 +640,84 @@ class TorrentEngine @Inject constructor(
     }
 
     private fun findHandle(infoHash: String): TorrentHandle? =
-        session.find(Sha1Hash.parseHex(infoHash))
+        synchronized(nativeLock) { session.find(Sha1Hash.parseHex(infoHash)) }
+
+    /** A handle may remain Java-valid briefly after session.remove(). Never take that stale generation
+     *  as the fast path: it cannot download or answer status and would strand the player in buffering. */
+    private fun liveHandle(active: ActiveTorrent): TorrentHandle? = synchronized(nativeLock) {
+        active.handle?.takeIf { handle ->
+            runCatching { handle.isValid && handle.inSession() }.getOrDefault(false)
+        }
+    }
+
+    private suspend fun beginAcquisition(infoHash: String) {
+        while (true) {
+            val claimed = synchronized(acquisitionStateLock) {
+                if (infoHash in evictingHashes) {
+                    false
+                } else {
+                    acquisitionCounts[infoHash] = (acquisitionCounts[infoHash] ?: 0) + 1
+                    true
+                }
+            }
+            if (claimed) return
+            delay(ACQUISITION_EVICTION_POLL_MS)
+        }
+    }
+
+    private fun endAcquisition(infoHash: String) = synchronized(acquisitionStateLock) {
+        val remaining = (acquisitionCounts[infoHash] ?: 1) - 1
+        if (remaining <= 0) acquisitionCounts.remove(infoHash) else acquisitionCounts[infoHash] = remaining
+    }
+
+    private fun beginEviction(infoHash: String): Boolean = synchronized(acquisitionStateLock) {
+        if ((acquisitionCounts[infoHash] ?: 0) > 0 ||
+            (streamingLeaseCounts[infoHash] ?: 0) > 0 ||
+            !evictingHashes.add(infoHash)
+        ) false else true
+    }
+
+    private fun endEviction(infoHash: String) = synchronized(acquisitionStateLock) {
+        evictingHashes.remove(infoHash)
+        Unit
+    }
+
+    fun isAcquiring(infoHash: String): Boolean = synchronized(acquisitionStateLock) {
+        (acquisitionCounts[infoHash] ?: 0) > 0
+    }
+
+    fun releaseStreamingLease(infoHash: String) = synchronized(acquisitionStateLock) {
+        val remaining = (streamingLeaseCounts[infoHash] ?: 1) - 1
+        if (remaining <= 0) streamingLeaseCounts.remove(infoHash) else streamingLeaseCounts[infoHash] = remaining
+    }
+
+    /** session.download() installs its handle asynchronously. Cancellation can arrive before findHandle
+     *  sees it, so poll briefly in NonCancellable and remove the eventual handle; otherwise an abandoned
+     *  Details warm remains an invisible all-files download. */
+    private suspend fun cleanupCancelledAdd(
+        infoHash: String,
+        active: ActiveTorrent,
+        deleteFiles: Boolean,
+    ) = withContext(NonCancellable) {
+        var handle = findHandle(infoHash)
+        repeat(CANCELLED_ADD_CLEANUP_POLLS) {
+            if (handle != null) return@repeat
+            delay(HANDLE_POLL_INTERVAL_MS)
+            handle = findHandle(infoHash)
+        }
+        handle?.takeIf { it.isValid }?.let { orphan ->
+            synchronized(nativeLock) {
+                runCatching {
+                    if (deleteFiles) session.remove(orphan, session_handle.delete_files)
+                    else session.remove(orphan)
+                }
+            }
+        }
+        torrents.remove(infoHash, active)
+        if (deleteFiles && infoHash !in legacyLayoutHashes) {
+            runCatching { File(savePath, infoHash).deleteRecursively() }
+        }
+    }
 
     /**
      * Fast-path re-attach helper: if the caller asked for a DIFFERENT (valid, non-sample video) file
@@ -451,15 +725,27 @@ class TorrentEngine @Inject constructor(
      * piece range, path and priorities move to the requested episode. A null/invalid preferred index
      * keeps the existing selection untouched.
      */
-    private fun reselectFileIfNeeded(handle: TorrentHandle, active: ActiveTorrent, preferredFileIndex: Int?) {
-        if (preferredFileIndex == null || preferredFileIndex == active.fileIndex) return
+    private fun reselectFileIfNeeded(
+        handle: TorrentHandle,
+        active: ActiveTorrent,
+        preferredFileIndex: Int?,
+        expectedSeason: Int?,
+        expectedEpisode: Int?,
+    ) {
+        if (preferredFileIndex != null && preferredFileIndex == active.fileIndex &&
+            (expectedSeason == null || expectedEpisode == null)
+        ) return
+        if (preferredFileIndex == null && (expectedSeason == null || expectedEpisode == null)) return
         val info = synchronized(nativeLock) { runCatching { handle.torrentFile() }.getOrNull() } ?: return
         val files = info.files()
-        val valid = preferredFileIndex in 0 until files.numFiles() &&
-            isVideoFile(files.fileName(preferredFileIndex)) &&
-            !isSampleFile(files.fileName(preferredFileIndex))
-        if (!valid) return
-        selectFile(handle, info, active, preferredFileIndex)
+        val validPreferred = preferredFileIndex?.takeIf { index ->
+            index in 0 until files.numFiles() && isVideoFile(files.fileName(index)) &&
+                !isSampleFile(files.fileName(index))
+        }
+        val episodeMatch = matchingEpisodeFile(files, expectedSeason, expectedEpisode)
+        val requested = episodeMatch ?: validPreferred
+        if (requested == null || requested == active.fileIndex) return
+        selectFile(handle, info, active, requested, expectedSeason, expectedEpisode)
     }
 
     /** Choose the file to stream: explicit index if valid, else the largest video file. */
@@ -468,6 +754,8 @@ class TorrentEngine @Inject constructor(
         info: TorrentInfo,
         active: ActiveTorrent,
         preferredFileIndex: Int?,
+        expectedSeason: Int?,
+        expectedEpisode: Int?,
     ) {
         val files = info.files()
         val numFiles = files.numFiles()
@@ -482,11 +770,17 @@ class TorrentEngine @Inject constructor(
         // handing the biggest archive part to ExoPlayer just dead-ends on a parse error. Fail hard
         // instead so the player auto-fails-over to a real single-file source (the player treats this
         // thrown error as a source failure and advances to the next candidate).
-        val largestVideo = (0 until numFiles)
+        val playableVideos = (0 until numFiles)
             .filter { isVideoFile(files.fileName(it)) && !isSampleFile(files.fileName(it)) }
+        val largestVideo = playableVideos
             .maxByOrNull { files.fileSize(it) }
 
-        val chosen = prefValid ?: largestVideo
+        val episodeMatch = matchingEpisodeFile(files, expectedSeason, expectedEpisode)
+        // Clear filename evidence beats a stale-but-in-range addon index. With no index and several
+        // episode files, failing is safer than silently serving the longest/random episode.
+        val chosen = episodeMatch ?: prefValid ?: largestVideo?.takeIf {
+            expectedSeason == null || expectedEpisode == null || playableVideos.size == 1
+        }
             ?: error("No playable video file in this torrent (archive/RAR release)")
 
         active.fileIndex = chosen
@@ -497,7 +791,7 @@ class TorrentEngine @Inject constructor(
         active.lastPiece = ((active.fileOffset + active.fileLength - 1) / active.pieceLength).toInt()
 
         val relPath = files.filePath(chosen)
-        active.filePath = File(savePath, relPath).absolutePath
+        active.filePath = File(torrentSavePath(active.infoHash), relPath).absolutePath
 
         Log.i(
             TAG,
@@ -513,6 +807,24 @@ class TorrentEngine @Inject constructor(
         val priorities = Array(numFiles) { Priority.IGNORE }
         priorities[chosen] = Priority.DEFAULT
         synchronized(nativeLock) { handle.prioritizeFiles(priorities) }
+    }
+
+    /** Recover a pack episode when the addon omitted fileIdx. Torrent filenames overwhelmingly encode
+     *  SxxExx or 1x02; selecting the largest file silently chose a random/long episode. */
+    private fun matchingEpisodeFile(files: FileStorage, season: Int?, episode: Int?): Int? {
+        if (season == null || episode == null) return null
+        val sxe = Regex("(?i)(?:^|[^a-z0-9])s0*${season}[^a-z0-9]*e0*${episode}(?:[^0-9]|$)")
+        val x = Regex("(?i)(?:^|[^0-9])0*${season}x0*${episode}(?:[^0-9]|$)")
+        val words = Regex(
+            "(?i)(?:^|[^a-z0-9])season[^0-9]*0*${season}.*" +
+                "episode[^0-9]*0*${episode}(?:[^0-9]|$)",
+        )
+        return (0 until files.numFiles()).firstOrNull { index ->
+            val path = files.filePath(index)
+            val name = files.fileName(index)
+            isVideoFile(name) && !isSampleFile(name) &&
+                (sxe.containsMatchIn(path) || x.containsMatchIn(path) || words.containsMatchIn(path))
+        }
     }
 
     private fun applySequentialAndPriority(handle: TorrentHandle, active: ActiveTorrent) {
@@ -568,20 +880,16 @@ class TorrentEngine @Inject constructor(
         // torrent has big pieces (8-32 MB), a few when pieces are small. A fixed 5-piece band was the
         // killer on big-piece torrents — 5 x 32 MB = 160 MB fetched in PARALLEL, so piece 0 (and thus
         // "head ready") didn't land for ~a minute even at 3 MB/s.
-        // A multi-piece ORDERED head band — NOT a byte budget that collapses to 1 piece on big-piece
-        // torrents. With 8 MB pieces, ceilDiv(6MB,8MB)=1, so only piece 0 was ever time-critical and the
-        // rest of the request queue scattered. Deadlining the first HEAD_PRIORITY_PIECES with STRICTLY
-        // STAGGERED deadlines (0, 20, 40… ms) keeps the head pipeline continuously fed and forces them
-        // to complete IN ORDER (0→1→2→3) rather than in parallel — so the contiguous head actually
-        // fills. Capped small so a big-piece torrent doesn't deadline a huge band.
-        val headPieces = maxOf(HEAD_PRIORITY_PIECES, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
-        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen))
-        // The EOF tail holds the mp4 moov AND the mkv cues, and ExoPlayer reads BOTH during prepare to
-        // build its seek map — so fetch the tail in PARALLEL with the head (deadline 0) for every
-        // container. Deferring the mkv cues was a mistake: the player then stalled ~15s on an on-demand
-        // EOF read after the head was already in (the "countdown says 2s, Almost-ready takes 15s" bug).
-        // With the tail in by READY, prepare is near-instant and the byte countdown matches first frame.
-        val tailBase = 0
+        // Bound urgency by BYTES. Four mandatory pieces made 128 MB time-critical on a 32 MB-piece
+        // old torrent, so the one piece required to start competed with three later pieces.
+        val headPieces = maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
+        // Only ISO-BMFF containers can require an EOF moov before first frame. Other containers fetch an
+        // EOF seek map on demand if the player actually asks for it; speculative EOF work starves thin heads.
+        val tailFrom = startupTailFromPiece(active)
+        // Let the first contiguous head piece win before the EOF band. Giving both deadline zero made a
+        // 32 MB head piece and a 32 MB tail piece split a thin swarm in parallel, doubling the time until
+        // the UI could show meaningful head progress without reducing total MP4 readiness work.
+        val tailBase = headPieces * HEAD_DEADLINE_STEP_MS
 
         // Best-effort: a concurrent stop()/removal can invalidate the handle between native calls,
         // which then throw — prioritisation isn't worth crashing over. Serialized (see nativeLock).
@@ -600,14 +908,39 @@ class TorrentEngine @Inject constructor(
                     handle.setPieceDeadline(p, i * HEAD_DEADLINE_STEP_MS)
                 }
             }
-            for (i in 0 until tailPieces) {
-                val p = active.lastPiece - i
-                if (p in active.firstPiece..active.lastPiece) {
-                    handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, tailBase + i * HEAD_DEADLINE_STEP_MS)
+            if (tailFrom != null) {
+                var i = 0
+                for (p in active.lastPiece downTo tailFrom) {
+                    if (p in active.firstPiece..active.lastPiece) {
+                        handle.piecePriority(p, Priority.TOP_PRIORITY)
+                        handle.setPieceDeadline(p, tailBase + i * HEAD_DEADLINE_STEP_MS)
+                        i++
+                    }
                 }
             }
+            active.startupTailArmed = tailFrom != null
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
+    }
+
+    /** A faststart MP4 revealed its moov in the head, so its speculative EOF work is no longer useful. */
+    fun cancelStartupTail(infoHash: String) {
+        val active = torrents[infoHash] ?: return
+        if (!active.startupTailArmed || active.pieceLength <= 0) return
+        val handle = active.handle?.takeIf { it.isValid } ?: return
+        synchronized(nativeLock) {
+            if (!active.startupTailArmed) return@synchronized
+            runCatching {
+                val startupHeadLast = active.firstPiece +
+                    maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, active.pieceLength)) - 1
+                for (p in active.lastPiece downTo tailFromPiece(active)) {
+                    if (p in active.firstPiece..active.lastPiece && p > startupHeadLast) {
+                        handle.resetPieceDeadline(p)
+                        handle.piecePriority(p, Priority.DEFAULT)
+                    }
+                }
+                active.startupTailArmed = false
+            }
+        }
     }
 
     /** Ceiling of [a]/[b] for positive ints. */
@@ -637,8 +970,7 @@ class TorrentEngine @Inject constructor(
         // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
         // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
         // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
-        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
-        val tailFrom = active.lastPiece - tailPieces + 1
+        val tailFrom = tailFromPiece(active)
         val deadlineLast = if (lastNeeded >= tailFrom) active.lastPiece else lastNeeded
 
         // Bump priority + deadlines so libtorrent fetches these next, in order. Best-effort: a
@@ -694,9 +1026,12 @@ class TorrentEngine @Inject constructor(
         if (active.pieceLength <= 0) return@synchronized 0L
         val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
             ?: return@synchronized 0L
-        val pieces = status.pieces()
+        contiguousHeadBytes(active, status.pieces())
+    }
+
+    private fun contiguousHeadBytes(active: ActiveTorrent, pieces: PieceIndexBitfield): Long {
         val pieceCount = pieces.size()
-        if (pieceCount == 0) return@synchronized 0L
+        if (pieceCount == 0) return 0L
 
         var contiguousPieces = 0
         var p = active.firstPiece
@@ -704,11 +1039,11 @@ class TorrentEngine @Inject constructor(
             contiguousPieces++
             p++
         }
-        if (contiguousPieces == 0) return@synchronized 0L
+        if (contiguousPieces == 0) return 0L
         val bytesFromPieceStart = contiguousPieces.toLong() * active.pieceLength
         // The first piece may begin before the file (shared with the previous file).
         val headOffsetInFirstPiece = active.fileOffset % active.pieceLength
-        (bytesFromPieceStart - headOffsetInFirstPiece).coerceIn(0L, active.fileLength)
+        return (bytesFromPieceStart - headOffsetInFirstPiece).coerceIn(0L, active.fileLength)
     }
 
     /**
@@ -734,14 +1069,13 @@ class TorrentEngine @Inject constructor(
         // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
         // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
         // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
-        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
+        val tailFrom = tailFromPiece(active)
         val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
             ?: return@synchronized false
         val pieces = status.pieces()
         val pieceCount = pieces.size()
         if (pieceCount == 0) return@synchronized false
-        for (i in 0 until tailPieces) {
-            val p = active.lastPiece - i
+        for (p in active.lastPiece downTo tailFrom) {
             if (p in active.firstPiece..active.lastPiece) {
                 if (p >= pieceCount || !pieces.getBit(p)) return@synchronized false
             }
@@ -821,6 +1155,28 @@ class TorrentEngine @Inject constructor(
         runCatching { pieces.getBit(piece) }.getOrDefault(false)
     }
 
+    /** One QUERY_PIECES call for an arbitrary set of file-relative offsets. */
+    fun availableByteOffsets(infoHash: String, byteOffsets: List<Long>): BooleanArray = synchronized(nativeLock) {
+        val result = BooleanArray(byteOffsets.size)
+        if (byteOffsets.isEmpty()) return@synchronized result
+        val active = torrents[infoHash] ?: return@synchronized result
+        val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized result
+        if (active.pieceLength <= 0) return@synchronized result
+        val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
+            ?: return@synchronized result
+        val pieces = status.pieces()
+        val pieceCount = pieces.size()
+        if (pieceCount == 0) return@synchronized result
+        byteOffsets.forEachIndexed { i, offset ->
+            if (offset >= 0L) {
+                val piece = ((active.fileOffset + offset) / active.pieceLength).toInt()
+                result[i] = piece in active.firstPiece..active.lastPiece &&
+                    piece < pieceCount && runCatching { pieces.getBit(piece) }.getOrDefault(false)
+            }
+        }
+        result
+    }
+
     /** Absolute path of the selected file, once chosen. */
     fun filePath(infoHash: String): String? = torrents[infoHash]?.filePath
 
@@ -841,10 +1197,10 @@ class TorrentEngine @Inject constructor(
      *  - `null`  = not enough head yet to decide (caller stays conservative until it resolves).
      * Reads the on-disk file directly (offset 0 = file start); only bytes within the contiguous head.
      */
-    fun mp4MoovInHead(infoHash: String): Boolean? {
+    fun mp4MoovInHead(infoHash: String, knownHeadBytes: Long? = null): Boolean? {
         val active = torrents[infoHash] ?: return null
         val path = active.filePath ?: return null
-        val head = contiguousHeadBytes(infoHash)
+        val head = knownHeadBytes ?: contiguousHeadBytes(infoHash)
         if (head < 16L) return null
         return runCatching {
             java.io.RandomAccessFile(path, "r").use { raf ->
@@ -884,9 +1240,11 @@ class TorrentEngine @Inject constructor(
     fun snapshot(infoHash: String): EngineStatus? = synchronized(nativeLock) {
         val active = torrents[infoHash] ?: return@synchronized null
         val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized null
-        val st = handle.status()
+        val st = handle.status(TorrentHandle.QUERY_PIECES)
+        val pieces = st.pieces()
         val fileTotal = active.fileLength.takeIf { it > 0 } ?: st.total()
-        val downloadedFile = (contiguousHeadBytes(infoHash)).coerceAtMost(fileTotal) // re-entrant lock
+        val downloadedFile = contiguousHeadBytes(active, pieces).coerceAtMost(fileTotal)
+        val tailProgress = startupTailProgressBytes(handle, active, pieces)
         // Progress on the selected file (sequential => contiguous head is a good proxy),
         // but never report less than libtorrent's own file-aware progress.
         val byHead = if (fileTotal > 0) downloadedFile.toFloat() / fileTotal else 0f
@@ -898,10 +1256,37 @@ class TorrentEngine @Inject constructor(
             seeders = st.numSeeds(),
             peers = st.numPeers(),
             downloadedBytes = (progress * fileTotal).toLong().coerceAtMost(fileTotal),
+            contiguousHeadBytes = downloadedFile,
+            startupTailProgressBytes = tailProgress,
             totalBytes = fileTotal,
             isFinished = st.isFinished,
             isPaused = st.flags().and_(TorrentFlags.PAUSED).non_zero(),
         )
+    }
+
+    /** Actual completion inside the startup EOF band, including finished 16 KiB blocks in a partial
+     *  piece. Whole-file progress is intentionally excluded: a swarm can have the body but no moov. */
+    private fun startupTailProgressBytes(
+        handle: TorrentHandle,
+        active: ActiveTorrent,
+        pieces: PieceIndexBitfield,
+    ): Long {
+        if (!active.startupTailArmed || startupTailFromPiece(active) == null || pieces.size() == 0) return 0L
+        val tailFrom = tailFromPiece(active)
+        var bytes = 0L
+        for (piece in tailFrom..active.lastPiece) {
+            if (piece < pieces.size() && pieces.getBit(piece)) bytes += active.pieceLength.toLong()
+        }
+        val partials = runCatching { handle.getDownloadQueue() }.getOrDefault(emptyList())
+        for (partial in partials) {
+            val piece = partial.pieceIndex()
+            if (piece in tailFrom..active.lastPiece &&
+                piece < pieces.size() && !pieces.getBit(piece)
+            ) {
+                bytes += partial.finished().toLong() * TORRENT_BLOCK_BYTES
+            }
+        }
+        return bytes
     }
 
     fun pause(infoHash: String) {
@@ -928,7 +1313,7 @@ class TorrentEngine @Inject constructor(
             runCatching {
                 if (!handle.status().hasMetadata()) return
                 resumeDir.mkdirs()
-                handle.saveResumeData()
+                handle.saveResumeData(TorrentHandle.SAVE_INFO_DICT)
             }.onFailure { Log.w(TAG, "saveResume failed for $infoHash", it) }
         }
     }
@@ -937,10 +1322,26 @@ class TorrentEngine @Inject constructor(
      * Stop a torrent. [removeFiles]=false pauses + persists resume data (kept in cache);
      * [removeFiles]=true removes it from the session and deletes its files.
      */
-    fun stop(infoHash: String, removeFiles: Boolean) {
+    fun stop(infoHash: String, removeFiles: Boolean): Boolean {
+        if (!removeFiles) {
+            removeTorrent(infoHash, removeFiles = false)
+            return true
+        }
+        if (!beginEviction(infoHash)) return false
+        return try {
+            removeTorrent(infoHash, removeFiles = true)
+            true
+        } finally {
+            endEviction(infoHash)
+        }
+    }
+
+    /** Internal removal for the acquisition that owns this hash (metadata/select failure). */
+    private fun removeTorrent(infoHash: String, removeFiles: Boolean) {
         val active = torrents[infoHash]
         val handle = active?.handle
         if (removeFiles) {
+            val isolatedPayload = infoHash !in legacyLayoutHashes
             // session.remove frees the native torrent; serialize against the piece-status readers
             // or a concurrent read use-after-frees -> SIGSEGV (the whole-app lock).
             synchronized(nativeLock) {
@@ -951,9 +1352,11 @@ class TorrentEngine @Inject constructor(
             torrents.remove(infoHash)
             runCatching {
                 resumeFileFor(infoHash).delete()
-                torrentFileFor(infoHash).delete()
+                metadataFileFor(infoHash).delete()
+                if (isolatedPayload) File(savePath, infoHash).deleteRecursively()
             }
             active?.filePath?.let { runCatching { File(it).delete() } }
+            legacyLayoutHashes.remove(infoHash)
         } else {
             if (handle != null && handle.isValid) {
                 // KEEP the torrent LIVE in the session (handle stays valid, map entry kept) so re-opening
@@ -1009,7 +1412,6 @@ class TorrentEngine @Inject constructor(
         val curPiece = ((active.fileOffset + filePos) / active.pieceLength).toInt()
         if (curPiece == active.readHeadPiece) return
         val prev = active.readHeadPiece
-        active.readHeadPiece = curPiece
 
         val readahead = (readaheadBytes / active.pieceLength + 1)
         // Never strip deadlines off the tail/moov band. ExoPlayer re-reads the moov atom / mkv cues
@@ -1019,8 +1421,7 @@ class TorrentEngine @Inject constructor(
         // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
         // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
         // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
-        val tailPieces = maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, active.pieceLength))
-        val tailFrom = active.lastPiece - tailPieces + 1
+        val tailFrom = tailFromPiece(active)
         synchronized(nativeLock) { runCatching {
             // Move the SEQUENTIAL-download cursor to FOLLOW the read head, so libtorrent's bulk fill
             // proceeds FROM the current play position forward — not from the file front. Without this the
@@ -1030,8 +1431,10 @@ class TorrentEngine @Inject constructor(
             // correctly re-includes the earlier pieces. The head/tail deadlines still ride on top.
             handle.setSequentialRange(curPiece, active.lastPiece)
             if (prev >= 0) {
-                for (p in prev until curPiece) {
-                    if (p in active.firstPiece..active.lastPiece && p < tailFrom) {
+                val oldEnd = minOf(active.lastPiece, prev + readahead - 1)
+                val newEnd = minOf(active.lastPiece, curPiece + readahead - 1)
+                for (p in prev..oldEnd) {
+                    if (p in active.firstPiece..active.lastPiece && p < tailFrom && p !in curPiece..newEnd) {
                         handle.resetPieceDeadline(p)
                     }
                 }
@@ -1042,23 +1445,48 @@ class TorrentEngine @Inject constructor(
                 if (p in active.firstPiece..active.lastPiece) {
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
                     handle.setPieceDeadline(p, deadline)
-                    deadline += 25
+                    deadline += READAHEAD_DEADLINE_STEP_MS
                 }
             }
+            active.readHeadPiece = curPiece
         }.onFailure { Log.w(TAG, "advanceReadHead failed", it) } }
     }
 
     private fun resumeFileFor(infoHash: String) = File(resumeDir, "$infoHash.resume")
-    private fun torrentFileFor(infoHash: String) = File(resumeDir, "$infoHash.torrent")
+
+    /** New torrents are isolated by hash so a cold eviction can delete every file in a season pack. */
+    fun torrentSavePath(infoHash: String): File =
+        if (infoHash in legacyLayoutHashes) savePath
+        else File(savePath, infoHash).apply { mkdirs() }
+
+    private fun tailFromPiece(active: ActiveTorrent): Int {
+        val firstTailByte = (active.fileLength - TAIL_PRIORITY_BYTES).coerceAtLeast(0L)
+        return ((active.fileOffset + firstTailByte) / active.pieceLength).toInt()
+            .coerceIn(active.firstPiece, active.lastPiece)
+    }
+
+    private fun startupTailFromPiece(active: ActiveTorrent): Int? =
+        tailFromPiece(active).takeIf {
+            active.filePath?.substringAfterLast('.', "")?.lowercase() in MOOV_EXTS
+        }
 
     companion object {
         private const val TAG = "TorrentEngine"
+        private val INFO_HASH_REGEX = Regex("(?i)^[0-9a-f]{40}$")
         const val CACHE_DIR_NAME = "torrents"
+        private const val STORAGE_LAYOUT_PREFS = "torrent_storage_layout"
+        private const val STORAGE_LAYOUT_VERSION_KEY = "version"
+        private const val STORAGE_LAYOUT_VERSION = 2
 
         private const val METADATA_TIMEOUT_SECONDS = 60
+        private const val METADATA_REANNOUNCE_AFTER_MS = 10_000L
+        private const val METADATA_REANNOUNCE_INTERVAL_MS = 15_000L
         private const val HANDLE_POLL_ATTEMPTS = 100
+        private const val CANCELLED_ADD_CLEANUP_POLLS = 20
+        private const val ACQUISITION_EVICTION_POLL_MS = 50L
         private const val HANDLE_POLL_INTERVAL_MS = 50L
         private const val RANGE_POLL_INTERVAL_MS = 100L
+        private const val TORRENT_BLOCK_BYTES = 16L * 1024L
 
         /** ~6 MB head buffer + ~8 MB tail (mp4 moov atom / mkv cues at EOF).
          *
@@ -1077,23 +1505,22 @@ class TorrentEngine @Inject constructor(
          *  the front of a faststart file, so this resolves almost immediately). */
         const val MP4_SCAN_LIMIT = 64L * 1024 * 1024
 
-        /** Minimum number of head pieces to deadline IN ORDER, regardless of piece size. On big-piece
-         *  torrents a byte budget collapses to 1 piece, leaving only piece 0 time-critical while the
-         *  request queue scatters; a small staggered-deadline band keeps the head pipeline fed. */
-        const val HEAD_PRIORITY_PIECES = 4
-
         /** Per-piece deadline STEP for the head band. Must be large: libtorrent works all time-critical
          *  pieces toward their deadlines concurrently, so near-equal deadlines (~20 ms) complete in
          *  peer-speed order. A multi-second step keeps only the earliest head piece "overdue" so the
          *  swarm converges on it first, then the next — a strict in-order contiguous head fill. */
         const val HEAD_DEADLINE_STEP_MS = 3_000
 
+        /** Keep read-ahead ordered too. A 25ms step made an entire 24–32MB window overdue at once. */
+        const val READAHEAD_DEADLINE_STEP_MS = 250
+
         /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
          *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
         const val PREVIEW_PREFETCH_DEADLINE_MS = 4000
 
         /** Seed/upload cap (bytes/s) — keep a streaming client from saturating the home upstream. */
-        const val UPLOAD_RATE_LIMIT = 100 * 1024
+        const val UPLOAD_RATE_LIMIT = 512 * 1024
+        const val LOW_POWER_UPLOAD_RATE_LIMIT = 256 * 1024
 
         /** Sliding look-ahead band kept hot ahead of the player's read position. Bigger = more pieces
          *  in flight concurrently = better swarm utilisation under SEQUENTIAL_DOWNLOAD (closer to a
@@ -1116,11 +1543,15 @@ class TorrentEngine @Inject constructor(
             "udp://tracker.torrent.eu.org:451/announce",
             "udp://explodie.org:6969/announce",
             "udp://open.stealth.si:80/announce",
-            "udp://tracker.dler.org:6969/announce",
-            "udp://opentracker.i2p.rocks:6969/announce",
+            "udp://tracker.gbitt.info:80/announce",
+            "udp://opentracker.io:6969/announce",
         )
 
-        private val VIDEO_EXTS = setOf("mp4", "mkv", "avi", "webm", "mov", "m4v", "flv", "ts")
+        private val VIDEO_EXTS = setOf(
+            "mp4", "mkv", "avi", "webm", "mov", "m4v", "flv", "ts",
+            "wmv", "asf", "mpg", "mpeg", "m2ts", "mts", "vob", "ogv",
+        )
+        private val MOOV_EXTS = setOf("mp4", "m4v", "mov")
 
         fun isVideoFile(name: String?): Boolean {
             val ext = name?.substringAfterLast('.', "")?.lowercase() ?: return false
@@ -1140,6 +1571,8 @@ data class EngineStatus(
     val seeders: Int,
     val peers: Int,
     val downloadedBytes: Long,
+    val contiguousHeadBytes: Long,
+    val startupTailProgressBytes: Long,
     val totalBytes: Long,
     val isFinished: Boolean,
     val isPaused: Boolean,

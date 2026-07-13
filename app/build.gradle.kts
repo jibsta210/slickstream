@@ -198,6 +198,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.datastore.preferences)
 
+    testImplementation("junit:junit:4.13.2")
+
     // Firebase — cross-device sync of favourites + watch history (dormant without google-services.json)
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.firestore)

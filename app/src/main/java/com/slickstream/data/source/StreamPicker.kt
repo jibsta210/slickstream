@@ -45,16 +45,10 @@ object StreamPicker {
         // flag emoji, or tags like RUS/VOSTFR/PLSUB). Prefer the English-looking ones; only fall back
         // to the rest if there are none.
         val english = decodable.filter { it.englishLikely }.ifEmpty { decodable }
-        // Prefer a SINGLE-FILE episode over a season PACK when one exists. A pack streams slower to
-        // start — big pieces (often 32 MB), and the wanted episode sits mid-torrent behind a shared
-        // boundary piece that must download in full before the head unlocks. We still IGNORE the other
-        // files, but the piece geometry makes packs sluggish, so skip them while a single-file release
-        // is available. Soft: fall back to packs if that's all there is.
-        val singleFile = english.filter { !it.isPack }.ifEmpty { english }
         // Drop CAM/TS releases BEFORE the health floor — a heavily-seeded CAM of a new release must not
         // raise the floor and knock out the real (lower-seeded) BluRay/WEB encode (same reason foreign /
         // unplayable are dropped pre-floor). Soft: fall back to CAMs only if there is literally nothing else.
-        val notCam = singleFile.filterNot { it.isCam }.ifEmpty { singleFile }
+        val notCam = english.filterNot { it.isCam }.ifEmpty { english }
         // Fake/sample floor (opt-in): drop sources whose ADVERTISED size is implausibly small for real
         // content. Runs BEFORE the health floor for the same reason CAMs do — fake torrents advertise
         // huge seeder counts, and a 5000-"seeder" 2 MB decoy must not inflate the relative floor and
@@ -71,28 +65,56 @@ object StreamPicker {
         val bestSeeders = plausible.maxOfOrNull { it.seeders ?: 0 } ?: 0
         val floor = maxOf(MIN_SEEDERS, (bestSeeders * RELATIVE_HEALTH_FRACTION).toInt())
         val healthy = plausible.filter { (it.seeders ?: 0) >= floor }.ifEmpty { plausible }
+        // Pack avoidance is deliberately SOFT and therefore runs only after the health floor. Applying
+        // it first made a 1-seed single-episode release hide a healthy 100-seed season pack, then compute
+        // the floor from that already-starved subset. Prefer a single release only when one survives the
+        // same health test as the packs; otherwise the healthy pack is the faster source in practice.
+        val singleFiles = healthy.filter { !it.isPack }
+        val bestHealth = healthy.maxOfOrNull { it.seeders ?: 0 } ?: 0
+        val comparableSingletons = if (bestHealth <= 0) singleFiles else singleFiles.filter {
+            (it.seeders ?: 0) >= (bestHealth * PACK_SINGLETON_MIN_HEALTH_FRACTION).toInt().coerceAtLeast(1)
+        }
+        val packs = healthy.filter { it.isPack }
+        val candidates = when {
+            comparableSingletons.isNotEmpty() -> comparableSingletons
+            packs.isNotEmpty() -> packs
+            else -> healthy
+        }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
-                healthy.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
+                candidates.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
             StreamSizePreference.SMALLEST -> {
-                val withSize = healthy.filter { (it.sizeBytes ?: 0L) > 0L }
+                val withSize = candidates.filter { (it.sizeBytes ?: 0L) > 0L }
                 if (withSize.isNotEmpty()) {
                     withSize.minWithOrNull(
                         compareBy<StreamSource> { it.sizeBytes ?: 0L }.thenByDescending { it.seeders ?: 0 },
                     )
                 } else {
-                    healthy.maxByOrNull { it.seeders ?: 0 }
+                    candidates.maxByOrNull { it.seeders ?: 0 }
                 }
             }
             StreamSizePreference.BALANCED -> {
-                val withSize = healthy.filter { (it.sizeBytes ?: 0L) > 0L }.sortedBy { it.sizeBytes ?: 0L }
-                val pool = if (withSize.size >= 4) withSize.take((withSize.size * 2 + 2) / 3) else healthy
+                val withSize = candidates.filter { (it.sizeBytes ?: 0L) > 0L }.sortedBy { it.sizeBytes ?: 0L }
+                val pool = if (withSize.size >= 4) withSize.take((withSize.size * 2 + 2) / 3) else candidates
                 pool.minWithOrNull(
                     compareByDescending<StreamSource> { it.seeders ?: 0 }.thenBy { it.sizeBytes ?: Long.MAX_VALUE },
                 )
             }
         }
         return picked ?: list.first()
+    }
+
+    /** Pick the best direct HTTP source using the same quality/display cap as the player. Kept
+     *  separate from [pick] because torrent health/size ranking is intentionally irrelevant to direct
+     *  URLs, while callers such as downloads may still explicitly rank torrents. */
+    fun pickDirect(list: List<StreamSource>, maxTier: Int, lowPower: Boolean): StreamSource? {
+        val directs = list.filter { it.isDirect }
+        if (directs.isEmpty()) return null
+        val effectiveTier = if (lowPower) minOf(maxTier, QualityPreference.FHD_1080.maxTier) else maxTier
+        val capped = directs.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }.ifEmpty { directs }
+        val english = capped.filter { it.englishLikely }.ifEmpty { capped }
+        return english
+            .maxByOrNull { it.rank }
     }
 
     // Any non-Latin script in a torrent name is a hard non-English signal: Cyrillic, Greek, Hebrew,
@@ -231,18 +253,23 @@ object StreamPicker {
     // Season / multi-episode PACK markers, usually carried in the pack's FOLDER name (which Torrentio
     // includes alongside the chosen file name): "Season 1", "Complete", a season range "S01-S03", an
     // episode range "E01-E10", "Pack"/"Collection"/"Batch". A single-episode filename ("…S01E01…")
-    // matches none of these. Used together with a multi-file fileIndex to flag packs.
+    // matches none of these. File indexes are deliberately NOT used: index > 0 only means the selected
+    // video was not the first torrent entry (a subtitle/sample can occupy index 0), not that it is a pack.
     private val PACK_MARKERS = Regex(
         "(?i)(\\bcomplete\\b|\\bseasons?\\b|\\bpack\\b|\\bcollection\\b|\\bbatch\\b|" +
+            "\\bs\\d{1,2}\\b|" +
             "\\bs\\d{1,2}[\\s._-]*-[\\s._-]*s?\\d{1,2}\\b|" +
             "\\be\\d{1,3}[\\s._-]*-[\\s._-]*e?\\d{1,3}\\b)",
     )
 
     /**
-     * True when the release text looks like a season/multi-episode pack. [fileIndex] is the chosen
-     * file's index within the torrent: anything past the first file is a multi-file torrent, a strong
-     * structural pack signal on its own; the text markers catch packs where the episode is file 0.
+     * True when the release text looks like a season/multi-episode pack. [fileIndex] is retained for
+     * source compatibility but is not evidence of a pack: ordinary single-video torrents can put a
+     * sample, poster, or subtitle before the main video. The release/folder markers are authoritative.
      */
+    @Suppress("UNUSED_PARAMETER")
     fun looksLikePack(text: String, fileIndex: Int?): Boolean =
-        (fileIndex != null && fileIndex > 0) || PACK_MARKERS.containsMatchIn(text)
+        PACK_MARKERS.containsMatchIn(text)
+
+    private const val PACK_SINGLETON_MIN_HEALTH_FRACTION = 0.5
 }

@@ -20,6 +20,7 @@ import com.slickstream.data.source.StreamPicker
 import com.slickstream.navigation.NavArg
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -290,7 +291,7 @@ class DetailsViewModel @Inject constructor(
     private fun warmSource(d: MediaDetails, season: Int?, episode: Int?) {
         warmJob?.cancel()
         warmJob = viewModelScope.launch {
-            runCatching {
+            try {
                 val list = when (val r = sourceRepository.resolve(d, season, episode)) {
                     is DataResult.Success -> r.data
                     is DataResult.Error -> return@launch
@@ -300,14 +301,21 @@ class DetailsViewModel @Inject constructor(
                 // Same display clamp as the player's pickPreferred — the prewarm must warm the SAME
                 // source the player will pick, or the prefetch is wasted.
                 val warmTier = minOf(settings.wifiQuality.maxTier, deviceProfile.maxDisplayTier)
-                val best = StreamPicker.pick(list, warmTier, settings.streamSize, deviceProfile.isLowPower)
+                val best = StreamPicker.pickDirect(list, warmTier, deviceProfile.isLowPower)
+                    ?: StreamPicker.pick(list, warmTier, settings.streamSize, deviceProfile.isLowPower)
                     ?: return@launch
                 // The picker sinks CAMs below real encodes, so a CAM only wins when nothing better exists
                 // — flag it for the details UI ("CAM" badge: the only version out is a cinema rip).
                 if (best.isCam != _uiState.value.onlyCamAvailable) {
                     _uiState.value = _uiState.value.copy(onlyCamAvailable = best.isCam)
                 }
-                torrentStreamer.prefetch(best)
+                // A direct URL is already the player's instant, first-choice path; sending it to the
+                // torrent prefetcher creates meaningless torrent work (empty magnet/synthetic hash).
+                if (!best.isDirect) torrentStreamer.prefetch(best)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // Prewarm is opportunistic. Playback will resolve/validate the source normally.
             }
         }
     }

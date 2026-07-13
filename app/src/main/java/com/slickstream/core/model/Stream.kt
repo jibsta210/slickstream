@@ -13,6 +13,9 @@ data class StreamSource(
     val seeders: Int?,
     val provider: String,        // indexer / tracker label
     val fileIndex: Int? = null,  // which file inside a multi-file torrent, if known
+    /** Episode identity used to recover the right file from a season pack when an addon omits fileIdx. */
+    val expectedSeason: Int? = null,
+    val expectedEpisode: Int? = null,
     /** True when this source is a season/multi-episode PACK rather than a single-file release. Packs
      *  stream slower to start (large pieces, the wanted episode sits mid-file behind a shared boundary
      *  piece), so the picker prefers a single-file episode when one exists. */
@@ -68,9 +71,15 @@ data class StreamStatus(
     val seeders: Int,
     val peers: Int,
     val downloadedBytes: Long,
+    /** Bytes available contiguously from the selected file's start. Unlike [downloadedBytes], this
+     *  excludes scattered/tail pieces and is the authoritative startup-buffer progress signal. */
+    val contiguousHeadBytes: Long = 0L,
     val totalBytes: Long,
     val streamUrl: String?,         // local http URL once playable, else null
     val errorMessage: String? = null,
+    /** True after the contiguous head is ready while an MP4/MOV still needs its EOF moov pieces.
+     *  The player defers its head-stall watchdog to the streamer's dedicated bounded tail wait. */
+    val awaitingStartupTail: Boolean = false,
     /** Best-effort seconds until first frame (head + mp4 moov tail ÷ rate), or null when not estimable
      *  (e.g. still discovering peers / no download rate yet). Computed by the streamer against the same
      *  readiness gate that flips to READY, so the countdown matches when playback actually starts. */

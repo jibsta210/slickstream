@@ -160,6 +160,8 @@ interface TorrentStreamer {
     fun cachedTorrents(): List<String>
     suspend fun clearCache()
     fun cacheSizeBytes(): Long
+    /** True while at least one playback/download collector owns this torrent's selected file. */
+    fun isStreaming(infoHash: String): Boolean
 
     /**
      * System memory pressure (onTrimMemory): evict the on-disk cache down to [maxBytes] on a
@@ -184,6 +186,10 @@ interface TorrentStreamer {
 
     /** Non-blocking: is the slice covering this file byte-offset on disk yet? */
     fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean
+
+    /** Batched variant used by thumbnail sampling. Performs one native piece-bitfield snapshot for all
+     *  offsets instead of one synchronous JNI/status call per timeline point. */
+    fun availableByteOffsets(infoHash: String, byteOffsets: List<Long>): BooleanArray
 
     /** Downsample the file's downloaded-piece state into [buckets] fill fractions (0f..1f), start→end,
      *  for the player's chunk/piece bar. Empty until pieces exist. */

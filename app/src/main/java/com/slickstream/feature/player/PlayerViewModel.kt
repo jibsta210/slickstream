@@ -317,7 +317,7 @@ class PlayerViewModel @Inject constructor(
     /** True once this source has actually reached playback — gates the downshift watchdog so it can't
      *  fight the STARTUP failover watchdog (which owns the pre-first-frame phase). Reset per source. */
     @Volatile private var hasReachedPlaying = false
-    /** Last downloadedBytes the streamer emitted — the watchdog's head-progress signal. */
+    /** Last contiguous head byte count emitted — scattered/tail pieces must not mask a stuck head. */
     @Volatile private var lastEmittedDownloadedBytes: Long = 0L
 
     // --- "Stuck buffering -> try a smaller stream" hint ---
@@ -610,12 +610,7 @@ class PlayerViewModel @Inject constructor(
         // File-server-first: a DIRECT http/hls source plays INSTANTLY with no swarm, so always prefer the
         // best direct stream (within the quality cap) over any torrent. Only fall through to the torrent
         // health-pick when there's no direct source.
-        val directs = list.filter { it.isDirect }
-        if (directs.isNotEmpty()) {
-            val cap = if (deviceProfile.isLowPower) minOf(prefTier, QualityPreference.FHD_1080.maxTier) else prefTier
-            return directs.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { directs }
-                .maxByOrNull { it.rank } ?: directs.first()
-        }
+        StreamPicker.pickDirect(list, prefTier, deviceProfile.isLowPower)?.let { return it }
         val sizePref = settingsRepository.current().streamSize
         return StreamPicker.pick(list, prefTier, sizePref, deviceProfile.isLowPower) ?: list.first()
     }
@@ -756,7 +751,12 @@ class PlayerViewModel @Inject constructor(
                 val sinceStart = now - bufferingSinceMs
                 val stalled = now - lastProgressAt
                 // (a) Dead/fake swarm: budget elapsed AND the head stopped growing.
-                val deadSwarm = sinceStart >= FAILOVER_BUFFER_BUDGET_MS && stalled >= WATCHDOG_STALL_MS
+                // Once the head is ready, an EOF-moov MP4 is governed by the streamer's separate,
+                // bounded tail wait. A complete 32 MB tail piece exposes no partial piece progress, so
+                // the head is expected to remain flat while a healthy thin swarm finishes that piece.
+                val awaitingTail = latestStatus?.awaitingStartupTail == true
+                val deadSwarm = !awaitingTail &&
+                    sinceStart >= FAILOVER_BUFFER_BUDGET_MS && stalled >= WATCHDOG_STALL_MS
                 // (b) Can't-decode source: the streamer handed us a URL (READY) but the player still hasn't
                 //     reached first frame a good while later, WHILE bytes keep flowing. That's the missing-
                 //     mp4-moov / scattered-head trap — the head-flat check above never catches it because
@@ -891,9 +891,23 @@ class PlayerViewModel @Inject constructor(
             }
             resp.use { r ->
                 if (r.code in 400..599) return@withContext false   // dead / removed
-                val len = r.header("Content-Length")?.toLongOrNull()
-                    ?: r.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
-                if (len != null && len in 1 until MIN_DIRECT_FILE_BYTES) return@withContext false   // tiny fake
+                // A ranged GET normally has Content-Length: 2 while Content-Range carries the full
+                // object size. HLS manifests are also legitimately only a few KB.
+                val contentRange = r.header("Content-Range")
+                val len = contentRange?.substringAfterLast('/')?.toLongOrNull()
+                    ?: r.header("Content-Length")?.toLongOrNull().takeIf { contentRange == null }
+                val pathExt = url.substringBefore('?').substringAfterLast('.', "").lowercase()
+                val contentType = r.header("Content-Type").orEmpty()
+                val isManifest = pathExt == "m3u8" || contentType.contains("mpegurl", ignoreCase = true)
+                // Opaque HLS/proxy endpoints commonly return a tiny manifest as text/plain or
+                // application/octet-stream. Apply the fake-size floor only when the URL/MIME actually
+                // identifies a progressive media object; ambiguous small responses go to the bounded
+                // startup watchdog instead of being falsely discarded.
+                val knownProgressive = pathExt in PROGRESSIVE_VIDEO_EXTENSIONS ||
+                    (contentType.startsWith("video/", ignoreCase = true) && !isManifest)
+                if (knownProgressive && len != null && len in 1 until MIN_DIRECT_FILE_BYTES) {
+                    return@withContext false
+                }
                 true
             }
         }
@@ -932,11 +946,9 @@ class PlayerViewModel @Inject constructor(
         // swarm (StreamPicker ranks by seeders, which directs have 0 of, so a torrent always won). Mirrors
         // the file-server-first pickPreferred(). Falls through to the torrent health-pick only when no
         // untried direct remains — the correct final fallback.
-        val directs = remaining.filter { it.isDirect }
-        val next = if (directs.isNotEmpty()) {
-            val cap = if (deviceProfile.isLowPower) minOf(pref, QualityPreference.FHD_1080.maxTier) else pref
-            directs.filter { QualityPreference.tierOf(it.quality) <= cap }.ifEmpty { directs }
-                .maxByOrNull { it.rank } ?: directs.first()
+        val direct = StreamPicker.pickDirect(remaining, pref, deviceProfile.isLowPower)
+        val next = if (direct != null) {
+            direct
         } else {
             StreamPicker.pick(remaining, pref, sizePref, deviceProfile.isLowPower) ?: remaining.first()
         }
@@ -1000,7 +1012,7 @@ class PlayerViewModel @Inject constructor(
 
     private fun handleStatus(status: StreamStatus, source: StreamSource) {
         // Feed the buffering watchdog's head-progress signal on every emission.
-        lastEmittedDownloadedBytes = status.downloadedBytes
+        lastEmittedDownloadedBytes = status.contiguousHeadBytes
         // Mark when the source first became READY (a URL exists). The startup watchdog uses this to tell
         // "player can't reach first frame" (e.g. missing mp4 moov) apart from "still filling the head".
         if (status.streamUrl != null && firstReadyAtMs == 0L) {
@@ -1081,7 +1093,7 @@ class PlayerViewModel @Inject constructor(
      * bytes are needed but the rate is too low to estimate.
      */
     private fun etaToPlaying(status: StreamStatus): Int? {
-        val needed = (PLAYABLE_TARGET_BYTES - status.downloadedBytes).coerceAtLeast(0L)
+        val needed = (PLAYABLE_TARGET_BYTES - status.contiguousHeadBytes).coerceAtLeast(0L)
         val downloadSecs = when {
             needed == 0L -> 0
             status.downloadRateBytes > 0 -> (needed / status.downloadRateBytes).toInt()
@@ -1116,7 +1128,7 @@ class PlayerViewModel @Inject constructor(
      * prepare/buffer, giving one continuous bar from tap to first frame.
      */
     private fun bufferFillPercent(status: StreamStatus): Int =
-        ((status.downloadedBytes.toFloat() / PLAYABLE_TARGET_BYTES) * 100f).toInt().coerceIn(0, 100)
+        ((status.contiguousHeadBytes.toFloat() / PLAYABLE_TARGET_BYTES) * 100f).toInt().coerceIn(0, 100)
 
     /**
      * Gentle nudge: if the head-buffer has dragged on past [BUFFERING_NAG_MS] with a low download
@@ -2249,15 +2261,18 @@ class PlayerViewModel @Inject constructor(
         /** A direct link whose real file (Content-Length) is under this is a fake/sample, not a movie —
          *  rejected by the pre-play HEAD check before the player is even committed. */
         const val MIN_DIRECT_FILE_BYTES = 3L * 1024 * 1024
+        val PROGRESSIVE_VIDEO_EXTENSIONS = setOf(
+            "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "asf", "mpg", "mpeg", "ts", "m2ts", "mts", "vob", "ogv",
+        )
         /** Pre-player buffering wall-clock before the watchdog will consider a source a failure. */
-        const val FAILOVER_BUFFER_BUDGET_MS = 45_000L
+        const val FAILOVER_BUFFER_BUDGET_MS = 75_000L
         /** Watchdog poll cadence while waiting for a source to become playable. */
         const val WATCHDOG_TICK_MS = 3_000L
         /** Head bytes flat this long (while still not playing) = stalled swarm -> fail over. */
-        const val WATCHDOG_STALL_MS = 20_000L
+        const val WATCHDOG_STALL_MS = 30_000L
         /** READY emitted (player has a URL) but still hasn't reached first frame this long, while bytes
          *  keep flowing = a can't-decode source (missing mp4 moov / scattered head) -> fail over. */
-        const val STARTUP_PLAY_TIMEOUT_MS = 18_000L
+        const val STARTUP_PLAY_TIMEOUT_MS = 70_000L
         /** A mid-stream stall persisting this long = a source whose swarm can't sustain the bitrate ->
          *  auto-downshift to a smaller source (keeping position). */
         const val SUSTAINED_REBUFFER_TIMEOUT_MS = 30_000L
@@ -2270,9 +2285,10 @@ class PlayerViewModel @Inject constructor(
         /** ...or once past this fraction of the runtime, whichever comes first. */
         const val PREFETCH_PCT = 0.85f
 
-        /** Bytes that must download before playback can actually START (head + a moov/tail cushion) —
-         *  the ETA target. Bigger than the bare head so the estimate isn't wildly optimistic. */
-        const val PLAYABLE_TARGET_BYTES = 6L * 1024 * 1024
+        /** Contiguous head gate used by TorrentStreamer before it emits READY. MP4 tail readiness is
+         *  represented separately by the streamer's ETA; keeping this identical prevents a 33% bar
+         *  from disappearing when a healthy MKV starts. */
+        const val PLAYABLE_TARGET_BYTES = 2L * 1024 * 1024
         /** Fixed seconds added to the ETA for the moov/tail fetch + ExoPlayer prepare AFTER the head
          *  fills, so "time to playing" includes the post-download buffering, not just the download. */
         const val PREPARE_MARGIN_SECONDS = 3

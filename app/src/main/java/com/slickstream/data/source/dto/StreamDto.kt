@@ -26,6 +26,10 @@ data class StreamDto(
     val infoHash: String? = null,
     /** Index of the desired file inside a multi-file torrent. */
     val fileIdx: Int? = null,
+    /** Optional Stremio peer-discovery hints. `tracker:` entries contain announce URLs; `dht:`
+     *  entries commonly repeat the torrent info-hash and can recover it for older addons that omit
+     *  [infoHash]. Both forms are folded into the magnet URI by the source repository. */
+    val sources: List<String> = emptyList(),
     /** A DIRECT http/hls stream URL (Stremio standard) — present INSTEAD of [infoHash] for non-torrent
      *  addons (free direct-streaming). When set, the app plays it straight, no P2P. */
     val url: String? = null,
@@ -38,6 +42,10 @@ data class BehaviorHintsDto(
     /** Stremio "binge group" — often encodes provider + quality. */
     val bingeGroup: String? = null,
     val filename: String? = null,
+    /** Stremio marks HTTP URLs that are not directly web-playable with this flag. Torrent/debrid
+     *  download-action rows often expose such a URL alongside [StreamDto.infoHash]; those must go
+     *  through the torrent engine rather than being mistaken for instant direct video. */
+    val notWebReady: Boolean? = null,
     /** File size in bytes, when the indexer provides it directly. */
     val videoSize: Long? = null,
     /** HTTP headers the player MUST send when fetching a DIRECT [StreamDto.url] — many streaming hosts

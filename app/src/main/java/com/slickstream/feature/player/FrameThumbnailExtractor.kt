@@ -18,20 +18,18 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 /**
- * Scrub-bar thumbnails for a torrent stream, sampled in two bandwidth-aware tiers.
+ * Scrub-bar thumbnails for a torrent stream, sampled only from pieces playback already downloaded.
  *
  * A torrent downloads sequentially, so only the already-buffered region can be decoded without
  * blocking. To give a useful film-strip scrub experience we sample at two densities:
  *
- *  - COARSE tier: ~[COARSE_COUNT] evenly-spaced points across the WHOLE timeline that we actively
- *    PREFETCH (at a relaxed deadline that never competes with playback). Bounded whole-timeline
- *    coverage — this is roughly the old fixed-24 behaviour and caps how much we ever download for
- *    previews.
+ *  - COARSE tier: ~[COARSE_COUNT] evenly-spaced points across the whole timeline. These appear as the
+ *    sequential download reaches them; preview generation never changes torrent piece priority.
  *
  *  - DENSE tier: ~1 frame per MINUTE of content. These are NEVER prefetched — they're decoded
  *    free-of-charge ONLY where the covering bytes are ALREADY on disk
  *    ([TorrentStreamer.isByteAvailable] == true). As the user watches (the contiguous downloaded
- *    head grows) and as the coarse prefetches land, more and more dense samples become decodable for
+ *    head grows), more and more dense samples become decodable for
  *    free; the poll loop re-scans and fills them in. Net effect: the already-downloaded region of the
  *    timeline ends up ~1 frame/min (free), the rest stays at coarse density until its bytes arrive.
  *
@@ -85,7 +83,7 @@ class FrameThumbnailExtractor(
         this.durationMs = durationMs
         this.fileLength = fileLength
 
-        // Coarse tier: bounded whole-timeline coverage that we actively prefetch.
+        // Coarse tier: bounded whole-timeline grid filled opportunistically from available pieces.
         val coarseCount = COARSE_COUNT
         // Dense tier: ~1 frame/min, clamped so very short clips don't go below the coarse density and
         // very long ones don't blow past the cache cap.
@@ -123,31 +121,44 @@ class FrameThumbnailExtractor(
     }
 
     private suspend fun run(streamUrl: String, hash: String, coarseCount: Int, denseCount: Int) {
-        // Coarse sample centres (time + byte offset). These get actively prefetched.
+        // Coarse + dense sample centres. Both are strictly opportunistic: a 20-point whole-timeline
+        // prefetch used to mark 40 widely-scattered whole pieces time-critical (hundreds of MB on old
+        // torrents), directly starving the next playback piece on thin swarms.
         val coarseInterval = (durationMs / coarseCount).coerceAtLeast(1L)
         val coarseTimes = (0 until coarseCount).map { i -> i * coarseInterval + coarseInterval / 2 }
         val coarseOffsets = coarseTimes.map { byteOffsetForTime(it) }
 
-        // Dense sample centres (time only — never prefetched, decoded only where bytes already exist).
         val denseTimes = (0 until denseCount).map { i -> i * denseIntervalMs + denseIntervalMs / 2 }
-
-        // Kick off the coarse prefetch up front (relaxed deadline; never competes with playback).
-        runCatching { streamer.prefetchPreviewOffsets(hash, coarseOffsets) }
 
         // Prefer the on-disk file (libtorrent allocates the whole file up front; we only ever decode
         // slices that isByteAvailable() confirms are present). MediaMetadataRetriever reading the local
         // file is far more reliable than pointing it at the NanoHTTPD URL, which silently fails to
         // decode on some TVs (the "chunk bar works but no preview frames" bug). Fall back to the URL.
         val path = filePath
-        val retriever = runCatching {
-            MediaMetadataRetriever().apply {
-                if (path != null && java.io.File(path).exists()) setDataSource(path)
-                else setDataSource(streamUrl, HashMap<String, String>())
+        var retriever: MediaMetadataRetriever? = null
+        var attempts = 0
+        while (currentCoroutineContext().isActive && retriever == null) {
+            retriever = runCatching {
+                val candidate = MediaMetadataRetriever()
+                try {
+                    if (path != null && java.io.File(path).exists()) candidate.setDataSource(path)
+                    else candidate.setDataSource(streamUrl, HashMap<String, String>())
+                    candidate
+                } catch (t: Throwable) {
+                    runCatching { candidate.release() }
+                    throw t
+                }
+            }.getOrElse {
+                // Sparse MKV/WebM files may not expose enough container metadata on the first attempt.
+                // Retry as sequential playback fills more bytes; this never requests torrent pieces.
+                if (attempts++ == 0) {
+                    Log.w(TAG, "thumbnail retriever waiting for container metadata (path=$path)")
+                }
+                null
             }
-        }.getOrNull() ?: run {
-            Log.w(TAG, "thumbnail retriever setDataSource failed (path=$path url=$streamUrl)")
-            return
+            if (retriever == null) delay(RETRIEVER_RETRY_MS)
         }
+        val activeRetriever = retriever ?: return
 
         try {
             // Frame centres we've already attempted (decoded or proven-empty) — keyed by time, so we
@@ -166,32 +177,21 @@ class FrameThumbnailExtractor(
             while (currentCoroutineContext().isActive) {
                 var progressed = false
 
-                // Coarse tier — prefetched, so its bytes will arrive; decode each as it lands.
-                for (i in coarseTimes.indices) {
-                    if (!currentCoroutineContext().isActive) break
-                    val t = coarseTimes[i]
-                    if (t in done) continue
-                    if (!streamer.isByteAvailable(hash, coarseOffsets[i])) continue
-                    if (decodeAndStore(retriever, t)) progressed = true
+                val pending = buildList<Pair<Long, Long>> {
+                    coarseTimes.forEachIndexed { i, t -> if (t !in done) add(t to coarseOffsets[i]) }
+                    denseTimes.forEach { t -> if (t !in done) add(t to byteOffsetForTime(t)) }
+                }.distinctBy { it.first }
+                // One native bitfield snapshot per round, rather than up to ~200 synchronous JNI calls
+                // contending with the local HTTP reader's global engine lock.
+                val available = streamer.availableByteOffsets(hash, pending.map { it.second })
+                var decodedThisRound = 0
+                for (i in pending.indices) {
+                    if (!currentCoroutineContext().isActive || decodedThisRound >= MAX_DECODES_PER_ROUND) break
+                    if (!available.getOrElse(i) { false }) continue
+                    val t = pending[i].first
+                    if (decodeAndStore(activeRetriever, t)) progressed = true
                     done += t
-                }
-
-                // Dense tier — FREE only: decode a sample solely when its bytes are already on disk.
-                // Never prefetch these. Re-scanned every round so newly-downloaded regions fill in.
-                for (t in denseTimes) {
-                    if (!currentCoroutineContext().isActive) break
-                    if (t in done) continue
-                    if (!streamer.isByteAvailable(hash, byteOffsetForTime(t))) continue
-                    if (decodeAndStore(retriever, t)) progressed = true
-                    done += t
-                }
-
-                // Re-arm deadlines on coarse points still missing so libtorrent keeps fetching them.
-                val coarseMissing = coarseTimes.indices
-                    .filter { coarseTimes[it] !in done }
-                    .map { coarseOffsets[it] }
-                if (coarseMissing.isNotEmpty()) {
-                    runCatching { streamer.prefetchPreviewOffsets(hash, coarseMissing) }
+                    decodedThisRound++
                 }
 
                 // If the coarse tier is fully decoded AND every dense point has been attempted, there's
@@ -206,7 +206,7 @@ class FrameThumbnailExtractor(
                 delay(if (idleRounds > 6) IDLE_POLL_MS else ACTIVE_POLL_MS)
             }
         } finally {
-            runCatching { retriever.release() }
+            runCatching { activeRetriever.release() }
         }
     }
 
@@ -311,8 +311,7 @@ class FrameThumbnailExtractor(
     private companion object {
         const val TAG = "FrameThumbs"
 
-        /** Coarse tier: evenly-spaced points across the whole timeline that we actively PREFETCH.
-         *  Bounds how much we ever download for previews (≈ the old fixed-24 behaviour). */
+        /** Coarse tier: evenly-spaced points across the whole timeline, never actively downloaded. */
         const val COARSE_COUNT = 20
 
         /** Dense tier upper bound (~1 frame/min, clamped to this). Each thumb ≈ 230 KB, so the cap
@@ -332,5 +331,8 @@ class FrameThumbnailExtractor(
 
         const val ACTIVE_POLL_MS = 600L
         const val IDLE_POLL_MS = 2500L
+        const val RETRIEVER_RETRY_MS = 2500L
+        /** Bound background decoder CPU so weak TVs keep their cores for live video + piece hashing. */
+        const val MAX_DECODES_PER_ROUND = 2
     }
 }

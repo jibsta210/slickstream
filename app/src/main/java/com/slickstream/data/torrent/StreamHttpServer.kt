@@ -7,6 +7,11 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.RandomAccessFile
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /**
  * Local HTTP bridge that serves a (possibly still-downloading) torrent file to ExoPlayer
@@ -23,6 +28,43 @@ class StreamHttpServer(
     // hostname = null binds all interfaces (0.0.0.0) so a Chromecast on the LAN can reach the
     // stream; local playback still uses the 127.0.0.1 baseUrl below.
 ) : NanoHTTPD(null as String?, 0 /* ephemeral port */) {
+
+    init {
+        // NanoHTTPD's default runner creates one unbounded thread per connection. Missing torrent
+        // ranges can block for tens of seconds, so player retries/cast requests could otherwise retain
+        // dozens of threads and 1MB read buffers. Video players need only a small handful concurrently.
+        val handlers = ConcurrentHashMap.newKeySet<ClientHandler>()
+        val executor = ThreadPoolExecutor(
+            MAX_HTTP_WORKERS,
+            MAX_HTTP_WORKERS,
+            30L,
+            TimeUnit.SECONDS,
+            ArrayBlockingQueue(MAX_PENDING_CONNECTIONS),
+            { task -> Thread(task, "torrent-http").apply { isDaemon = true } },
+            ThreadPoolExecutor.AbortPolicy(),
+        )
+        setAsyncRunner(object : AsyncRunner {
+            override fun exec(code: ClientHandler) {
+                handlers += code
+                try {
+                    executor.execute(code)
+                } catch (_: RejectedExecutionException) {
+                    handlers -= code
+                    code.close()
+                }
+            }
+
+            override fun closed(code: ClientHandler) {
+                handlers -= code
+            }
+
+            override fun closeAll() {
+                handlers.toList().forEach { runCatching { it.close() } }
+                handlers.clear()
+                executor.shutdownNow()
+            }
+        })
+    }
 
     /** The local base URL, valid only after [start]. */
     val baseUrl: String
@@ -75,8 +117,8 @@ class StreamHttpServer(
     }
 
     private fun serveFull(infoHash: String, file: File, totalLength: Long, mime: String): Response {
-        // Ensure at least the head is present before we start streaming from 0.
-        blockForRange(infoHash, 0, (HEAD_SERVE_BYTES - 1).coerceAtMost(totalLength - 1))
+        // The InputStream performs the single authoritative range wait. A second preflight used to wait
+        // 30s, ignore failure, send HTTP 200, then wait another 22–30s for the same missing piece.
         val stream = TorrentFileInputStream(engine, infoHash, file, 0, totalLength - 1)
         val resp = newFixedLengthResponse(Response.Status.OK, mime, stream, totalLength)
         addCommonHeaders(resp, totalLength)
@@ -96,20 +138,11 @@ class StreamHttpServer(
         if (start > end || start < 0) return rangeNotSatisfiable(totalLength)
 
         val contentLength = end - start + 1
-        // Make sure the first chunk of the requested window is on disk before we respond.
-        blockForRange(infoHash, start, (start + HEAD_SERVE_BYTES - 1).coerceAtMost(end))
-
         val stream = TorrentFileInputStream(engine, infoHash, file, start, end)
         val resp = newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, mime, stream, contentLength)
         addCommonHeaders(resp, totalLength)
         resp.addHeader("Content-Range", "bytes $start-$end/$totalLength")
         return resp
-    }
-
-    private fun blockForRange(infoHash: String, start: Long, endInclusive: Long) {
-        runBlocking {
-            engine.ensureRange(infoHash, start, endInclusive, RANGE_BLOCK_TIMEOUT_MS)
-        }
     }
 
     private fun rangeNotSatisfiable(totalLength: Long): Response {
@@ -164,6 +197,12 @@ class StreamHttpServer(
         "mov" -> "video/quicktime"
         "ts" -> "video/mp2t"
         "flv" -> "video/x-flv"
+        "wmv" -> "video/x-ms-wmv"
+        "asf" -> "video/x-ms-asf"
+        "mpg", "mpeg" -> "video/mpeg"
+        "m2ts", "mts" -> "video/mp2t"
+        "vob" -> "video/mpeg"
+        "ogv" -> "video/ogg"
         else -> "video/mp4"
     }
 
@@ -199,7 +238,10 @@ class StreamHttpServer(
         // 1 MB/s but gives up and switches torrents" bug. 22s leaves comfortable margin (and ensureRange
         // polls, so it isn't holding the native lock the whole time); a genuinely dead swarm is still
         // caught by the buffering watchdog. ensureRange's deadline-fetch keeps the piece prioritised.
-        private val readWaitMs = if (engine.isLowPower) 22_000L else READ_WAIT_TIMEOUT_MS
+        // Piece sizes are torrent-defined, not device-defined. Older season packs commonly use 32 MB
+        // pieces; at 0.5-1 MB/s a healthy requested piece needs 32-64 seconds, so a TV-specific 22s cap
+        // falsely failed exactly the thin swarms this path is meant to rescue.
+        private val readWaitMs = READ_WAIT_TIMEOUT_MS
         private val flushWaitMs = if (engine.isLowPower) 15_000L else FLUSH_WAIT_BUDGET_MS
 
         private fun raf(): RandomAccessFile =
@@ -284,7 +326,7 @@ class StreamHttpServer(
             private const val TAG = "TorrentFileInputStream"
 
             /** Per-read wait budget while streaming further into the file. */
-            private const val READ_WAIT_TIMEOUT_MS = 30_000L
+            private const val READ_WAIT_TIMEOUT_MS = 75_000L
 
             /** Max time to wait for libtorrent to flush a hashed-but-uncached piece to disk. */
             private const val FLUSH_WAIT_BUDGET_MS = 30_000L
@@ -294,11 +336,8 @@ class StreamHttpServer(
     companion object {
         private const val TAG = "StreamHttpServer"
         private const val LOOPBACK = "127.0.0.1"
+        private const val MAX_HTTP_WORKERS = 12
+        private const val MAX_PENDING_CONNECTIONS = 24
 
-        /** Bytes to confirm present before responding to a (re)seek. */
-        private const val HEAD_SERVE_BYTES = 512L * 1024L
-
-        /** How long to block a Range response while waiting on the head slice. */
-        private const val RANGE_BLOCK_TIMEOUT_MS = 30_000L
     }
 }

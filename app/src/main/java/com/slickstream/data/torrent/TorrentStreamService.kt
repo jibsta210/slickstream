@@ -30,8 +30,9 @@ class TorrentStreamService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startInForeground()
-        // Sticky so the OS restarts us if killed while a stream is still expected to run.
-        return START_STICKY
+        // The service owns no resumable work. Restarting it without the in-process streamer creates a
+        // permanent "Streaming…" notification while no torrent exists.
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

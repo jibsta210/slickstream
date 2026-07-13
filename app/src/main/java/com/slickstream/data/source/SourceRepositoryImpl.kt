@@ -8,9 +8,17 @@ import com.slickstream.core.model.StreamSource
 import com.slickstream.core.repository.SourceRepository
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.source.dto.StreamDto
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.URLEncoder
 import java.util.Locale
 import javax.inject.Inject
@@ -32,6 +40,17 @@ class SourceRepositoryImpl @Inject constructor(
     private val settingsRepository: SettingsRepository,
 ) : SourceRepository {
 
+    /** Successful resolves are briefly reusable by details prewarm + player startup. [inFlight] also
+     *  makes those overlapping calls share one addon fan-out instead of issuing the same dozen HTTP
+     *  requests twice. Failures are never cached. */
+    private val resolveMutex = Mutex()
+    private val resolveCache = mutableMapOf<ResolveKey, CachedResolve>()
+    /** Repository-owned because one caller (usually details prewarm) may be cancelled while another
+     *  (the player) is awaiting the same resolve. Cancelling either waiter must not cancel their shared
+     *  network request out from under the other. The repository is an app-lifetime singleton. */
+    private val resolveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val inFlight = mutableMapOf<ResolveKey, SharedResolve>()
+
     override suspend fun resolve(
         details: MediaDetails,
         season: Int?,
@@ -48,6 +67,93 @@ class SourceRepositoryImpl @Inject constructor(
             imdbId
         }
 
+        val customBases = try {
+            settingsRepository.current().customSourceUrl
+                .split(",").map { it.trim() }.filter { it.isNotBlank() }.map(::normalizeBase)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        val autoBases = try {
+            addonRegistry.streamingBaseUrls()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        // Include the complete addon set without retaining a token-bearing custom URL in the key.
+        val addonFingerprint = syntheticHash((customBases + baseUrls + autoBases).distinct().joinToString("\n"))
+        val key = ResolveKey(type, id, addonFingerprint)
+        val shared = resolveMutex.withLock {
+            val now = System.nanoTime()
+            resolveCache.entries.removeAll { now - it.value.storedAtNanos >= RESOLVE_CACHE_TTL_NANOS }
+            resolveCache[key]?.let { return it.result }
+            inFlight[key]?.also { it.waiters++ } ?: SharedResolve(
+                deferred = resolveScope.async(start = CoroutineStart.LAZY) {
+                    resolveAndCache(key, details, type, id, customBases, autoBases)
+                },
+                waiters = 1,
+            ).also { inFlight[key] = it }
+        }
+        shared.deferred.start()
+        // Await remains cancellable for this caller, but the app-scope request can still satisfy other
+        // waiters and populate the short cache. If every waiter leaves, cancel the fan-out immediately
+        // so rapid Details browsing cannot fill OkHttp with abandoned addon requests.
+        return try {
+            shared.deferred.await()
+        } finally {
+            val cancel = resolveMutex.withLock {
+                val current = inFlight[key]
+                if (current !== shared) {
+                    false
+                } else {
+                    current.waiters--
+                    if (current.waiters <= 0) {
+                        inFlight.remove(key, current)
+                        !current.deferred.isCompleted
+                    } else {
+                        false
+                    }
+                }
+            }
+            if (cancel) shared.deferred.cancel()
+        }
+    }
+
+    private suspend fun resolveAndCache(
+        key: ResolveKey,
+        details: MediaDetails,
+        type: String,
+        id: String,
+        customBases: List<String>,
+        autoBases: List<String>,
+    ): DataResult<List<StreamSource>> {
+        try {
+            val result = resolveUncached(details, type, id, customBases, autoBases)
+            if (result is DataResult.Success) {
+                resolveMutex.withLock {
+                    resolveCache[key] = CachedResolve(result, System.nanoTime())
+                }
+            }
+            return result
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            return DataResult.Error(
+                "Failed to resolve sources for \"${details.item.title}\": ${t.message ?: "unknown error"}",
+                t,
+            )
+        }
+    }
+
+    private suspend fun resolveUncached(
+        details: MediaDetails,
+        type: String,
+        id: String,
+        customBases: List<String>,
+        autoBases: List<String>,
+    ): DataResult<List<StreamSource>> {
         return try {
             // Query every CONFIGURED indexer addon PLUS the auto-discovered, health-checked free
             // streaming addons (AddonRegistry — kept current automatically, no manual URLs) in parallel.
@@ -57,17 +163,22 @@ class SourceRepositoryImpl @Inject constructor(
             // cached direct streams) is queried FIRST, then the built-in indexer, then the
             // auto-discovered free addons. Paste-tolerant: a ".../manifest.json" install URL is
             // normalised to the query base.
-            val customBases = runCatching {
-                settingsRepository.current().customSourceUrl
-                    .split(",").map { it.trim() }.filter { it.isNotBlank() }.map(::normalizeBase)
-            }.getOrDefault(emptyList())
-            val autoBases = runCatching { addonRegistry.streamingBaseUrls() }.getOrDefault(emptyList())
             val allBases = (customBases + baseUrls + autoBases).distinct()
             val responses = coroutineScope {
                 allBases.map { base ->
                     async {
-                        kotlinx.coroutines.withTimeoutOrNull(ADDON_QUERY_TIMEOUT_MS) {
-                            runCatching { api.getStreamsAt("${base}stream/$type/$id.json") }.getOrNull()
+                        // Auto-discovered file-server addons are optional enrichment. One dead entry
+                        // must not hold a ready Torrentio/RD result for the old blanket 10-second timeout.
+                        val optionalAuto = base in autoBases && base !in customBases && base !in baseUrls
+                        val timeout = if (optionalAuto) AUTO_ADDON_QUERY_TIMEOUT_MS else ADDON_QUERY_TIMEOUT_MS
+                        kotlinx.coroutines.withTimeoutOrNull(timeout) {
+                            try {
+                                api.getStreamsAt("${base}stream/$type/$id.json")
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Throwable) {
+                                null
+                            }
                         }
                     }
                 }.awaitAll()
@@ -79,25 +190,30 @@ class SourceRepositoryImpl @Inject constructor(
             // Title-aware language detection needs the title at MAP time so a language name that's part
             // of the title ("The French Dispatch") isn't read as a foreign-audio tag.
             val movieTitle = details.item.title
+            val idParts = id.split(':')
+            val expectedSeason = idParts.getOrNull(1)?.toIntOrNull()
+            val expectedEpisode = idParts.getOrNull(2)?.toIntOrNull()
             val sources = ok
                 .flatMap { it.streams }
-                .mapNotNull { it.toStreamSource(movieTitle) }
+                .mapNotNull { it.toStreamSource(movieTitle, expectedSeason, expectedEpisode) }
                 .groupBy { it.infoHash }
-                .map { (_, rows) -> rows.maxByOrNull { it.seeders ?: 0 }!! }
+                // A cached debrid URL and a torrent fallback can share an info-hash. Keep the direct
+                // one even if a duplicate torrent row reports more seeders; seeders are irrelevant to
+                // an already-hosted file and dropping it defeats file-server-first playback.
+                .map { (_, rows) ->
+                    rows.maxWithOrNull(
+                        compareBy<StreamSource> { it.isDirect }.thenBy { it.seeders ?: 0 },
+                    )!!
+                }
                 // Direct (file-server) streams first — they play instantly with no swarm — then torrents
                 // by health, so the manual source list matches the auto-pick's file-server-first order.
                 .sortedWith(compareByDescending<StreamSource> { it.isDirect }.thenByDescending { it.rank })
-            // English-only by default — foreign releases shouldn't even be an OPTION (the user keeps
-            // hitting random Spanish/Chinese). Prefer English; if a title genuinely has no English
-            // release, still NEVER surface an unreadable non-Latin name — fall back to Latin-script
-            // (e.g. a Spanish-only foreign film), and only to the raw list if even that is empty.
-            val english = sources.filter {
-                it.englishLikely && StreamPicker.noForeignTag(it.title, movieTitle)
-            }
-            val filtered = english.ifEmpty {
-                sources.filterNot { StreamPicker.hasNonLatin(it.title) }.ifEmpty { sources }
-            }
-            DataResult.Success(filtered)
+            // Keep every viable transport for manual selection and late failover. StreamPicker applies
+            // English preference softly, so an obscure title is never stranded just because its only
+            // healthy release is tagged as foreign/original audio.
+            DataResult.Success(sources)
+        } catch (e: CancellationException) {
+            throw e
         } catch (t: Throwable) {
             DataResult.Error(
                 "Failed to resolve sources for \"${details.item.title}\": ${t.message ?: "unknown error"}",
@@ -124,19 +240,30 @@ class SourceRepositoryImpl @Inject constructor(
         url.substringBefore("manifest.json").let { if (it.endsWith("/")) it else "$it/" }
 
     /** Map one indexer row to a [StreamSource], or null if it's neither a torrent nor a direct URL. */
-    private fun StreamDto.toStreamSource(movieTitle: String): StreamSource? {
-        // A DIRECT http/hls stream (free streaming addon) — no torrent. Synthesize a stable info-hash
-        // from the URL so all the existing infoHash-keyed bookkeeping (resume, history, failover) works
-        // unchanged. Torrent rows keep their real info-hash; rows with neither are ignored (ytId/external).
-        val directUrl = url?.trim()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
-        val hash = infoHash?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
-            ?: directUrl?.let { syntheticHash(it) }
-            ?: return null
-
+    private fun StreamDto.toStreamSource(movieTitle: String, season: Int?, episode: Int?): StreamSource? {
         // Pool every text field that may carry quality / seeders / size / codec metadata (the codec
         // and container often live in the filename, e.g. "…XviD-MAXX.avi", so include it).
         val haystack = listOfNotNull(name, title, description, behaviorHints?.bingeGroup, behaviorHints?.filename)
             .joinToString("\n")
+
+        // Stremio addons sometimes expose an HTTP *action* that asks the debrid service to download an
+        // uncached torrent. It is not a playable file URL. When the row also carries a hash, preserve
+        // the useful torrent fallback and ignore the action URL; without a hash there is nothing this
+        // app can play, so discard it. `notWebReady` is NOT torrent evidence: Stremio also sets it for
+        // valid HLS/header-proxied direct streams which Android can play.
+        val rawUrl = url?.trim()?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        val declaredHash = infoHash?.trim()?.let(::canonicalInfoHash)
+        // Stremio `dht:` sources are peer/node hints, not torrent identities. Treating a 40-hex node ID
+        // as BTIH creates a perfectly valid-looking magnet for the wrong/nonexistent torrent.
+        val torrentHash = declaredHash
+        val isDebridAction = DEBRID_DOWNLOAD_ACTION.containsMatchIn(haystack)
+        if (isDebridAction && torrentHash == null) return null
+        val forceTorrent = torrentHash != null && isDebridAction
+        val directUrl = rawUrl.takeUnless { forceTorrent }
+        // Direct playback identity is the URL, not its underlying torrent hash. RD can return several
+        // independently expiring URLs plus a P2P fallback for one hash; keying all of them by that hash
+        // collapsed the list to one dead link and made failover impossible.
+        val hash = directUrl?.let { syntheticHash(it) } ?: torrentHash ?: return null
 
         // A "kindly configure this addon to access streams" placeholder is NOT playable — its url is a
         // debrid/config gate, not a video. Drop it so it never appears as a (broken) direct source.
@@ -150,13 +277,15 @@ class SourceRepositoryImpl @Inject constructor(
 
         return StreamSource(
             title = displayName.trim(),
-            magnetUri = if (directUrl != null) "" else buildMagnet(hash, displayName),
+            magnetUri = if (directUrl != null) "" else buildMagnet(hash, displayName, sources),
             infoHash = hash,
             quality = parseQuality(haystack),
             sizeBytes = behaviorHints?.videoSize ?: parseSize(haystack),
             seeders = parseSeeders(haystack),
             provider = parseProvider(name),
             fileIndex = fileIdx,
+            expectedSeason = season,
+            expectedEpisode = episode,
             // Flag season/multi-episode packs so the picker prefers a single-file episode (faster start).
             isPack = StreamPicker.looksLikePack(haystack, fileIdx),
             // Detect language from the FULL text (filename + Torrentio title/description), not just
@@ -190,16 +319,52 @@ class SourceRepositoryImpl @Inject constructor(
             .digest(url.toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
 
-    private fun buildMagnet(infoHash: String, displayName: String): String {
+    private fun buildMagnet(infoHash: String, displayName: String, sources: List<String>): String {
         val sb = StringBuilder("magnet:?xt=urn:btih:").append(infoHash)
         val dn = displayName.lineSequence().firstOrNull()?.trim().orEmpty()
         if (dn.isNotEmpty()) {
             sb.append("&dn=").append(URLEncoder.encode(dn, "UTF-8"))
         }
-        for (tracker in TRACKERS) {
+        // Addon-provided trackers are often private/specialised and can be the only peers for an old
+        // release. Preserve them ahead of the public fallback set.
+        val addonTrackers = sources.mapNotNull(::trackerFromSource)
+        for (tracker in (addonTrackers + TRACKERS).distinct()) {
             sb.append("&tr=").append(URLEncoder.encode(tracker, "UTF-8"))
         }
         return sb.toString()
+    }
+
+    private fun trackerFromSource(source: String): String? {
+        if (!source.startsWith("tracker:", ignoreCase = true)) return null
+        return source.substringAfter(':').trim().takeIf {
+            it.startsWith("http://", ignoreCase = true) ||
+                it.startsWith("https://", ignoreCase = true) ||
+                it.startsWith("udp://", ignoreCase = true)
+        }
+    }
+
+    /** Normalize hex/base32 v1 BTIHs to the engine/cache's one lowercase 40-hex identity. */
+    private fun canonicalInfoHash(value: String): String? {
+        val hash = value.trim()
+        if (HEX_INFO_HASH.matches(hash)) return hash.lowercase(Locale.ROOT)
+        if (!BASE32_INFO_HASH.matches(hash)) return null
+        var buffer = 0
+        var bits = 0
+        val out = ByteArray(20)
+        var outIndex = 0
+        for (ch in hash.uppercase(Locale.ROOT)) {
+            val digit = BASE32_ALPHABET.indexOf(ch)
+            if (digit < 0) return null
+            buffer = (buffer shl 5) or digit
+            bits += 5
+            if (bits >= 8) {
+                bits -= 8
+                if (outIndex >= out.size) return null
+                out[outIndex++] = ((buffer shr bits) and 0xFF).toByte()
+            }
+        }
+        if (outIndex != out.size) return null
+        return out.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private fun parseQuality(text: String): String {
@@ -240,8 +405,29 @@ class SourceRepositoryImpl @Inject constructor(
     }
 
     private companion object {
+        data class ResolveKey(val type: String, val id: String, val addonFingerprint: String)
+        data class SharedResolve(
+            val deferred: Deferred<DataResult<List<StreamSource>>>,
+            var waiters: Int,
+        )
+        data class CachedResolve(
+            val result: DataResult.Success<List<StreamSource>>,
+            val storedAtNanos: Long,
+        )
+
+        const val RESOLVE_CACHE_TTL_NANOS = 30_000_000_000L
         /** Per-addon resolve timeout — a slow/dead auto-discovered addon can't stall the whole resolve. */
-        const val ADDON_QUERY_TIMEOUT_MS = 10_000L
+        const val ADDON_QUERY_TIMEOUT_MS = 8_000L
+        const val AUTO_ADDON_QUERY_TIMEOUT_MS = 2_500L
+        val HEX_INFO_HASH = Regex("(?i)^[a-f0-9]{40}$")
+        val BASE32_INFO_HASH = Regex("(?i)^[a-z2-7]{32}$")
+        const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        /** Torrentio/debrid rows whose URL initiates an uncached download instead of serving video. */
+        val DEBRID_DOWNLOAD_ACTION = Regex(
+            "(?i)(\\b(?:rd|ad|pm)\\s*download\\b|" +
+                "\\bdownload\\s+to\\s+(?:your\\s+)?(?:real[\\s-]?debrid|all[\\s-]?debrid|" +
+                "premiumize|debrid)\\b|\\bdebrid\\s+(?:download|action)\\b)",
+        )
         // 👤 followed by an optional space and a seeder count.
         val SEEDER_EMOJI_REGEX = Regex("""👤\s*(\d+)""")
         val SEEDER_WORD_REGEX = Regex("""(?i)seed(?:er)?s?\s*[:=]?\s*(\d+)""")

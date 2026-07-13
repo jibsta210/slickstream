@@ -10,6 +10,7 @@ import com.slickstream.core.model.StreamStatus
 import com.slickstream.core.repository.TorrentStreamer
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.awaitClose
@@ -20,6 +21,8 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -53,8 +56,16 @@ class TorrentStreamerImpl @Inject constructor(
     /** infoHash -> source, so resume()/pause() can re-derive parameters if needed. */
     private val sources = ConcurrentHashMap<String, StreamSource>()
 
-    /** infoHashes currently being STREAMED by a player — a prefetch must never pause these. */
-    private val streamingHashes = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+    /** Active collectors per info-hash. A set was wrong when playback + an offline download shared a
+     *  torrent: closing either collector removed protection and paused/evicted bytes under the other. */
+    private val streamingRefs = ConcurrentHashMap<String, AtomicInteger>()
+    private val acquiringRefs = ConcurrentHashMap<String, AtomicInteger>()
+    private val activeSelections = ConcurrentHashMap<String, StreamSelection>()
+    private val selectionLocks = ConcurrentHashMap<String, Mutex>()
+
+    /** Piece-map snapshots are produced by the IO poller and consumed by Compose. This keeps synchronous
+     *  libtorrent status() calls (and nativeLock waits) off the main/UI thread. */
+    private val pieceMapCache = ConcurrentHashMap<String, FloatArray>()
 
     /** The most recently warmed (next-episode) info-hash. Protected from cache eviction so a long
      *  current episode can't evict the precache before the user advances. Cleared once it streams. */
@@ -69,25 +80,65 @@ class TorrentStreamerImpl @Inject constructor(
             return@callbackFlow
         }
 
-        onStreamStarted()
+        try {
+            onStreamStarted()
+        } catch (t: Throwable) {
+            trySend(errorStatus(source, "Failed to start torrent service: ${t.message ?: "unknown error"}"))
+            close()
+            return@callbackFlow
+        }
 
         var emittedReady = false
 
         // METADATA phase.
         trySend(baseStatus(source, StreamState.METADATA, progress = 0f, streamUrl = null))
 
+        val requestedHash = source.infoHash.lowercase()
+        val selection = StreamSelection(source.fileIndex, source.expectedSeason, source.expectedEpisode)
+        markAcquiring(requestedHash)
         val infoHash = try {
-            engine.addMagnet(source.magnetUri, source.fileIndex)
+            selectionLocks.getOrPut(requestedHash) { Mutex() }.withLock {
+                var activeSelection = activeSelections[requestedHash]
+                if (isStreaming(requestedHash) && activeSelection != null && activeSelection != selection) {
+                    // Player source/episode transitions cancel the old collector without joining it.
+                    // Give awaitClose a brief chance to release the one mutable pack-file selection;
+                    // true concurrent playback/download ownership remains rejected below.
+                    repeat(SELECTION_HANDOFF_POLLS) {
+                        if (!isStreaming(requestedHash)) return@repeat
+                        delay(SELECTION_HANDOFF_POLL_MS)
+                    }
+                    activeSelection = activeSelections[requestedHash]
+                }
+                if (isStreaming(requestedHash) && activeSelection != null && activeSelection != selection) {
+                    error("A different episode from this season pack is already in use")
+                }
+                engine.addMagnet(
+                    source.magnetUri,
+                    source.fileIndex,
+                    source.expectedSeason,
+                    source.expectedEpisode,
+                    acquireStreamingLease = true,
+                ).also { canonicalHash ->
+                    // Source mapping canonicalizes v1 hashes, so these normally match. Store under the
+                    // engine key as the final authority and claim ownership before releasing the lock.
+                    activeSelections[canonicalHash] = selection
+                    markStreaming(canonicalHash)
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            onStreamStopped()
+            throw cancelled
         } catch (t: Throwable) {
             Log.e(TAG, "addMagnet failed", t)
             trySend(errorStatus(source, t.message ?: "Failed to load torrent"))
             onStreamStopped()
             close()
             return@callbackFlow
+        } finally {
+            unmarkAcquiring(requestedHash)
         }
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
-        streamingHashes.add(infoHash)
         // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
         if (infoHash == warmedHash) warmedHash = null
 
@@ -95,26 +146,50 @@ class TorrentStreamerImpl @Inject constructor(
         // Make room if we're over budget — but protect the active stream(s) AND the warmed next-episode
         // torrent. The warm is PAUSED (not active), so without this it was the first thing evicted while
         // the current episode kept downloading, which is why "precache did nothing" after a long episode.
-        runCatching { cache.enforceBudget(streamingHashes + setOfNotNull(infoHash, warmedHash)) }
+        scope.launch {
+            runCatching {
+                cache.enforceBudget(streamingHashes() + acquiringHashes() + setOfNotNull(warmedHash))
+            }
+        }
 
-        val server = ensureServer()
+        val server = try {
+            ensureServer()
+        } catch (t: Throwable) {
+            val stillStreaming = unmarkStreaming(infoHash)
+            if (!stillStreaming) activeSelections.remove(infoHash, selection)
+            if (!stillStreaming) runCatching { engine.pause(infoHash) }
+            onStreamStopped()
+            trySend(errorStatus(source, "Failed to start local stream bridge: ${t.message ?: "unknown error"}"))
+            close()
+            return@callbackFlow
+        }
         val streamUrl = server.urlFor(infoHash)
 
         // Only mp4/m4v/mov CAN need the EOF moov atom before ExoPlayer parses a frame — and even then,
         // only when the moov is at the END (not a "faststart"/web-optimized file whose moov is up front
         // in the head). mkv/webm/avi keep their index near the front and never wait. The faststart check
         // needs head bytes, so it's resolved per-poll below.
-        val containerNeedsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS
+        val containerNeedsTail = runCatching { engine.selectedFileExt(infoHash) in MOOV_CONTAINERS }
+            .getOrDefault(false)
 
         // BUFFERING phase.
-        trySend(buildStatus(source, infoHash, StreamState.BUFFERING, streamUrl = null))
+        trySend(
+            buildStatus(
+                source,
+                infoHash,
+                StreamState.BUFFERING,
+                streamUrl = null,
+                snap = runCatching { engine.snapshot(infoHash) }.getOrNull(),
+            ),
+        )
 
         // Poll until enough head (+tail) is buffered, then flip to READY and keep emitting.
         val pollJob = launch {
             var pollCount = 0
             var zeroRateSince = 0L
             var lastReannounce = 0L
-            val streamStartMs = System.currentTimeMillis()
+            var tailWaitSince = 0L
+            var lastTailProgressBytes = -1L
             while (isActive) {
                 val snap = engine.snapshot(infoHash)
                 if (snap == null) {
@@ -145,7 +220,7 @@ class TorrentStreamerImpl @Inject constructor(
                     zeroRateSince = 0L
                 }
 
-                val headBytes = engine.contiguousHeadBytes(infoHash)
+                val headBytes = snap.contiguousHeadBytes
                 val headReady = headBytes >= READY_HEAD_BYTES
                 // Tail gate is CONTAINER-AWARE: mkv/webm start on head alone; only mp4 waits for the EOF
                 // moov (so prepare() never ranges into an absent atom). mp4 needs the moov ONLY when it's
@@ -156,18 +231,44 @@ class TorrentStreamerImpl @Inject constructor(
                 // sat in STATE_BUFFERING forever ("100% · Almost ready…" that never plays, or only starts
                 // tens-of-% into the download once the moov happens to arrive). The head-only watchdog never
                 // caught it because the overall download kept progressing. READY now requires the moov to be
-                // GENUINELY present — OR the head-independent overall hard cap as a true last resort, which
-                // the VM's startup-failover ceiling then backs up (bail to another source if the player
-                // still can't reach first frame).
-                val needsTail = containerNeedsTail && engine.mp4MoovInHead(infoHash) != true
+                // GENUINELY present. The VM's stall watchdog advances only when a swarm stops making
+                // contiguous progress, so a slow-but-live old torrent remains viable.
+                val moovInHead = if (containerNeedsTail) engine.mp4MoovInHead(infoHash, headBytes) else null
+                if (moovInHead == true) engine.cancelStartupTail(infoHash)
+                val needsTail = containerNeedsTail && moovInHead != true
                 val tailReady = !needsTail || engine.tailAvailable(infoHash)
-                val overallGrace = now - streamStartMs > OVERALL_HARD_CAP_MS
-                val canStart = (headReady && tailReady) || (overallGrace && headBytes > 0L)
+                if (headReady && needsTail && !tailReady) {
+                    // This is a STALL timeout, not a wall-clock cap. Whole-piece availability exposes
+                    // no partial progress for a 32 MB EOF piece, but selected-file progress still tells
+                    // us the swarm is alive; reset while bytes advance so thin old swarms and offline
+                    // MP4 downloads are not killed merely for being slow.
+                    if (snap.startupTailProgressBytes > lastTailProgressBytes) {
+                        lastTailProgressBytes = snap.startupTailProgressBytes
+                        tailWaitSince = now
+                    } else if (tailWaitSince == 0L) {
+                        tailWaitSince = now
+                    }
+                    if (now - tailWaitSince >= TAIL_STALL_TIMEOUT_MS) {
+                        trySend(errorStatus(source, "Required MP4 index pieces are unavailable in this swarm"))
+                        close()
+                        return@launch
+                    }
+                } else {
+                    tailWaitSince = 0L
+                    lastTailProgressBytes = -1L
+                }
+                // Never hand a known-incomplete startup range to the player. On a weak but live swarm,
+                // the old hard cap started HTTP early and the VM failed it before the range wait could
+                // finish. The stall watchdog still advances away from truly dead swarms.
+                val canStart = headReady && tailReady
 
                 // ETA to first frame, against the real gate (head + tail-when-needed), refreshed each poll.
                 val eta = estimateEta(snap, headBytes, tailReady)
 
                 if (pollCount++ % DIAG_EVERY == 0) {
+                    engine.pieceMap(infoHash, PIECE_MAP_CACHE_BUCKETS)
+                        .takeIf { it.isNotEmpty() }
+                        ?.let { pieceMapCache[infoHash] = it }
                     Log.d(
                         TAG,
                         "stream=$infoHash rate=${snap.downloadRate}B/s peers=${snap.peers} " +
@@ -214,6 +315,7 @@ class TorrentStreamerImpl @Inject constructor(
                             buildStatus(
                                 source, infoHash, StreamState.BUFFERING,
                                 streamUrl = null, snap = snap, etaSeconds = eta,
+                                awaitingStartupTail = headReady && needsTail && !tailReady,
                             ),
                         )
                     }
@@ -224,10 +326,14 @@ class TorrentStreamerImpl @Inject constructor(
 
         awaitClose {
             pollJob.cancel()
-            streamingHashes.remove(infoHash)
+            val stillStreaming = unmarkStreaming(infoHash)
+            if (!stillStreaming) activeSelections.remove(infoHash, selection)
+            if (!stillStreaming) pieceMapCache.remove(infoHash)
             // The flow was cancelled (player left). Pause + persist; keep files in cache.
             scope.launch {
-                runCatching { engine.pause(infoHash) }
+                // A next-episode start can claim this hash after unmarkStreaming() but before this IO
+                // cleanup runs. Recheck live ownership so the old generation never pauses the new one.
+                if (!stillStreaming && !isStreaming(infoHash)) runCatching { engine.pause(infoHash) }
                 cache.touch(infoHash)
                 onStreamStopped()
             }
@@ -245,10 +351,11 @@ class TorrentStreamerImpl @Inject constructor(
     }
 
     override suspend fun stop(infoHash: String, removeFiles: Boolean) = withContext(Dispatchers.IO) {
-        engine.stop(infoHash, removeFiles)
+        if (isStreaming(infoHash)) return@withContext
         if (removeFiles) {
             cache.evict(infoHash)
         } else {
+            engine.stop(infoHash, removeFiles = false)
             cache.touch(infoHash)
         }
         sources.remove(infoHash)
@@ -260,39 +367,76 @@ class TorrentStreamerImpl @Inject constructor(
         protectedHashes: Set<String>,
     ): String? = withContext(Dispatchers.IO) {
         if (!engine.isAvailable()) return@withContext null
+        if (source.isDirect || source.magnetUri.isBlank()) return@withContext null
+        val requestedHash = source.infoHash.lowercase()
+        // One ActiveTorrent has one selected file. Re-selecting a different episode from the same pack
+        // while this hash is playing mutates the HTTP route underneath the current player.
+        if (isStreaming(requestedHash)) return@withContext null
+        markAcquiring(requestedHash)
         // Deliberately NO onStreamStarted()/ensureServer() — warming must not spin up the
         // foreground service or the HTTP bridge. It is a quiet background head-fetch.
-        val infoHash = try {
-            engine.addMagnet(source.magnetUri, source.fileIndex)
+        val acquiredHash = try {
+            selectionLocks.getOrPut(requestedHash) { Mutex() }.withLock {
+                // Re-check under the same lock used by start(); the player may have claimed this hash
+                // after the optimistic check above.
+                if (isStreaming(requestedHash)) return@withLock null
+                engine.addMagnet(
+                    source.magnetUri,
+                    source.fileIndex,
+                    source.expectedSeason,
+                    source.expectedEpisode,
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            unmarkAcquiring(requestedHash)
+            throw cancelled
         } catch (t: Throwable) {
+            unmarkAcquiring(requestedHash)
             Log.w(TAG, "prefetch addMagnet failed for ${source.infoHash}", t)
             return@withContext null
         }
-
-        cache.touch(infoHash)
-        // Make room if over budget, but never evict the playing torrent OR the one we're warming.
-        runCatching { cache.enforceBudget(protectedHashes + infoHash) }
-
-        // Buffer a small head AND the moov tail (for non-faststart mp4) so first-frame is INSTANT when
-        // the user advances — warming the head alone left the reused torrent stalling on the EOF moov,
-        // exactly the gate the foreground stream waits on. mkv/webm + faststart mp4 need only the head.
-        // Container/needsTail is re-checked each tick: right after addMagnet, metadata (so the file
-        // extension) isn't known yet, so we can't decide once up front.
-        val deadline = System.currentTimeMillis() + PREFETCH_BUDGET_MS
-        while (currentCoroutineContext().isActive && System.currentTimeMillis() < deadline) {
-            val headReady = engine.contiguousHeadBytes(infoHash) >= PREFETCH_HEAD_BYTES
-            val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS &&
-                engine.mp4MoovInHead(infoHash) != true
-            val tailReady = !needsTail || engine.tailAvailable(infoHash)
-            if (headReady && tailReady) break
-            delay(POLL_INTERVAL_MS)
+        if (acquiredHash == null) {
+            unmarkAcquiring(requestedHash)
+            return@withContext null
         }
-        // Park the warmed torrent — UNLESS a player has meanwhile started streaming it (Play pressed
-        // during the warm), or we'd pause the live stream out from under the player.
-        if (infoHash !in streamingHashes) runCatching { engine.pause(infoHash) }
-        cache.touch(infoHash)
-        warmedHash = infoHash   // protect it from eviction until the user advances to it
-        infoHash
+        val infoHash = acquiredHash
+        // Publish protection before any budget walk. acquiringRefs remains held for the entire warm,
+        // closing the gap where memory pressure could evict the just-created payload mid-prefetch.
+        warmedHash = infoHash
+
+        var completedWarm = false
+        try {
+            cache.touch(infoHash)
+            // Make room if over budget, but never evict the playing torrent OR the one we're warming.
+            runCatching { cache.enforceBudget(protectedHashes + infoHash) }
+
+            // Buffer a small head AND the moov tail (for non-faststart mp4) so first-frame is INSTANT
+            // when the user advances. Re-check the container each tick because metadata may have only
+            // just arrived when addMagnet returns.
+            val deadline = System.currentTimeMillis() + PREFETCH_BUDGET_MS
+            while (currentCoroutineContext().isActive && System.currentTimeMillis() < deadline) {
+                val headBytes = engine.contiguousHeadBytes(infoHash)
+                val headReady = headBytes >= PREFETCH_HEAD_BYTES
+                val moovInHead = if (engine.selectedFileExt(infoHash) in MOOV_CONTAINERS) {
+                    engine.mp4MoovInHead(infoHash, headBytes)
+                } else null
+                if (moovInHead == true) engine.cancelStartupTail(infoHash)
+                val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS && moovInHead != true
+                val tailReady = !needsTail || engine.tailAvailable(infoHash)
+                if (headReady && tailReady) break
+                delay(POLL_INTERVAL_MS)
+            }
+            completedWarm = true
+            // Keep it protected unless a player claimed it during the warm.
+            val nowStreaming = isStreaming(infoHash)
+            warmedHash = infoHash.takeUnless { nowStreaming }
+            infoHash
+        } finally {
+            if (!isStreaming(infoHash)) runCatching { engine.pause(infoHash) }
+            cache.touch(infoHash)
+            if (!completedWarm && warmedHash == infoHash) warmedHash = null
+            unmarkAcquiring(requestedHash)
+        }
     }
 
     override fun cachedTorrents(): List<String> = cache.cachedTorrents()
@@ -300,7 +444,9 @@ class TorrentStreamerImpl @Inject constructor(
     override suspend fun clearCache() = withContext(Dispatchers.IO) {
         // Never delete files out from under an active stream — its live handle would keep claiming
         // pieces exist and the HTTP server would serve zeros from a recreated sparse file.
-        cache.clearCache(protectedHashes = streamingHashes.toSet())
+        cache.clearCache(
+            protectedHashes = streamingHashes() + acquiringHashes() + setOfNotNull(warmedHash),
+        )
     }
 
     override fun onMemoryPressure(maxBytes: Long) {
@@ -310,12 +456,17 @@ class TorrentStreamerImpl @Inject constructor(
         // excludes every paused-in-session torrent and made pressure eviction a no-op).
         scope.launch {
             runCatching {
-                cache.enforceBudget(streamingHashes + setOfNotNull(warmedHash), maxBytes = maxBytes)
+                cache.enforceBudget(
+                    streamingHashes() + acquiringHashes() + setOfNotNull(warmedHash),
+                    maxBytes = maxBytes,
+                )
             }
         }
     }
 
     override fun cacheSizeBytes(): Long = cache.cacheSizeBytes()
+
+    override fun isStreaming(infoHash: String): Boolean = (streamingRefs[infoHash]?.get() ?: 0) > 0
 
     override fun fileLength(infoHash: String): Long = engine.fileLength(infoHash)
 
@@ -327,31 +478,104 @@ class TorrentStreamerImpl @Inject constructor(
     override fun isByteAvailable(infoHash: String, byteOffset: Long): Boolean =
         engine.isByteAvailable(infoHash, byteOffset)
 
-    override fun pieceMap(infoHash: String, buckets: Int): FloatArray =
-        engine.pieceMap(infoHash, buckets)
+    override fun availableByteOffsets(infoHash: String, byteOffsets: List<Long>): BooleanArray =
+        engine.availableByteOffsets(infoHash, byteOffsets)
+
+    override fun pieceMap(infoHash: String, buckets: Int): FloatArray {
+        if (buckets <= 0) return FloatArray(0)
+        val raw = pieceMapCache[infoHash] ?: return FloatArray(0)
+        if (raw.size == buckets) return raw.copyOf()
+        return FloatArray(buckets) { bucket ->
+            val from = (bucket.toLong() * raw.size / buckets).toInt()
+            val to = (((bucket + 1L) * raw.size / buckets).toInt()).coerceAtLeast(from + 1)
+            var sum = 0f
+            var count = 0
+            for (i in from until minOf(to, raw.size)) {
+                sum += raw[i]
+                count++
+            }
+            if (count == 0) 0f else sum / count
+        }
+    }
 
     // --- internals -------------------------------------------------------------------------
+
+    private data class StreamSelection(
+        val fileIndex: Int?,
+        val season: Int?,
+        val episode: Int?,
+    )
+
+    private fun markStreaming(infoHash: String) {
+        streamingRefs.compute(infoHash) { _, count ->
+            (count ?: AtomicInteger()).also { it.incrementAndGet() }
+        }
+    }
+
+    /** Returns true when another collector still owns this hash. */
+    private fun unmarkStreaming(infoHash: String): Boolean {
+        var remaining = 0
+        var released = false
+        streamingRefs.computeIfPresent(infoHash) { _, count ->
+            released = true
+            remaining = count.decrementAndGet().coerceAtLeast(0)
+            count.takeIf { remaining > 0 }
+        }
+        if (released) engine.releaseStreamingLease(infoHash)
+        return remaining > 0
+    }
+
+    private fun streamingHashes(): Set<String> = streamingRefs.entries
+        .asSequence()
+        .filter { it.value.get() > 0 }
+        .map { it.key }
+        .toSet()
+
+    private fun markAcquiring(infoHash: String) {
+        acquiringRefs.compute(infoHash) { _, count ->
+            (count ?: AtomicInteger()).also { it.incrementAndGet() }
+        }
+    }
+
+    private fun unmarkAcquiring(infoHash: String) {
+        acquiringRefs.computeIfPresent(infoHash) { _, count ->
+            count.takeIf { it.decrementAndGet() > 0 }
+        }
+    }
+
+    private fun acquiringHashes(): Set<String> = acquiringRefs.entries
+        .asSequence()
+        .filter { it.value.get() > 0 }
+        .map { it.key }
+        .toSet()
 
     @Synchronized
     private fun ensureServer(): StreamHttpServer {
         httpServer?.let { return it }
         val server = StreamHttpServer(engine)
-        // SOCKET_READ_TIMEOUT 0 = no timeout (long-lived video streaming connections).
-        server.start(0, false)
+        // Bound idle keep-alive/header reads. Active response-body streaming is not cut off by this.
+        server.start(HTTP_SOCKET_READ_TIMEOUT_MS, false)
         httpServer = server
         Log.i(TAG, "Stream HTTP server up at ${server.baseUrl}")
         return server
     }
 
+    @Synchronized
     private fun onStreamStarted() {
         if (activeStreams.getAndIncrement() == 0) {
-            startForegroundService()
+            try {
+                startForegroundService()
+            } catch (t: Throwable) {
+                activeStreams.decrementAndGet()
+                throw t
+            }
         }
     }
 
+    @Synchronized
     private fun onStreamStopped() {
-        if (activeStreams.decrementAndGet() <= 0) {
-            activeStreams.set(0)
+        val remaining = activeStreams.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+        if (remaining == 0) {
             stopForegroundService()
             shutdownServerIfIdle()
         }
@@ -359,7 +583,7 @@ class TorrentStreamerImpl @Inject constructor(
 
     @Synchronized
     private fun shutdownServerIfIdle() {
-        if (engine.activeCount() == 0) {
+        if (activeStreams.get() == 0) {
             httpServer?.let { runCatching { it.stop() } }
             httpServer = null
         }
@@ -394,6 +618,7 @@ class TorrentStreamerImpl @Inject constructor(
         seeders = source.seeders ?: 0,
         peers = 0,
         downloadedBytes = 0,
+        contiguousHeadBytes = 0,
         totalBytes = source.sizeBytes ?: 0L,
         streamUrl = streamUrl,
     )
@@ -405,6 +630,7 @@ class TorrentStreamerImpl @Inject constructor(
         streamUrl: String?,
         snap: EngineStatus? = engine.snapshot(infoHash),
         etaSeconds: Int? = null,
+        awaitingStartupTail: Boolean = false,
     ): StreamStatus {
         if (snap == null) return baseStatus(source, state, 0f, streamUrl).copy(infoHash = infoHash)
         return StreamStatus(
@@ -416,9 +642,11 @@ class TorrentStreamerImpl @Inject constructor(
             seeders = snap.seeders,
             peers = snap.peers,
             downloadedBytes = snap.downloadedBytes,
+            contiguousHeadBytes = snap.contiguousHeadBytes,
             totalBytes = snap.totalBytes.takeIf { it > 0 } ?: (source.sizeBytes ?: 0L),
             streamUrl = streamUrl,
             etaSeconds = etaSeconds,
+            awaitingStartupTail = awaitingStartupTail,
         )
     }
 
@@ -434,9 +662,10 @@ class TorrentStreamerImpl @Inject constructor(
         val rate = snap.downloadRate
         if (rate <= 0) return null
         val tailNeeded = if (tailReady) 0L else MOOV_TAIL_BYTES
-        val target = READY_HEAD_BYTES + tailNeeded
         val headRemaining = (READY_HEAD_BYTES - headBytes).coerceAtLeast(0L)
-        val remaining = (target - snap.downloadedBytes).coerceAtLeast(headRemaining)
+        // Overall torrent progress includes scattered/preview/tail pieces and previously made this hit
+        // zero while the contiguous head was still absent. Only credit the bytes tied to the real gate.
+        val remaining = headRemaining + tailNeeded
         return ((remaining / rate) + PREPARE_MARGIN_SECONDS).toInt().takeIf { it in 1..900 }
     }
 
@@ -448,6 +677,7 @@ class TorrentStreamerImpl @Inject constructor(
         seeders = source.seeders ?: 0,
         peers = 0,
         downloadedBytes = 0,
+        contiguousHeadBytes = 0,
         totalBytes = source.sizeBytes ?: 0L,
         streamUrl = null,
         errorMessage = message,
@@ -456,6 +686,10 @@ class TorrentStreamerImpl @Inject constructor(
     companion object {
         private const val TAG = "TorrentStreamer"
         private const val POLL_INTERVAL_MS = 500L
+        /** Header/idle timeout only; active response-body streaming is not capped by this value. */
+        private const val HTTP_SOCKET_READ_TIMEOUT_MS = 10_000
+        private const val SELECTION_HANDOFF_POLLS = 20
+        private const val SELECTION_HANDOFF_POLL_MS = 50L
 
         /** Contiguous head bytes required before we declare READY (~2 MB — enough to start). */
         private const val READY_HEAD_BYTES = 2L * 1024L * 1024L
@@ -469,23 +703,22 @@ class TorrentStreamerImpl @Inject constructor(
          *  bytes are present (container parse, decoder init, initial buffer fill). */
         private const val PREPARE_MARGIN_SECONDS = 4L
 
-        /** Head-INDEPENDENT hard cap: the gate can never sit BUFFERING longer than this, even if the
-         *  contiguous head is pinned below READY by a slow early piece (the "fast download, never plays"
-         *  trap). After it, we start with whatever head exists and let player retries + failover work. */
-        private const val OVERALL_HARD_CAP_MS = 25_000L
-
         /** Containers whose index (moov atom) lives at EOF and MUST be present before the first frame.
          *  Everything else (mkv/webm/avi…) starts on the head alone. */
         private val MOOV_CONTAINERS = setOf("mp4", "m4v", "mov")
 
         /** Emit a diagnostic log line every Nth poll (~2 s at a 500 ms interval). */
         private const val DIAG_EVERY = 4
+        private const val PIECE_MAP_CACHE_BUCKETS = 256
 
         /** After this long at 0 B/s on an incomplete torrent, force a re-announce to re-find peers. */
         private const val STALL_REANNOUNCE_AFTER_MS = 5_000L
 
         /** Don't force a re-announce more often than this (trackers rate-limit / ban abusive clients). */
         private const val REANNOUNCE_INTERVAL_MS = 20_000L
+        /** A peer set can have the sequential head but not the EOF moov. Avoid an infinite pre-player wait,
+         *  while still allowing a 32MB tail piece several minutes on a genuinely slow old swarm. */
+        private const val TAIL_STALL_TIMEOUT_MS = 4L * 60_000L
 
         /** Head bytes to pre-buffer when warming the next episode (~2 MB — cheap, just enough). */
         private const val PREFETCH_HEAD_BYTES = 8L * 1024L * 1024L

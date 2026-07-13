@@ -28,6 +28,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -213,8 +214,13 @@ class DownloadManager @Inject constructor(
                 // SEASON-PACK GUARD: every episode downloaded from one pack shares this infoHash, and
                 // evict() deletes ALL of the torrent's files. Only unpin+evict when no other download
                 // row still references the hash — otherwise deleting E02 would nuke E01's finished file.
-                val stillReferenced = dao.getAll().any { it.infoHash == hash }
-                if (!stillReferenced) { cache.unpin(hash); cache.evict(hash) }
+                val stillReferenced = hashUsedByOtherRow(hash, d.key)
+                if (!stillReferenced) {
+                    cache.unpin(hash)
+                    // Playback may currently own the same cached torrent. Never delete its backing file;
+                    // once unpinned it becomes normal LRU data and the next budget pass can remove it.
+                    if (!torrentStreamer.isStreaming(hash)) cache.evict(hash)
+                }
             }
             d.filePath?.let { p -> if (p.startsWith(downloadsDir.absolutePath)) File(p).delete() }
         }
@@ -311,7 +317,8 @@ class DownloadManager @Inject constructor(
             // Carry the stored fileIndex so a resumed SEASON-PACK episode re-selects the exact file
             // instead of the largest one (which would silently download the wrong episode).
             return StreamSource(title = title, magnetUri = magnetUri, infoHash = infoHash, quality = quality,
-                sizeBytes = sizeBytes.takeIf { it > 0 }, seeders = null, provider = "Download", fileIndex = fileIndex)
+                sizeBytes = sizeBytes.takeIf { it > 0 }, seeders = null, provider = "Download", fileIndex = fileIndex,
+                expectedSeason = season, expectedEpisode = episode)
         }
         return null
     }
@@ -368,15 +375,42 @@ class DownloadManager @Inject constructor(
     }
 
     private suspend fun downloadTorrent(d: Download, source: StreamSource, minBytes: Long) {
+        // Ownership from start().first() ends as soon as the final status arrives, but persisting a
+        // multi-GB file continues afterward. Pin across the entire attempt so cache pressure cannot
+        // delete the completed sparse file halfway through that copy.
+        cache.pin(source.infoHash)
+        try {
+            downloadPinnedTorrent(d, source, minBytes)
+        } catch (e: Exception) {
+            // Cancellation is normally delete()/shutdown: retain the pin for resumable shutdown, while
+            // delete() explicitly drops it after removing the row. A real failed candidate is unpinned
+            // and evicted only when no sibling download still depends on the same season pack.
+            if (e !is kotlinx.coroutines.CancellationException && !hashUsedByOtherRow(source.infoHash, d.key)) {
+                cache.unpin(source.infoHash)
+                scope.launch {
+                    repeat(20) {
+                        if (!torrentStreamer.isStreaming(source.infoHash)) {
+                            runCatching { cache.evict(source.infoHash) }
+                            return@launch
+                        }
+                        delay(100)
+                    }
+                }
+            }
+            throw e
+        }
+    }
+
+    private suspend fun downloadPinnedTorrent(d: Download, source: StreamSource, minBytes: Long) {
         var lastWrite = 0L
         var lastBytes = -1L
         var lastAdvanceAt = android.os.SystemClock.elapsedRealtime()
+        var completedPath: String? = null
         // first { done } CANCELS the (hot, never-completing) streamer flow the instant the file is fully
         // downloaded — releasing workLock so the next queued item (e.g. the rest of a season) can run.
         // A plain collect{ return@collect } would loop forever and jam the queue. A terminal ERROR
         // throws out to the failover loop, which tries the next source.
-        val finalStatus = try {
-            torrentStreamer.start(source)
+        val finalStatus = torrentStreamer.start(source)
                 .onEach { status ->
                     if (status.state == StreamState.ERROR) {
                         throw java.io.IOException(status.errorMessage ?: "torrent error")
@@ -387,6 +421,11 @@ class DownloadManager @Inject constructor(
                     // 2 MB — abort the moment the size is known instead of saving junk.
                     if (status.totalBytes in 1 until minBytes) {
                         throw java.io.IOException("selected file too small to be real (${status.totalBytes} B < $minBytes B)")
+                    }
+                    if (status.progress >= 0.999f && status.totalBytes > 0) {
+                        // Capture while this flow still owns the hash/file selection. A player may
+                        // select another episode from the pack immediately after first{} cancels us.
+                        completedPath = engine.filePath(source.infoHash)
                     }
                     // STALL GUARD: many fakes resolve metadata then deliver nothing (fabricated seeder
                     // counts, dead swarm). Without an escape, first{} would hang forever, holding
@@ -415,23 +454,12 @@ class DownloadManager @Inject constructor(
                         throw java.io.IOException("downloaded file too small to be real (${fin.totalBytes} B < $minBytes B)")
                     }
                 }
-        } catch (e: Exception) {
-            // Rejected/failed torrent: drop its data so junk never lingers (or gets resumed) in the
-            // cache — but NEVER evict a hash another download ROW still uses. Season-pack episodes share
-            // one torrent, so evicting would delete ALL the pack's files, killing a sibling that's
-            // downloading or already finished from the same torrent. Skip on cancellation (delete()
-            // handles its own cleanup).
-            if (e !is kotlinx.coroutines.CancellationException && !hashUsedByOtherRow(source.infoHash, d.key)) {
-                runCatching { cache.evict(source.infoHash) }
-            }
-            throw e
-        }
         // DURABLE RELOCATION: the torrent's file lives in the app CACHE dir, which the OS can reclaim
         // under storage pressure — so "downloaded for the plane" could silently vanish. Copy it into the
         // persistent downloads dir (same place direct downloads land) and point the row THERE, so offline
         // playback reads a file the system won't delete. A short/failed copy is treated as an attempt
         // failure (failover tries the next source) rather than a bogus COMPLETED.
-        val src = engine.filePath(source.infoHash)?.let { File(it) }
+        val src = completedPath?.let { File(it) }
             ?: throw java.io.IOException("engine reported no file for completed torrent")
         val ext = src.name.substringAfterLast('.', "mkv")
         val dest = File(downloadsDir, "${d.key}.$ext")
@@ -444,12 +472,14 @@ class DownloadManager @Inject constructor(
         // We now own a durable copy, so the cache torrent no longer needs protection — unpin and let the
         // LRU reclaim it normally. Do NOT evict: a season-pack sibling may still be downloading from the
         // same torrent, and evict() deletes ALL the torrent's files.
-        runCatching { cache.unpin(source.infoHash) }
         dao.updateProgress(
             d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1,
             DownloadStatus.COMPLETED.name, finalStatus.totalBytes, finalStatus.totalBytes,
             dest.absolutePath,
         )
+        // The durable row is committed. Keep the cache pinned only if another non-durable/legacy row
+        // still relies on this same hash.
+        if (!hashUsedByOtherRow(source.infoHash, d.key)) runCatching { cache.unpin(source.infoHash) }
     }
 
     private suspend fun downloadDirect(d: Download, source: StreamSource, minBytes: Long) {
@@ -512,10 +542,18 @@ class DownloadManager @Inject constructor(
         }
     }
 
-    /** True when a download row OTHER than [exceptKey] still references [hash] — evicting it would
-     *  delete the shared season-pack torrent's files out from under that sibling. */
+    /** True when another row still needs cache bytes for [hash]. New completed downloads have durable
+     *  copies and do not keep a season pack pinned forever; legacy completed rows whose path still lives
+     *  outside [downloadsDir], plus queued/downloading siblings, remain protected. */
     private suspend fun hashUsedByOtherRow(hash: String, exceptKey: String): Boolean =
-        dao.getAll().any { it.infoHash == hash && it.toDownload().key != exceptKey }
+        dao.getAll().any { row ->
+            if (row.infoHash != hash || row.toDownload().key == exceptKey) return@any false
+            val inProgress = row.status == DownloadStatus.QUEUED.name ||
+                row.status == DownloadStatus.DOWNLOADING.name
+            val legacyCompleted = row.status == DownloadStatus.COMPLETED.name &&
+                row.filePath?.startsWith(downloadsDir.absolutePath) != true
+            inProgress || legacyCompleted
+        }
 
     private suspend fun setStatus(d: Download, status: DownloadStatus) =
         dao.updateProgress(d.mediaId, d.mediaType, d.season ?: -1, d.episode ?: -1, status.name, d.downloadedBytes, d.totalBytes, d.filePath)

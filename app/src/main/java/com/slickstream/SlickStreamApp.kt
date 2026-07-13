@@ -20,6 +20,10 @@ import javax.inject.Inject
 @HiltAndroidApp
 class SlickStreamApp : Application(), ImageLoaderFactory {
 
+    private val appIoScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO,
+    )
+
     @Inject
     lateinit var torrentEngine: TorrentEngine
 
@@ -39,14 +43,14 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
         // bootstrapped — and the persisted .session_state restored — by the time the user presses
         // Play. Otherwise the first stream pays session.start + DHT bootstrap on the critical path.
         // ensureStarted() is idempotent (AtomicBoolean guard), so this is safe to fire-and-forget.
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        appIoScope.launch {
             runCatching { torrentEngine.ensureStarted() }
         }
         // When the whole app goes to background, flush libtorrent's DHT/session state so the next
         // cold start finds peers fast even if the process is later killed.
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStop(owner: LifecycleOwner) {
-                runCatching { torrentEngine.saveSessionState() }
+                appIoScope.launch { runCatching { torrentEngine.saveSessionState() } }
             }
         })
     }
