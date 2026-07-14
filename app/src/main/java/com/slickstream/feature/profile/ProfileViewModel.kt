@@ -36,13 +36,25 @@ class ProfileViewModel @Inject constructor(
     /** The currently active profile (drives the avatar + kids Home rows). */
     val activeProfile: StateFlow<Profile?> = profileRepository.activeProfile
 
-    /** Make [id] the active profile. Library re-queries automatically. */
-    fun select(id: String) {
-        viewModelScope.launch { profileRepository.setActiveProfile(id) }
+    /**
+     * Make [id] the active profile. Library re-queries automatically. [onSelected] runs only after
+     * DataStore has committed the change, so a picker can navigate away without cancelling it.
+     */
+    fun select(id: String, onSelected: () -> Unit = {}) {
+        viewModelScope.launch {
+            profileRepository.setActiveProfile(id)
+            onSelected()
+        }
     }
 
-    /** Create a profile, then immediately switch to it. */
-    fun create(name: String, isKids: Boolean, colorIndex: Int, avatarIndex: Int = 0) {
+    /** Create a profile, switch to it, then notify the picker that it is safe to navigate away. */
+    fun create(
+        name: String,
+        isKids: Boolean,
+        colorIndex: Int,
+        avatarIndex: Int = 0,
+        onCreated: () -> Unit = {},
+    ) {
         viewModelScope.launch {
             val created = profileRepository.createProfile(
                 name = name.trim(),
@@ -51,6 +63,7 @@ class ProfileViewModel @Inject constructor(
                 avatarIndex = avatarIndex,
             )
             profileRepository.setActiveProfile(created.id)
+            onCreated()
         }
     }
 

@@ -100,8 +100,7 @@ fun ProfilePickerScreen(
                         if (managing) {
                             editing = profile
                         } else {
-                            viewModel.select(profile.id)
-                            onProfileChosen()
+                            viewModel.select(profile.id, onSelected = onProfileChosen)
                         }
                     },
                 )
@@ -136,9 +135,16 @@ fun ProfilePickerScreen(
             initialColorIndex = viewModel.nextColorIndex(),
             confirmLabel = "Create",
             onSave = { name, isKids, colorIndex, avatarIndex ->
-                viewModel.create(name, isKids, colorIndex, avatarIndex)
-                showCreate = false
-                onProfileChosen()
+                viewModel.create(
+                    name = name,
+                    isKids = isKids,
+                    colorIndex = colorIndex,
+                    avatarIndex = avatarIndex,
+                    onCreated = {
+                        showCreate = false
+                        onProfileChosen()
+                    },
+                )
             },
             onDismiss = { showCreate = false },
         )

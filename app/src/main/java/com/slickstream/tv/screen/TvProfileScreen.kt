@@ -1,11 +1,8 @@
 package com.slickstream.tv.screen
 
-import android.app.Activity
 import android.content.Context
-import android.content.ContextWrapper
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -15,15 +12,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DeleteSweep
-import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Login
 import androidx.compose.material.icons.rounded.Logout
-import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.runtime.Composable
@@ -39,7 +33,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -51,12 +44,12 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
-import coil.compose.AsyncImage
-import com.slickstream.core.model.DataResult
+import com.slickstream.core.model.Profile
 import com.slickstream.core.model.UserProfile
 import com.slickstream.core.repository.AuthRepository
 import com.slickstream.feature.profile.ProfileViewModel
 import com.slickstream.tv.components.TvConfirmDialog
+import com.slickstream.ui.components.ProfileAvatar
 import com.slickstream.ui.theme.Brand
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
@@ -82,19 +75,10 @@ private fun authRepository(context: Context): AuthRepository =
         TvAuthEntryPoint::class.java,
     ).authRepository()
 
-private fun Context.findActivity(): Activity? {
-    var ctx: Context? = this
-    while (ctx is ContextWrapper) {
-        if (ctx is Activity) return ctx
-        ctx = ctx.baseContext
-    }
-    return null
-}
-
 /**
- * Android TV Profile. Shows the signed-in Google account (or a sign-in prompt) and library
- * actions. Sign-in launches the Credential Manager flow which needs an [Activity]; sign-out and
- * clear-history are confirmed with a styled brand dialog (never a native AlertDialog).
+ * Android TV Profile. Shows the active viewing profile, Google sync status and library actions.
+ * Sign-out and clear-history are confirmed with a styled brand dialog (never a native
+ * AlertDialog).
  */
 @Composable
 fun TvProfileScreen(
@@ -107,6 +91,7 @@ fun TvProfileScreen(
     val context = LocalContext.current
     val authRepository = remember { authRepository(context) }
     val user by authRepository.currentUser.collectAsStateWithLifecycle()
+    val activeProfile by profileViewModel.activeProfile.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
 
     // Re-hydrate any persisted session when the screen first appears.
@@ -116,9 +101,9 @@ fun TvProfileScreen(
     var signInError by remember { mutableStateOf<String?>(null) }
     var showPairing by remember { mutableStateOf(false) }
 
-    // Land focus on the first action (Sign in / Sign out) on entry.
+    // Switching is the primary profile action, so land focus there once when this screen opens.
     val firstFocus = remember { androidx.compose.ui.focus.FocusRequester() }
-    LaunchedEffect(user == null) {
+    LaunchedEffect(Unit) {
         repeat(12) {
             kotlinx.coroutines.delay(40)
             if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
@@ -138,13 +123,14 @@ fun TvProfileScreen(
             color = Brand.OnSurface,
         )
 
-        ProfileHeader(user = user)
+        ProfileHeader(profile = activeProfile, user = user)
 
         Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.width(520.dp)) {
             ProfileAction(
                 icon = Icons.Rounded.SwitchAccount,
                 label = "Switch profile",
                 onClick = onSwitchProfile,
+                focusRequester = firstFocus,
             )
 
             if (user == null) {
@@ -152,14 +138,12 @@ fun TvProfileScreen(
                     icon = Icons.Rounded.Login,
                     label = "Sign in with Google",
                     onClick = { signInError = null; showPairing = true },
-                    focusRequester = firstFocus,
                 )
             } else {
                 ProfileAction(
                     icon = Icons.Rounded.Logout,
                     label = "Sign out",
                     onClick = { dialog = ProfileDialog.SignOut },
-                    focusRequester = firstFocus,
                 )
             }
 
@@ -240,43 +224,38 @@ fun TvProfileScreen(
 private enum class ProfileDialog { SignOut, ClearHistory }
 
 @Composable
-private fun ProfileHeader(user: UserProfile?) {
+private fun ProfileHeader(profile: Profile?, user: UserProfile?) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier
-                .size(96.dp)
-                .clip(CircleShape)
-                .background(Brand.SurfaceVariant),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (user?.photoUrl != null) {
-                AsyncImage(
-                    model = user.photoUrl,
-                    contentDescription = user.displayName,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            } else {
-                Icon(
-                    imageVector = Icons.Rounded.Person,
-                    contentDescription = null,
-                    tint = Brand.OnSurfaceDim,
-                    modifier = Modifier.size(52.dp),
-                )
-            }
-        }
+        ProfileAvatar(
+            name = profile?.name ?: "Guest",
+            colorIndex = profile?.colorIndex ?: 0,
+            isKids = profile?.isKids == true,
+            avatarIndex = profile?.avatarIndex ?: 0,
+            size = 96.dp,
+        )
         Spacer(Modifier.width(24.dp))
-        Column {
+        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
             Text(
-                text = user?.displayName ?: user?.email ?: "Guest",
+                text = profile?.name ?: "Guest",
                 style = MaterialTheme.typography.titleLarge,
                 color = Brand.OnSurface,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = if (user == null) "Not signed in" else (user.email ?: "Signed in with Google"),
+                text = if (profile?.isKids == true) {
+                    "Active viewing profile · Kids"
+                } else {
+                    "Active viewing profile"
+                },
                 style = MaterialTheme.typography.bodyLarge,
+                color = Brand.Violet,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = user?.email?.let { "Syncing with $it" } ?: "Local only · Not signed in",
+                style = MaterialTheme.typography.bodyMedium,
                 color = Brand.OnSurfaceDim,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

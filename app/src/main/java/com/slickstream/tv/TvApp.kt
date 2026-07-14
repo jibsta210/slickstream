@@ -15,8 +15,10 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import androidx.hilt.navigation.compose.hiltViewModel
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
+import com.slickstream.feature.profile.ProfileViewModel
 import com.slickstream.navigation.NavArg
 import com.slickstream.navigation.Routes
 import com.slickstream.tv.components.TvDestination
@@ -51,6 +53,8 @@ fun TvApp() {
         val navController = rememberNavController()
         val backStack by navController.currentBackStackEntryAsState()
         val currentRoute = backStack?.destination?.route
+        val profileViewModel: ProfileViewModel = hiltViewModel()
+        val activeProfile by profileViewModel.activeProfile.collectAsStateWithLifecycle()
 
         // On app launch, land focus on the nav rail (the selected/Home item) so it's obvious you're in
         // the menu — otherwise focus went to the home hero and a RIGHT press scrolled the carousel when
@@ -64,7 +68,8 @@ fun TvApp() {
         }
 
         // No launch picker: the app reopens straight into the last-used profile (ProfileRepository
-        // persists activeProfileId across launches). Switch via Profile → Switch profile.
+        // persists activeProfileId across launches). The rail always shows that active profile and
+        // opens the picker directly, without detouring through the account/settings screen.
 
         // The rail is shown for the four top-level sections; details + player are immersive.
         val showRail = currentRoute == null ||
@@ -109,6 +114,12 @@ fun TvApp() {
                     TvNavRail(
                         selectedRoute = selectedRoute,
                         onSelect = { dest -> navigateTopLevel(navController, dest) },
+                        activeProfile = activeProfile,
+                        onSwitchProfile = {
+                            navController.navigate(Routes.PROFILE_PICKER) {
+                                launchSingleTop = true
+                            }
+                        },
                         selectedItemFocus = railFocus,
                     )
                 }

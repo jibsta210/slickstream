@@ -1,6 +1,5 @@
 package com.slickstream.tv.components
 
-import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -9,7 +8,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -22,12 +20,11 @@ import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SportsBasketball
+import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.focusRequester
@@ -42,6 +39,8 @@ import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Text
+import com.slickstream.core.model.Profile
+import com.slickstream.ui.components.ProfileAvatar
 import com.slickstream.ui.theme.Brand
 
 /** A single destination shown in the left navigation rail. */
@@ -65,6 +64,8 @@ enum class TvDestination(val route: String, val label: String, val icon: ImageVe
 fun TvNavRail(
     selectedRoute: String,
     onSelect: (TvDestination) -> Unit,
+    activeProfile: Profile?,
+    onSwitchProfile: () -> Unit,
     modifier: Modifier = Modifier,
     /** Attached to the SELECTED item so the shell can land initial app-launch focus on the rail (so it's
      *  obvious you're in the menu) rather than on the home content. */
@@ -103,7 +104,98 @@ fun TvNavRail(
             )
         }
 
-        Spacer(Modifier.height(1.dp))
+        // Keep the viewing identity visible on every top-level screen. This is deliberately a
+        // separate action from the Profile destination above: centre/Enter opens the picker in one
+        // step, while Profile remains the home for account, downloads and settings.
+        Spacer(Modifier.weight(1f))
+        ActiveProfileItem(
+            profile = activeProfile,
+            onClick = onSwitchProfile,
+        )
+    }
+}
+
+@Composable
+private fun ActiveProfileItem(
+    profile: Profile?,
+    onClick: () -> Unit,
+) {
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(14.dp)
+
+    Surface(
+        onClick = onClick,
+        interactionSource = interaction,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Brand.SurfaceVariant,
+            focusedContainerColor = Brand.Violet,
+            pressedContainerColor = Brand.VioletDim,
+            contentColor = Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(
+                androidx.compose.foundation.BorderStroke(3.dp, Color.White),
+                shape = shape,
+            ),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        androidx.compose.foundation.layout.Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (profile != null) {
+                ProfileAvatar(
+                    name = profile.name,
+                    colorIndex = profile.colorIndex,
+                    isKids = profile.isKids,
+                    avatarIndex = profile.avatarIndex,
+                    size = 42.dp,
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(42.dp)
+                        .background(Brand.Surface, androidx.compose.foundation.shape.CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Person,
+                        contentDescription = null,
+                        tint = if (focused) Color.White else Brand.OnSurfaceDim,
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = profile?.name ?: "Choose profile",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (focused) Color.White else Brand.OnSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = if (profile?.isKids == true) "Kids · Switch" else "Switch profile",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (focused) Color.White.copy(alpha = 0.82f) else Brand.OnSurfaceDim,
+                    maxLines = 1,
+                )
+            }
+            Icon(
+                imageVector = Icons.Rounded.SwitchAccount,
+                contentDescription = "Switch profile",
+                tint = if (focused) Color.White else Brand.Violet,
+                modifier = Modifier.size(22.dp),
+            )
+        }
     }
 }
 
