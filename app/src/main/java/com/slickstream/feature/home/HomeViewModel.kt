@@ -85,18 +85,12 @@ class HomeViewModel @Inject constructor(
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     /**
-     * Live "Continue Watching" feed from the local library — the user's full watch history, scrollable,
-     * not just the few in-progress items. We collapse to the single most-recent row per title (the
-     * underlying flow is ordered most-recent-first) but no longer drop a title once an episode is
-     * finished: a SHOW you're working through must STAY on the rail pointing at the next episode (it
-     * used to vanish the moment you finished one). A finished MOVIE is genuinely done, so it leaves.
+     * Live "Continue Watching" feed from the local library — every per-episode row is retained until
+     * [resolveContinueWatching] groups it by title. Keeping the rows matters after an auto-advance:
+     * an asynchronous final save for episode 1 can have a timestamp a few milliseconds newer than the
+     * episode-2 start, but episode 2 is still the authoritative continuation point.
      */
-    // Raw history, deduped to the most-recent row per title. ALL the finished/advance logic happens in
-    // [resolveContinueWatching] below — it needs the live Settings thresholds AND the catalog (to know
-    // whether a next episode even exists), so it can't be a pure .map here.
-    private val rawHistory: Flow<List<WatchHistoryItem>> =
-        libraryRepository.observeHistory()
-            .map { rows -> rows.asSequence().distinctBy { it.media.id to it.media.mediaType }.toList() }
+    private val rawHistory: Flow<List<WatchHistoryItem>> = libraryRepository.observeHistory()
 
     /** (episode "up next" threshold, movie "similar bar" threshold) as 0..1 fractions — the SAME
      *  settings that drive the in-player next-episode / similar-titles cards, so the rail advances
@@ -212,8 +206,11 @@ class HomeViewModel @Inject constructor(
         tvThreshold: Float,
         movieThreshold: Float,
     ): List<WatchHistoryItem> = coroutineScope {
-        rows.map { h ->
+        // Room supplies newest rows first; groupBy preserves the first-seen key order, so the final
+        // title list remains most-recent-first while retaining every episode for causal recovery.
+        rows.groupBy { it.media.id to it.media.mediaType }.values.map { titleRows ->
             async {
+                val h = selectContinueWatchingRow(titleRows) ?: return@async null
                 when (h.media.mediaType) {
                     MediaType.MOVIE -> if (h.progress.percent >= movieThreshold) null else h
                     MediaType.TV -> resolveShowRow(h, tvThreshold)
@@ -473,3 +470,35 @@ class HomeViewModel @Inject constructor(
         )
     }
 }
+
+/**
+ * Pick the row that best represents where viewing actually continued.
+ *
+ * Normally this is simply the newest timestamp. Older app versions, however, saved the outgoing
+ * episode asynchronously while starting the next one. A near-complete episode-1 write could land
+ * just after the episode-2 write and incorrectly win. When that exact pattern appears within a short
+ * transition window, prefer the recorded successor; old, intentional rewatches remain unaffected.
+ */
+internal fun selectContinueWatchingRow(rows: List<WatchHistoryItem>): WatchHistoryItem? {
+    val rowOrder = compareBy<WatchHistoryItem> { it.progress.updatedAt }
+        .thenBy { it.progress.season ?: -1 }
+        .thenBy { it.progress.episode ?: -1 }
+    val latest = rows.maxWithOrNull(rowOrder) ?: return null
+    if (latest.media.mediaType != MediaType.TV || !latest.progress.isFinished) return latest
+
+    val currentSeason = latest.progress.season ?: return latest
+    val currentEpisode = latest.progress.episode ?: return latest
+    return rows.asSequence()
+        .filter { candidate ->
+            val season = candidate.progress.season ?: return@filter false
+            val episode = candidate.progress.episode ?: return@filter false
+            val isSuccessor = season > currentSeason || (season == currentSeason && episode > currentEpisode)
+            val age = latest.progress.updatedAt - candidate.progress.updatedAt
+            isSuccessor && age in 0..LEGACY_EPISODE_TRANSITION_WINDOW_MS
+        }
+        .maxWithOrNull(rowOrder)
+        ?: latest
+}
+
+/** Long enough for the old async save race, short enough not to reinterpret a later rewatch. */
+private const val LEGACY_EPISODE_TRANSITION_WINDOW_MS = 5 * 60 * 1_000L

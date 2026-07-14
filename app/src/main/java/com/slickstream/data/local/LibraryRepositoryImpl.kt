@@ -187,7 +187,7 @@ class LibraryRepositoryImpl @Inject constructor(
         item: MediaItem,
         progress: PlaybackProgress,
     ) {
-        watchHistoryDao.upsert(
+        watchHistoryDao.upsertIfNewer(
             WatchHistoryEntity.from(item, progress, addedAt = System.currentTimeMillis(), profileId = profileId),
         )
     }

@@ -1348,9 +1348,14 @@ class PlayerViewModel @Inject constructor(
                         }
                     }
                     Player.STATE_ENDED -> {
-                        saveProgressNow()
-                        // Auto-play the next episode of a TV series when one finishes.
-                        if (mediaType == MediaType.TV && _hasNext.value) nextEpisode()
+                        // End-of-file is stronger than the player's occasionally-imprecise 99.x%
+                        // position. Persist a completed -> started transition before auto-advancing so
+                        // another device can never rank the outgoing episode above the next one.
+                        if (mediaType == MediaType.TV && _hasNext.value) {
+                            autoAdvanceNextEpisode()
+                        } else {
+                            saveProgressNow()
+                        }
                     }
                     else -> Unit
                 }
@@ -1610,8 +1615,11 @@ class PlayerViewModel @Inject constructor(
                     }
                 }
                 Player.STATE_ENDED -> {
-                    saveProgressNow()
-                    if (mediaType == MediaType.TV && _hasNext.value) nextEpisode()
+                    if (mediaType == MediaType.TV && _hasNext.value) {
+                        autoAdvanceNextEpisode()
+                    } else {
+                        saveProgressNow()
+                    }
                 }
                 else -> Unit
             }
@@ -1897,16 +1905,16 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    private fun saveProgressNow() {
+    private fun progressSnapshot(updatedAt: Long = System.currentTimeMillis()): Pair<MediaItem, PlaybackProgress>? {
         // While hopping episodes the (reused) player still holds the OUTGOING episode's position until
         // the new media item is bound — never persist in that window, or it lands under the new key.
-        if (switchingEpisode) return
+        if (switchingEpisode) return null
         // Read from whichever local backend is active — ExoPlayer or the VLC fallback (both Media3
         // [Player]s). Keep using _player while casting so we persist the local position, not the TV's.
-        val p: Player = _player.value ?: vlcPlayer ?: return
-        val d = details ?: return
+        val p: Player = _player.value ?: vlcPlayer ?: return null
+        val d = details ?: return null
         val position = p.currentPosition
-        if (position <= 0L) return
+        if (position <= 0L) return null
         // duration is C.TIME_UNSET (negative) until the container tail (mp4 moov / mkv cues) is
         // parsed — common on low-power TV that starts via the tail-grace path. Don't drop the save:
         // persist a 0 "unknown" duration so the resume point survives; the next ticker save fills in
@@ -1921,13 +1929,67 @@ class PlayerViewModel @Inject constructor(
             episode = currentEpisode,
             positionMs = position,
             durationMs = duration,
-            updatedAt = System.currentTimeMillis(),
+            updatedAt = updatedAt,
             infoHash = activeInfoHash,
         )
+        return item to progress
+    }
+
+    private fun saveProgressNow() {
+        val (item, progress) = progressSnapshot() ?: return
         // Use cleanupScope so it still completes if invoked during teardown.
         cleanupScope.launch {
             runCatching { libraryRepository.saveProgress(item, progress) }
         }
+    }
+
+    /**
+     * Persist an episode hop in causal order. The target gets a zero-position row one millisecond
+     * newer than the outgoing row, making "episode 2 started" authoritative even if playback stops
+     * before the normal 10-second progress ticker. Natural end-of-file also stores an explicit 100%
+     * sentinel because Media3/VLC can report a final position just shy of duration.
+     */
+    private suspend fun persistEpisodeTransition(
+        item: MediaItem,
+        fromSeason: Int?,
+        fromEpisode: Int?,
+        toSeason: Int,
+        toEpisode: Int,
+        outgoingCompleted: Boolean,
+        outgoingSnapshot: PlaybackProgress?,
+        outgoingInfoHash: String?,
+        targetInfoHash: String?,
+    ) {
+        val transitionAt = System.currentTimeMillis()
+        val outgoing = if (outgoingCompleted && fromSeason != null && fromEpisode != null) {
+            PlaybackProgress(
+                mediaId = mediaId,
+                mediaType = mediaType,
+                season = fromSeason,
+                episode = fromEpisode,
+                positionMs = 1L,
+                durationMs = 1L,
+                updatedAt = transitionAt,
+                infoHash = outgoingInfoHash,
+            )
+        } else {
+            outgoingSnapshot?.copy(updatedAt = transitionAt)
+        }
+        if (outgoing != null) {
+            runCatching { libraryRepository.saveProgress(item, outgoing) }
+        }
+
+        val started = PlaybackProgress(
+            mediaId = mediaId,
+            mediaType = mediaType,
+            season = toSeason,
+            episode = toEpisode,
+            positionMs = 0L,
+            durationMs = 0L,
+            updatedAt = transitionAt + 1L,
+            infoHash = targetInfoHash,
+        )
+        runCatching { libraryRepository.saveProgress(item, started) }
     }
 
     private suspend fun stopActiveStream(removeFiles: Boolean) {
@@ -2099,18 +2161,37 @@ class PlayerViewModel @Inject constructor(
      * active stream, re-resolve sources for the target episode and start it — mirroring [load]'s
      * resolve+start path (reset resume seek, reload subtitles, rebuild ExoPlayer via [startSource]).
      */
-    fun playEpisode(season: Int, episode: Int) {
+    fun playEpisode(season: Int, episode: Int) =
+        playEpisode(season, episode, outgoingCompleted = false)
+
+    private fun playEpisode(season: Int, episode: Int, outgoingCompleted: Boolean) {
         if (mediaType != MediaType.TV) return
         val d = details ?: return
         if (season == currentSeason && episode == currentEpisode) return
 
         viewModelScope.launch {
-            // Persist where we are in the OUTGOING episode (coords are still the old ones here).
-            saveProgressNow()
+            val fromSeason = currentSeason
+            val fromEpisode = currentEpisode
+            val outgoingInfoHash = activeInfoHash
+            val targetInfoHash = prefetchedInfoHash
+            // Snapshot BEFORE suppressing saves; persist it synchronously with the target row below.
+            // This replaces the old fire-and-forget save that could land after episode 2 had started.
+            val outgoingSnapshot = if (outgoingCompleted) null else progressSnapshot()?.second
             // Suppress saves + stop the ticker for the duration of the hop so the outgoing position
             // can't be written under the incoming key; cleared once ensurePlayer binds the new media.
             switchingEpisode = true
             progressTickJob?.cancel()
+            persistEpisodeTransition(
+                item = d.item,
+                fromSeason = fromSeason,
+                fromEpisode = fromEpisode,
+                toSeason = season,
+                toEpisode = episode,
+                outgoingCompleted = outgoingCompleted,
+                outgoingSnapshot = outgoingSnapshot,
+                outgoingInfoHash = outgoingInfoHash,
+                targetInfoHash = targetInfoHash,
+            )
             bufferWatchdogJob?.cancel()
             // A pending mid-stream downshift belongs to the OUTGOING episode. Left armed, it can fire
             // during the resolve below and start a smaller source of the OLD episode under the new title.
@@ -2186,6 +2267,20 @@ class PlayerViewModel @Inject constructor(
         viewModelScope.launch {
             val (ns, ne) = nextEpisodeCoords(d, s, e) ?: return@launch
             playEpisode(ns, ne)
+        }
+    }
+
+    /** Natural end-of-file: unlike the manual Next button, the outgoing episode is definitively done. */
+    private fun autoAdvanceNextEpisode() {
+        val d = details ?: return
+        val s = currentSeason ?: return
+        val e = currentEpisode ?: return
+        viewModelScope.launch {
+            val (ns, ne) = nextEpisodeCoords(d, s, e) ?: run {
+                saveProgressNow()
+                return@launch
+            }
+            playEpisode(ns, ne, outgoingCompleted = true)
         }
     }
 

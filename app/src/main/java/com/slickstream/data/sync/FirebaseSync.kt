@@ -5,6 +5,7 @@ import android.util.Log
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import com.slickstream.core.model.MediaItem
@@ -272,13 +273,15 @@ class FirebaseSync @Inject constructor(
 
     // --- History ------------------------------------------------------------
 
-    suspend fun pushHistory(profileId: String, item: MediaItem, progress: PlaybackProgress) {
-        val col = histCol() ?: return
-        runCatching {
+    /** @return true only after Firestore accepts the write, so the coordinator can retry failures. */
+    suspend fun pushHistory(profileId: String, item: MediaItem, progress: PlaybackProgress): Boolean {
+        val col = histCol() ?: return false
+        return runCatching {
             col.document(histKey(profileId, progress))
                 .set(item.toMap() + progress.toMap() + ("profileId" to profileId))
                 .await()
-        }
+            true
+        }.getOrDefault(false)
     }
 
     /** Pulls (profileId, item, progress) triples so each row re-attaches to its origin profile. */
@@ -293,6 +296,24 @@ class FirebaseSync @Inject constructor(
                 Triple(pid, media, progress)
             }
         }.getOrDefault(emptyList())
+    }
+
+    /** Live listener: newer episode progress written by another device, with its origin profile. */
+    fun listenHistory(onItem: (String, MediaItem, PlaybackProgress) -> Unit): ListenerRegistration? {
+        val col = histCol() ?: return null
+        return col.addSnapshotListener { snap, _ ->
+            // Only decode changed documents after the initial snapshot. Iterating snap.documents here
+            // would re-read the user's ENTIRE watch history on every 15-second progress update.
+            snap?.documentChanges?.forEach { change ->
+                if (change.type == DocumentChange.Type.REMOVED) return@forEach
+                val d = change.document
+                val data = d.data ?: return@forEach
+                val pid = data["profileId"] as? String ?: return@forEach
+                val media = data.toMediaItem() ?: return@forEach
+                val progress = data.toPlaybackProgress() ?: return@forEach
+                onItem(pid, media, progress)
+            }
+        }
     }
 
     // --- Settings (account-level, device-agnostic) --------------------------

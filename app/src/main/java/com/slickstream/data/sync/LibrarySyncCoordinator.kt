@@ -12,9 +12,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import com.slickstream.data.local.entity.ProfileEntity
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -30,12 +33,14 @@ import javax.inject.Singleton
  *      missing/newer ones, then push the local union back up
  *   5. ongoing favourite push: a delta against the last known per-profile key set
  *   6. favourite listener: add-if-missing into the item's ORIGIN profile
- *   7. ongoing history push: debounced, keyed by origin profile
+ *   7. ongoing history push: sampled (never starved by the 10-second player ticker), keyed by origin
+ *   8. history listener: last-write-wins progress from other devices into the origin profile
  *
- * Loop-free: listeners only add-if-missing, and pushes only diff against the last known set, so
- * steady state performs no writes. Removals do NOT propagate across devices (union semantics) — see
- * README — so the favourite push never sends deletes.
+ * Loop-free: incoming history timestamps are pre-marked before the Room write, so the local observer
+ * does not echo them; local history pushes only rows newer than their last synced timestamp. Removals
+ * do NOT propagate across devices (union semantics) — see README.
  */
+@OptIn(kotlinx.coroutines.FlowPreview::class)
 @Singleton
 class LibrarySyncCoordinator @Inject constructor(
     private val library: LibraryRepository,
@@ -47,12 +52,16 @@ class LibrarySyncCoordinator @Inject constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val jobs = mutableListOf<Job>()
     private var favListener: ListenerRegistration? = null
+    private var historyListener: ListenerRegistration? = null
     private var profileListener: ListenerRegistration? = null
     private var settingsListener: ListenerRegistration? = null
     private var lastFavKeys: Set<String> = emptySet()
     /** Per-profile last-pushed updatedAt, so the push observer fires on EDITS (rename/avatar), not just
      *  new ids — and skips echoing a profile we just pulled (same updatedAt). */
     private var lastProfileSigs: Map<String, Long> = emptyMap()
+    /** Per profile/title/episode last-synced progress timestamp; concurrent because Firestore may
+     *  deliver multiple document changes in parallel with the Room push collector. */
+    private val lastHistorySigs = ConcurrentHashMap<String, Long>()
     private var lastSettingsSig: String? = null
     @Volatile private var running = false
 
@@ -76,6 +85,25 @@ class LibrarySyncCoordinator @Inject constructor(
                 scope.launch {
                     if (!library.isFavoriteInProfile(pid, item.id, item.mediaType)) {
                         library.addFavoriteForProfile(pid, item)
+                    }
+                }
+            }
+            historyListener = sync.listenHistory { pid, item, remote ->
+                scope.launch {
+                    if (!running) return@launch
+                    val local = library.getProgressForProfile(
+                        pid,
+                        remote.mediaId,
+                        remote.mediaType,
+                        remote.season,
+                        remote.episode,
+                    )
+                    if (local == null || remote.updatedAt > local.updatedAt) {
+                        // Mark before writing Room so startHistoryPush treats the resulting emission as
+                        // an incoming echo, not a fresh local edit that needs uploading again.
+                        lastHistorySigs.merge(historyKey(pid, remote), remote.updatedAt, ::maxOf)
+                        if (!running) return@launch
+                        library.saveProgressForProfile(pid, item, remote)
                     }
                 }
             }
@@ -209,7 +237,8 @@ class LibrarySyncCoordinator @Inject constructor(
             }
         }
         // History: take the newer (per origin profile).
-        sync.pullHistory().forEach { (pid, item, remote) ->
+        val remoteHistory = sync.pullHistory()
+        remoteHistory.forEach { (pid, item, remote) ->
             val local = library.getProgressForProfile(pid, remote.mediaId, remote.mediaType, remote.season, remote.episode)
             if (local == null || remote.updatedAt > local.updatedAt) {
                 library.saveProgressForProfile(pid, item, remote)
@@ -219,7 +248,25 @@ class LibrarySyncCoordinator @Inject constructor(
         val favs = library.allFavoritesForSync()
         favs.forEach { (pid, fav) -> sync.pushFavorite(pid, fav.media) }
         lastFavKeys = favs.map { (pid, fav) -> favKey(pid, fav.media.id, fav.media.mediaType) }.toSet()
-        library.allHistoryForSync().forEach { (pid, item, progress) -> sync.pushHistory(pid, item, progress) }
+
+        // History documents are immutable per episode key except for their progress timestamp. The
+        // old code rewrote EVERY episode on EVERY launch, delaying the live listener and burning I/O
+        // as libraries grew. Start with what the pull proved is already remote, then upload only rows
+        // whose local timestamp is newer (or whose cloud document is missing).
+        val syncedHistory = remoteHistory.associate { (pid, _, progress) ->
+            historyKey(pid, progress) to progress.updatedAt
+        }.toMutableMap()
+        val history = library.allHistoryForSync()
+        history.forEach { (pid, item, progress) ->
+            val key = historyKey(pid, progress)
+            if (progress.updatedAt > (syncedHistory[key] ?: Long.MIN_VALUE) &&
+                sync.pushHistory(pid, item, progress)
+            ) {
+                syncedHistory[key] = progress.updatedAt
+            }
+        }
+        lastHistorySigs.clear()
+        lastHistorySigs.putAll(syncedHistory)
     }
 
     private fun startFavoritePush() {
@@ -237,9 +284,21 @@ class LibrarySyncCoordinator @Inject constructor(
 
     private fun startHistoryPush() {
         jobs += scope.launch {
-            // Progress saves tick frequently; debounce so we don't hammer Firestore.
-            library.observeAllHistoryForSync().debounce(HISTORY_DEBOUNCE_MS).collectLatest { history ->
-                history.forEach { (pid, item, progress) -> sync.pushHistory(pid, item, progress) }
+            // Player progress arrives every 10 seconds. The old 15-second debounce was therefore
+            // perpetually reset during playback and often uploaded ONLY episode 1 during the pause
+            // before episode 2 — exactly the stale cross-device Continue Watching bug. Sampling emits
+            // the newest snapshot on a fixed cadence, and the timestamp map sends only changed rows.
+            // Do not use collectLatest here: canceling an in-flight Firestore write when the next
+            // sample arrives can starve slow/offline uploads just like the old debounce did.
+            library.observeAllHistoryForSync().sample(HISTORY_SYNC_INTERVAL_MS).collect { history ->
+                history.forEach { (pid, item, progress) ->
+                    val key = historyKey(pid, progress)
+                    if (progress.updatedAt > (lastHistorySigs[key] ?: Long.MIN_VALUE)) {
+                        if (sync.pushHistory(pid, item, progress)) {
+                            lastHistorySigs.merge(key, progress.updatedAt, ::maxOf)
+                        }
+                    }
+                }
             }
         }
     }
@@ -248,6 +307,8 @@ class LibrarySyncCoordinator @Inject constructor(
         running = false
         favListener?.remove()
         favListener = null
+        historyListener?.remove()
+        historyListener = null
         profileListener?.remove()
         profileListener = null
         settingsListener?.remove()
@@ -256,15 +317,19 @@ class LibrarySyncCoordinator @Inject constructor(
         jobs.clear()
         lastFavKeys = emptySet()
         lastProfileSigs = emptyMap()
+        lastHistorySigs.clear()
         lastSettingsSig = null
     }
 
     private fun favKey(profileId: String, id: Int, type: com.slickstream.core.model.MediaType) =
         "${profileId}__${type.name}_$id"
 
+    private fun historyKey(profileId: String, progress: com.slickstream.core.model.PlaybackProgress) =
+        "${profileId}__${progress.mediaType.name}_${progress.mediaId}_${progress.season ?: -1}_${progress.episode ?: -1}"
+
     private companion object {
         const val TAG = "LibrarySync"
-        const val HISTORY_DEBOUNCE_MS = 15_000L
+        const val HISTORY_SYNC_INTERVAL_MS = 15_000L
         const val SETTINGS_DEBOUNCE_MS = 2_000L
     }
 }

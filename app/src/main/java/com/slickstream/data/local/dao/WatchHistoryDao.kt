@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import com.slickstream.core.model.MediaType
 import com.slickstream.data.local.entity.WatchHistoryEntity
 import kotlinx.coroutines.flow.Flow
@@ -48,6 +49,20 @@ interface WatchHistoryDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(entity: WatchHistoryEntity)
+
+    /** Atomic last-write-wins merge for cloud updates. The coordinator's pre-read avoids most no-op
+     *  calls, while this transaction closes the race between two devices/listener callbacks. */
+    @Transaction
+    suspend fun upsertIfNewer(entity: WatchHistoryEntity) {
+        val current = getByEpisode(
+            entity.id,
+            entity.mediaType,
+            entity.seasonKey,
+            entity.episodeKey,
+            entity.profileId,
+        )
+        if (current == null || entity.updatedAt > current.updatedAt) upsert(entity)
+    }
 
     /** Delete a single episode row (or the lone movie row when seasonKey/episodeKey == -1). */
     @Query(
