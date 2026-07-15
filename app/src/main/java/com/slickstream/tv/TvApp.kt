@@ -68,8 +68,8 @@ fun TvApp() {
         }
 
         // No launch picker: the app reopens straight into the last-used profile (ProfileRepository
-        // persists activeProfileId across launches). The rail always shows that active profile and
-        // opens the picker directly, without detouring through the account/settings screen.
+        // persists activeProfileId across launches). One active-profile rail item opens the unified
+        // quick switcher + settings hub; there is no duplicate generic Profile destination.
 
         // The rail is shown for the four top-level sections; details + player are immersive.
         val showRail = currentRoute == null ||
@@ -115,11 +115,6 @@ fun TvApp() {
                         selectedRoute = selectedRoute,
                         onSelect = { dest -> navigateTopLevel(navController, dest) },
                         activeProfile = activeProfile,
-                        onSwitchProfile = {
-                            navController.navigate(Routes.PROFILE_PICKER) {
-                                launchSingleTop = true
-                            }
-                        },
                         selectedItemFocus = railFocus,
                     )
                 }
@@ -214,7 +209,7 @@ fun TvApp() {
                         composable(Routes.PROFILE) {
                             TvProfileScreen(
                                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
-                                onSwitchProfile = { navController.navigate(Routes.PROFILE_PICKER) },
+                                onManageProfiles = { navController.navigate(Routes.PROFILE_PICKER) },
                                 onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) },
                             )
                         }

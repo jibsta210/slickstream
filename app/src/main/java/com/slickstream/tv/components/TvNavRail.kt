@@ -20,7 +20,6 @@ import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SportsBasketball
-import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -65,7 +64,6 @@ fun TvNavRail(
     selectedRoute: String,
     onSelect: (TvDestination) -> Unit,
     activeProfile: Profile?,
-    onSwitchProfile: () -> Unit,
     modifier: Modifier = Modifier,
     /** Attached to the SELECTED item so the shell can land initial app-launch focus on the rail (so it's
      *  obvious you're in the menu) rather than on the home content. */
@@ -95,7 +93,7 @@ fun TvNavRail(
             modifier = Modifier.padding(start = 12.dp, bottom = 16.dp),
         )
 
-        TvDestination.entries.forEach { dest ->
+        TvDestination.entries.filterNot { it == TvDestination.PROFILE }.forEach { dest ->
             TvNavItem(
                 destination = dest,
                 selected = dest.route == selectedRoute,
@@ -104,21 +102,25 @@ fun TvNavRail(
             )
         }
 
-        // Keep the viewing identity visible on every top-level screen. This is deliberately a
-        // separate action from the Profile destination above: centre/Enter opens the picker in one
-        // step, while Profile remains the home for account, downloads and settings.
+        // One identity destination, not a generic "Profile" row plus a cramped switcher underneath.
+        // The active name/avatar replaces the generic label and opens the unified profile + settings
+        // hub, where another profile can be selected directly.
         Spacer(Modifier.weight(1f))
-        ActiveProfileItem(
+        ProfileNavItem(
             profile = activeProfile,
-            onClick = onSwitchProfile,
+            selected = selectedRoute == TvDestination.PROFILE.route,
+            onClick = { onSelect(TvDestination.PROFILE) },
+            focusRequester = if (selectedRoute == TvDestination.PROFILE.route) selectedItemFocus else null,
         )
     }
 }
 
 @Composable
-private fun ActiveProfileItem(
+private fun ProfileNavItem(
     profile: Profile?,
+    selected: Boolean,
     onClick: () -> Unit,
+    focusRequester: androidx.compose.ui.focus.FocusRequester? = null,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -129,7 +131,7 @@ private fun ActiveProfileItem(
         interactionSource = interaction,
         shape = ClickableSurfaceDefaults.shape(shape = shape),
         colors = ClickableSurfaceDefaults.colors(
-            containerColor = Brand.SurfaceVariant,
+            containerColor = if (selected) Brand.SurfaceVariant else Color.Transparent,
             focusedContainerColor = Brand.Violet,
             pressedContainerColor = Brand.VioletDim,
             contentColor = Brand.OnSurface,
@@ -141,13 +143,15 @@ private fun ActiveProfileItem(
                 shape = shape,
             ),
         ),
-        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
-        modifier = Modifier.fillMaxWidth(),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier),
     ) {
         androidx.compose.foundation.layout.Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 10.dp),
+                .padding(horizontal = 12.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (profile != null) {
@@ -156,12 +160,12 @@ private fun ActiveProfileItem(
                     colorIndex = profile.colorIndex,
                     isKids = profile.isKids,
                     avatarIndex = profile.avatarIndex,
-                    size = 42.dp,
+                    size = 26.dp,
                 )
             } else {
                 Box(
                     modifier = Modifier
-                        .size(42.dp)
+                        .size(26.dp)
                         .background(Brand.Surface, androidx.compose.foundation.shape.CircleShape),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -169,31 +173,17 @@ private fun ActiveProfileItem(
                         imageVector = Icons.Rounded.Person,
                         contentDescription = null,
                         tint = if (focused) Color.White else Brand.OnSurfaceDim,
-                        modifier = Modifier.size(24.dp),
+                        modifier = Modifier.size(20.dp),
                     )
                 }
             }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    text = profile?.name ?: "Choose profile",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (focused) Color.White else Brand.OnSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = if (profile?.isKids == true) "Kids · Switch" else "Switch profile",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (focused) Color.White.copy(alpha = 0.82f) else Brand.OnSurfaceDim,
-                    maxLines = 1,
-                )
-            }
-            Icon(
-                imageVector = Icons.Rounded.SwitchAccount,
-                contentDescription = "Switch profile",
-                tint = if (focused) Color.White else Brand.Violet,
-                modifier = Modifier.size(22.dp),
+            Spacer(Modifier.width(16.dp))
+            Text(
+                text = profile?.name ?: "Profile",
+                style = MaterialTheme.typography.labelLarge,
+                color = if (focused) Color.White else if (selected) Brand.Violet else Brand.OnSurfaceDim,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }

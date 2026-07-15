@@ -2,6 +2,7 @@ package com.slickstream.tv.screen
 
 import android.content.Context
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,12 +13,15 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Login
+import androidx.compose.material.icons.automirrored.rounded.Logout
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Download
-import androidx.compose.material.icons.rounded.Login
-import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SwitchAccount
 import androidx.compose.runtime.Composable
@@ -45,7 +49,6 @@ import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.slickstream.core.model.Profile
-import com.slickstream.core.model.UserProfile
 import com.slickstream.core.repository.AuthRepository
 import com.slickstream.feature.profile.ProfileViewModel
 import com.slickstream.tv.components.TvConfirmDialog
@@ -76,21 +79,22 @@ private fun authRepository(context: Context): AuthRepository =
     ).authRepository()
 
 /**
- * Android TV Profile. Shows the active viewing profile, Google sync status and library actions.
- * Sign-out and clear-history are confirmed with a styled brand dialog (never a native
- * AlertDialog).
+ * Unified Android TV profile hub: the current identity, one-click switching, account state and app
+ * settings all live on this screen. Sign-out and clear-history are confirmed with a styled brand
+ * dialog (never a native AlertDialog).
  */
 @Composable
 fun TvProfileScreen(
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
-    onSwitchProfile: () -> Unit = {},
+    onManageProfiles: () -> Unit = {},
     onOpenDownloads: () -> Unit = {},
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
     val authRepository = remember { authRepository(context) }
     val user by authRepository.currentUser.collectAsStateWithLifecycle()
+    val profiles by profileViewModel.profiles.collectAsStateWithLifecycle()
     val activeProfile by profileViewModel.activeProfile.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
 
@@ -101,12 +105,19 @@ fun TvProfileScreen(
     var signInError by remember { mutableStateOf<String?>(null) }
     var showPairing by remember { mutableStateOf(false) }
 
-    // Switching is the primary profile action, so land focus there once when this screen opens.
+    // Switching is the primary profile action, so land on the active identity once. A later switch
+    // updates the active marker without yanking D-pad focus back to that tile.
     val firstFocus = remember { androidx.compose.ui.focus.FocusRequester() }
-    LaunchedEffect(Unit) {
-        repeat(12) {
+    var initialFocusRequested by remember { mutableStateOf(false) }
+    val initialFocusId = activeProfile?.id ?: profiles.firstOrNull()?.id
+    LaunchedEffect(initialFocusId) {
+        if (initialFocusId == null || initialFocusRequested) return@LaunchedEffect
+        repeat(20) {
             kotlinx.coroutines.delay(40)
-            if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            if (runCatching { firstFocus.requestFocus() }.isSuccess) {
+                initialFocusRequested = true
+                return@LaunchedEffect
+            }
         }
     }
 
@@ -115,37 +126,62 @@ fun TvProfileScreen(
             .fillMaxSize()
             .background(Brand.Background)
             .padding(start = 56.dp, end = 56.dp, top = 36.dp),
-        verticalArrangement = Arrangement.spacedBy(28.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        Text(
-            text = "Profile",
-            style = MaterialTheme.typography.headlineMedium,
-            color = Brand.OnSurface,
-        )
-
-        ProfileHeader(profile = activeProfile, user = user)
-
-        Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.width(520.dp)) {
-            ProfileAction(
-                icon = Icons.Rounded.SwitchAccount,
-                label = "Switch profile",
-                onClick = onSwitchProfile,
-                focusRequester = firstFocus,
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                text = activeProfile?.name ?: "Profile",
+                style = MaterialTheme.typography.headlineMedium,
+                color = Brand.OnSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
+            Text(
+                text = buildString {
+                    append("Profiles & settings")
+                    if (activeProfile?.isKids == true) append(" · Kids")
+                    append(user?.email?.let { " · Syncing with $it" } ?: " · Local only")
+                },
+                style = MaterialTheme.typography.bodyLarge,
+                color = Brand.OnSurfaceDim,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
 
-            if (user == null) {
-                ProfileAction(
-                    icon = Icons.Rounded.Login,
-                    label = "Sign in with Google",
-                    onClick = { signInError = null; showPairing = true },
-                )
-            } else {
-                ProfileAction(
-                    icon = Icons.Rounded.Logout,
-                    label = "Sign out",
-                    onClick = { dialog = ProfileDialog.SignOut },
-                )
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                text = "Switch profile",
+                style = MaterialTheme.typography.titleMedium,
+                color = Brand.OnSurface,
+            )
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                items(profiles, key = { it.id }) { profile ->
+                    QuickProfileItem(
+                        profile = profile,
+                        active = profile.id == activeProfile?.id,
+                        onClick = {
+                            if (profile.id != activeProfile?.id) profileViewModel.select(profile.id)
+                        },
+                        modifier = if (profile.id == initialFocusId) {
+                            Modifier.focusRequester(firstFocus)
+                        } else {
+                            Modifier
+                        },
+                    )
+                }
+                item {
+                    ManageProfilesItem(onClick = onManageProfiles)
+                }
             }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.width(520.dp)) {
+            ProfileAction(
+                icon = Icons.Rounded.Settings,
+                label = "Settings",
+                onClick = onOpenSettings,
+            )
 
             ProfileAction(
                 icon = Icons.Rounded.Download,
@@ -153,11 +189,19 @@ fun TvProfileScreen(
                 onClick = onOpenDownloads,
             )
 
-            ProfileAction(
-                icon = Icons.Rounded.Settings,
-                label = "Settings",
-                onClick = onOpenSettings,
-            )
+            if (user == null) {
+                ProfileAction(
+                    icon = Icons.AutoMirrored.Rounded.Login,
+                    label = "Sign in with Google",
+                    onClick = { signInError = null; showPairing = true },
+                )
+            } else {
+                ProfileAction(
+                    icon = Icons.AutoMirrored.Rounded.Logout,
+                    label = "Sign out",
+                    onClick = { dialog = ProfileDialog.SignOut },
+                )
+            }
 
             ProfileAction(
                 icon = Icons.Rounded.DeleteSweep,
@@ -224,42 +268,112 @@ fun TvProfileScreen(
 private enum class ProfileDialog { SignOut, ClearHistory }
 
 @Composable
-private fun ProfileHeader(profile: Profile?, user: UserProfile?) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        ProfileAvatar(
-            name = profile?.name ?: "Guest",
-            colorIndex = profile?.colorIndex ?: 0,
-            isKids = profile?.isKids == true,
-            avatarIndex = profile?.avatarIndex ?: 0,
-            size = 96.dp,
-        )
-        Spacer(Modifier.width(24.dp))
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text(
-                text = profile?.name ?: "Guest",
-                style = MaterialTheme.typography.titleLarge,
-                color = Brand.OnSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+private fun QuickProfileItem(
+    profile: Profile,
+    active: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(14.dp)
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    Surface(
+        onClick = onClick,
+        interactionSource = interaction,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = if (active) Brand.SurfaceVariant else Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(
+                androidx.compose.foundation.BorderStroke(3.dp, Color.White),
+                shape = shape,
+            ),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+        modifier = modifier.width(210.dp).height(76.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ProfileAvatar(
+                name = profile.name,
+                colorIndex = profile.colorIndex,
+                isKids = profile.isKids,
+                avatarIndex = profile.avatarIndex,
+                size = 48.dp,
             )
-            Text(
-                text = if (profile?.isKids == true) {
-                    "Active viewing profile · Kids"
-                } else {
-                    "Active viewing profile"
-                },
-                style = MaterialTheme.typography.bodyLarge,
-                color = Brand.Violet,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text = user?.email?.let { "Syncing with $it" } ?: "Local only · Not signed in",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Brand.OnSurfaceDim,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = profile.name,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = when {
+                        active && profile.isKids -> "Active · Kids"
+                        active -> "Active"
+                        profile.isKids -> "Kids"
+                        else -> "Switch"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = when {
+                        focused -> Color.White.copy(alpha = 0.82f)
+                        active -> Brand.Cyan
+                        else -> Brand.OnSurfaceDim
+                    },
+                    maxLines = 1,
+                )
+            }
+            if (active) {
+                Icon(
+                    imageVector = Icons.Rounded.CheckCircle,
+                    contentDescription = "Active profile",
+                    tint = if (focused) Color.White else Brand.Cyan,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ManageProfilesItem(onClick: () -> Unit) {
+    val shape = RoundedCornerShape(14.dp)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(
+                androidx.compose.foundation.BorderStroke(3.dp, Color.White),
+                shape = shape,
+            ),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+        modifier = Modifier.width(190.dp).height(76.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Rounded.SwitchAccount, contentDescription = null, modifier = Modifier.size(28.dp))
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("All profiles", style = MaterialTheme.typography.titleSmall)
+                Text("Add or manage", style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
 }
