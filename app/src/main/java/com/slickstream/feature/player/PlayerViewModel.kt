@@ -156,6 +156,9 @@ class PlayerViewModel @Inject constructor(
         savedStateHandle.get<Int>(NavArg.SEASON)?.takeIf { it >= 0 }
     private val navEpisode: Int? =
         savedStateHandle.get<Int>(NavArg.EPISODE)?.takeIf { it >= 0 }
+    /** Explicit movie action from details. This is intentionally a nav argument (not inferred from
+     *  progress) so Resume and Start from beginning remain distinct across process recreation. */
+    private val startOverRequested: Boolean = savedStateHandle.get<Boolean>(NavArg.START_OVER) == true
 
     // The currently-playing episode. Mutable so in-player navigation (next/previous/auto-advance)
     // can switch episodes without recreating the screen. Movies leave these null and behave exactly
@@ -269,6 +272,10 @@ class PlayerViewModel @Inject constructor(
     private var progressTickJob: Job? = null
     private var activeInfoHash: String? = null
     private var hasSeekedToResume = false
+    /** Non-null for a Start-from-beginning player session. It begins at zero and tracks the live
+     *  position across source failovers, so the OLD persisted resume point can never leak back in while
+     *  a failover after real playback still resumes this NEW session at the correct position. */
+    private var startOverSessionPositionMs: Long? = if (startOverRequested) 0L else null
     /** True while hopping episodes: suppresses progress saves so the OUTGOING episode's position can't
      *  be written under the INCOMING episode's key (the "next episode opens on the end credits" bug).
      *  Cleared once the new media item is bound to the (reused) player. */
@@ -508,9 +515,15 @@ class PlayerViewModel @Inject constructor(
             failoverCount = 0
             directFailoverCount = 0
 
-            // Resume the SAME torrent if we have one cached for this episode; else auto-pick the best
-            // source within the user's per-network quality cap.
-            val best = pickResumeOrPreferred(list, currentSeason, currentEpisode)
+            // Start-over deliberately ignores the old release as well as its old timestamp. Resume may
+            // reuse an exact release only when it is actually cached on THIS device and still satisfies
+            // this TV's quality/decoder gates.
+            val best = if (startOverRequested) {
+                diagnostics.breadcrumb("player startOver=true")
+                pickPreferred(list, networkQualityPreference())
+            } else {
+                pickResumeOrPreferred(list, currentSeason, currentEpisode)
+            }
             startSource(best)
         }
     }
@@ -616,17 +629,47 @@ class PlayerViewModel @Inject constructor(
     }
 
     /**
-     * Resume-aware pick: if we already started this exact episode before, reuse the SAME torrent
-     * (its infoHash was saved with the progress and its partial download is still in the on-disk cache)
-     * instead of re-ranking from scratch — otherwise a shift in seeder counts between sessions picks a
-     * DIFFERENT release and restarts the download from 0% (the "I was at 40%, came back, it started
-     * over" bug). Falls back to the normal auto-pick when there's no saved progress, or the saved
-     * release is no longer in the indexer's results.
+     * Resume-aware pick: reuse the exact saved torrent only when its partial bytes exist on THIS device
+     * and the release still satisfies this device's current quality/decoder gates. The info-hash is part
+     * of cloud-synced watch history, so blindly reusing it made a weaker TV inherit a phone/strong-TV 4K
+     * or otherwise unsuitable release despite the TV's 1080p cap — a device/title-specific crash path.
+     * With no useful local partial, freshly rank the best source; the saved TIMESTAMP still resumes.
      */
     private suspend fun pickResumeOrPreferred(list: List<StreamSource>, season: Int?, episode: Int?): StreamSource {
+        val preference = networkQualityPreference()
+        val preferred = pickPreferred(list, preference)
         val savedHash = libraryRepository.getProgress(mediaId, mediaType, season, episode)?.infoHash
-        val resume = savedHash?.let { h -> list.firstOrNull { it.infoHash == h } }
-        return resume ?: pickPreferred(list, networkQualityPreference())
+        val resume = savedHash?.let { h -> list.firstOrNull { it.infoHash.equals(h, ignoreCase = true) } }
+            ?: return preferred
+        if (resume.infoHash.equals(preferred.infoHash, ignoreCase = true)) return preferred
+
+        // Direct links have no reusable local bytes and commonly expire; reranking a fresh direct is
+        // both faster and safer. For torrents, a cloud-synced hash from another device is not a cache.
+        val locallyCached = !resume.isDirect && withContext(Dispatchers.IO) {
+            torrentStreamer.cachedTorrents().any { it.equals(resume.infoHash, ignoreCase = true) }
+        }
+        val compatible = locallyCached && StreamPicker.isResumeCompatible(
+            source = resume,
+            candidates = list,
+            maxTier = minOf(preference.maxTier, deviceProfile.maxDisplayTier),
+            lowPower = deviceProfile.isLowPower,
+        )
+        if (compatible) {
+            diagnostics.breadcrumb("resumeSource reused=${resume.diagTag()}")
+            return resume
+        }
+
+        diagnostics.event(
+            "player_resume_source_reselected",
+            mapOf(
+                "saved" to resume.diagTag(),
+                "picked" to preferred.diagTag(),
+                "reason" to if (locallyCached) "device_incompatible" else "no_local_cache",
+                "lowPower" to deviceProfile.isLowPower.toString(),
+                "displayTier" to deviceProfile.maxDisplayTier.toString(),
+            ),
+        )
+        return preferred
     }
 
     private fun isOnUnmeteredNetwork(): Boolean {
@@ -643,6 +686,13 @@ class PlayerViewModel @Inject constructor(
         _currentSource.value = source
         hasSeekedToResume = false
         activeInfoHash = source.infoHash
+        // Attached to any subsequent Crashlytics report without exposing a title/hash/token. If a
+        // native/device decoder still terminates one model, the last attempted quality + device tier
+        // makes the next report actionable instead of an opaque title-specific crash.
+        diagnostics.breadcrumb(
+            "sourceStart src=${source.diagTag()} lowPower=${deviceProfile.isLowPower} " +
+                "displayTier=${deviceProfile.maxDisplayTier} startOver=${startOverSessionPositionMs != null}",
+        )
         // Drop any previous source's preview frames; the new one re-samples once it's playing.
         thumbnails.clear()
         // Record this attempt so failover never loops back to a source we've already tried, and clear
@@ -1872,6 +1922,13 @@ class PlayerViewModel @Inject constructor(
     private fun maybeSeekToResume(player: Player) {
         if (hasSeekedToResume) return
         hasSeekedToResume = true
+        // A Start-over session owns its own position. Initially this is 0; saveProgressNow updates it
+        // before any source switch, so later failovers resume the new session without ever consulting
+        // the stale pre-Start-over database position.
+        startOverSessionPositionMs?.let { sessionPosition ->
+            if (sessionPosition > 0L) player.seekTo(sessionPosition) else player.seekTo(0L)
+            return
+        }
         viewModelScope.launch {
             val saved = libraryRepository.getProgress(mediaId, mediaType, currentSeason, currentEpisode)
             if (saved != null && !saved.isFinished && saved.positionMs > 0) {
@@ -1937,6 +1994,9 @@ class PlayerViewModel @Inject constructor(
 
     private fun saveProgressNow() {
         val (item, progress) = progressSnapshot() ?: return
+        if (startOverSessionPositionMs != null) {
+            startOverSessionPositionMs = progress.positionMs
+        }
         // Use cleanupScope so it still completes if invoked during teardown.
         cleanupScope.launch {
             runCatching { libraryRepository.saveProgress(item, progress) }

@@ -24,10 +24,16 @@ object Routes {
     const val DETAILS = "details/{mediaType}/{mediaId}"
     fun details(type: MediaType, id: Int) = "details/${type.name}/$id"
 
-    // player/{mediaType}/{mediaId}?season={season}&episode={episode}
-    const val PLAYER = "player/{mediaType}/{mediaId}?season={season}&episode={episode}"
-    fun player(type: MediaType, id: Int, season: Int? = null, episode: Int? = null) =
-        "player/${type.name}/$id?season=${season ?: -1}&episode=${episode ?: -1}"
+    // player/{mediaType}/{mediaId}?season={season}&episode={episode}&startOver={startOver}
+    const val PLAYER =
+        "player/{mediaType}/{mediaId}?season={season}&episode={episode}&startOver={startOver}"
+    fun player(
+        type: MediaType,
+        id: Int,
+        season: Int? = null,
+        episode: Int? = null,
+        startOver: Boolean = false,
+    ) = "player/${type.name}/$id?season=${season ?: -1}&episode=${episode ?: -1}&startOver=$startOver"
 
     // category/{mediaType}/{genreId}/{genreName} — full grid for one genre ("Kids", "Action", …)
     const val CATEGORY = "category/{mediaType}/{genreId}/{genreName}"
@@ -45,6 +51,7 @@ object NavArg {
     const val MEDIA_ID = "mediaId"
     const val SEASON = "season"
     const val EPISODE = "episode"
+    const val START_OVER = "startOver"
     const val QUERY = "query"
     const val GENRE_ID = "genreId"
     const val GENRE_NAME = "genreName"

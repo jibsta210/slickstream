@@ -117,6 +117,34 @@ object StreamPicker {
             .maxByOrNull { it.rank }
     }
 
+    /**
+     * Whether an exact saved torrent release is still a safe resume choice on THIS device. Watch
+     * progress (including its info-hash) syncs between devices, but display/decoder limits do not: a
+     * 4K release picked on a phone or stronger TV must not bypass the weaker TV's 1080p cap merely
+     * because it was saved in history. Apply the same staged gates as [pick], but strictly — the caller
+     * already has a freshly ranked fallback and should use it when this old release is unsuitable.
+     */
+    fun isResumeCompatible(
+        source: StreamSource,
+        candidates: List<StreamSource>,
+        maxTier: Int,
+        lowPower: Boolean,
+    ): Boolean {
+        val effectiveTier = if (lowPower) minOf(maxTier, QualityPreference.FHD_1080.maxTier) else maxTier
+        if (QualityPreference.tierOf(source.quality) > effectiveTier) return false
+
+        val capped = candidates.filter { QualityPreference.tierOf(it.quality) <= effectiveTier }
+        if (capped.any { it.playable } && !source.playable) return false
+
+        val decodable = capped.filter { it.playable }.ifEmpty { capped }
+        if (decodable.any { it.englishLikely } && !source.englishLikely) return false
+
+        val english = decodable.filter { it.englishLikely }.ifEmpty { decodable }
+        if (english.any { !it.isCam } && source.isCam) return false
+
+        return true
+    }
+
     // Any non-Latin script in a torrent name is a hard non-English signal: Cyrillic, Greek, Hebrew,
     // Arabic, Devanagari (Hindi), Thai, Hangul (Korean), Hiragana/Katakana + CJK (Chinese/Japanese).
     private val NON_LATIN = Regex(

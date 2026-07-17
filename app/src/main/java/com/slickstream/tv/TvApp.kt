@@ -96,8 +96,14 @@ fun TvApp() {
             navController.navigate(Routes.details(item.mediaType, item.id))
         }
 
-        fun openPlayer(type: MediaType, id: Int, season: Int? = null, episode: Int? = null) {
-            navController.navigate(Routes.player(type, id, season, episode))
+        fun openPlayer(
+            type: MediaType,
+            id: Int,
+            season: Int? = null,
+            episode: Int? = null,
+            startOver: Boolean = false,
+        ) {
+            navController.navigate(Routes.player(type, id, season, episode, startOver))
         }
 
         fun openCategory(type: MediaType, genreId: Int, name: String) {
@@ -252,6 +258,9 @@ fun TvApp() {
                                 onPlay = { type, id, season, episode ->
                                     openPlayer(type, id, season, episode)
                                 },
+                                onStartOver = { type, id ->
+                                    openPlayer(type, id, startOver = true)
+                                },
                                 onMediaClick = ::openDetails,
                                 onBack = { navController.popBackStack() },
                             )
@@ -267,6 +276,9 @@ fun TvApp() {
                                 },
                                 navArgument(NavArg.EPISODE) {
                                     type = NavType.IntType; defaultValue = -1
+                                },
+                                navArgument(NavArg.START_OVER) {
+                                    type = NavType.BoolType; defaultValue = false
                                 },
                             ),
                         ) {

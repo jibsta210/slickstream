@@ -344,6 +344,9 @@ fun PhoneApp() {
                     onPlay = { mediaType, mediaId, season, episode ->
                         navController.navigate(Routes.player(mediaType, mediaId, season, episode))
                     },
+                    onStartOver = { mediaType, mediaId ->
+                        navController.navigate(Routes.player(mediaType, mediaId, startOver = true))
+                    },
                     onBack = { navController.popBackStack() },
                     onMediaClick = { item -> navController.navigateToDetails(item) },
                 )
@@ -362,6 +365,10 @@ fun PhoneApp() {
                     navArgument(NavArg.EPISODE) {
                         type = NavType.IntType
                         defaultValue = -1
+                    },
+                    navArgument(NavArg.START_OVER) {
+                        type = NavType.BoolType
+                        defaultValue = false
                     },
                 ),
             ) {

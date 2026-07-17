@@ -23,6 +23,7 @@ import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -78,6 +79,7 @@ import com.slickstream.ui.theme.Brand
 @Composable
 fun TvDetailsScreen(
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
+    onStartOver: (MediaType, Int) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -98,6 +100,7 @@ fun TvDetailsScreen(
             downloadState = downloadState,
             seasonDownloads = seasonDownloads,
             onPlay = onPlay,
+            onStartOver = onStartOver,
             onToggleFavorite = viewModel::toggleFavorite,
             onSelectSeason = viewModel::selectSeason,
             onMediaClick = onMediaClick,
@@ -120,6 +123,7 @@ private fun DetailsContent(
     downloadState: com.slickstream.core.model.Download?,
     seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
+    onStartOver: (MediaType, Int) -> Unit,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
@@ -191,6 +195,7 @@ private fun DetailsContent(
                     downloadState = downloadState,
                     seasonDownloads = seasonDownloads,
                     onPlay = onPlay,
+                    onStartOver = onStartOver,
                     onToggleFavorite = onToggleFavorite,
                     onMarkMovieWatched = onMarkMovieWatched,
                     onMarkMovieUnwatched = onMarkMovieUnwatched,
@@ -325,6 +330,7 @@ private fun HeroBlock(
     downloadState: com.slickstream.core.model.Download?,
     seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
+    onStartOver: (MediaType, Int) -> Unit,
     onToggleFavorite: () -> Unit,
     onMarkMovieWatched: () -> Unit,
     onMarkMovieUnwatched: () -> Unit,
@@ -409,114 +415,131 @@ private fun HeroBlock(
 
         Spacer(Modifier.height(6.dp))
 
-        Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            DetailsActionButton(
-                onClick = {
-                    val rt = state.resumeTarget
-                    if (state.isTv) {
-                        // Resume the in-progress episode, or the next one after the last you finished
-                        // (computed in the VM) — not always S1E1.
-                        val season = rt?.season ?: state.selectedSeasonNumber
-                            ?: state.seasons.firstOrNull()?.seasonNumber
-                        onPlay(MediaType.TV, item.id, season, rt?.episode ?: 1)
-                    } else {
-                        onPlay(MediaType.MOVIE, item.id, null, null)
+        // Keep the primary movie actions on one row and the maintenance actions on a second row.
+        // Five wide buttons in one Row overflow on 720p / high-density Google TV layouts.
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                DetailsActionButton(
+                    onClick = {
+                        val rt = state.resumeTarget
+                        if (state.isTv) {
+                            // Resume the in-progress episode, or the next one after the last you finished
+                            // (computed in the VM) — not always S1E1.
+                            val season = rt?.season ?: state.selectedSeasonNumber
+                                ?: state.seasons.firstOrNull()?.seasonNumber
+                            onPlay(MediaType.TV, item.id, season, rt?.episode ?: 1)
+                        } else {
+                            onPlay(MediaType.MOVIE, item.id, null, null)
+                        }
+                    },
+                    primary = true,
+                    modifier = Modifier.focusRequester(playFocus),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = state.resumeTarget?.label ?: "Play",
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+
+                if (!state.isTv && state.hasMovieResume) {
+                    DetailsActionButton(onClick = { onStartOver(MediaType.MOVIE, item.id) }) {
+                        Icon(
+                            imageVector = Icons.Rounded.Replay,
+                            contentDescription = null,
+                            modifier = Modifier.size(24.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Start over", style = MaterialTheme.typography.labelLarge)
                     }
-                },
-                primary = true,
-                modifier = Modifier.focusRequester(playFocus),
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.PlayArrow,
-                    contentDescription = null,
-                    modifier = Modifier.size(24.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = state.resumeTarget?.label ?: "Play",
-                    style = MaterialTheme.typography.labelLarge,
-                )
+                }
+
+                DetailsActionButton(onClick = onToggleFavorite) {
+                    Icon(
+                        imageVector = if (isFavorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                        contentDescription = if (isFavorite) "Remove from favourites" else "Add to favourites",
+                        tint = if (isFavorite) Brand.Error else Color.White,
+                        modifier = Modifier.size(24.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (isFavorite) "Favourited" else "Favourite", style = MaterialTheme.typography.labelLarge)
+                }
+
+                // TV shows fit their season download beside Play/Favourite (three actions total).
+                if (state.isTv) {
+                    // Same predicate downloadSeason enqueues with (aired OR unknown air date) — the
+                    // aggregate must count exactly what a tap creates or the label lies/freezes.
+                    val aired = state.episodes.filter { it.isDownloadable() }
+                    val doneCount = aired.count { seasonDownloads[it.episodeNumber]?.isComplete == true }
+                    val seasonActive = aired.any {
+                        val s = seasonDownloads[it.episodeNumber]?.status
+                        s == com.slickstream.core.model.DownloadStatus.QUEUED ||
+                            s == com.slickstream.core.model.DownloadStatus.DOWNLOADING
+                    }
+                    val allDone = aired.isNotEmpty() && doneCount == aired.size
+                    val sn = state.selectedSeasonNumber
+                    val seasonLabel = when {
+                        allDone -> "Downloaded" + (sn?.let { " S$it" } ?: "")
+                        seasonActive -> "Downloading $doneCount/${aired.size}"
+                        sn != null -> "Download S$sn"
+                        else -> "Download season"
+                    }
+                    DetailsActionButton(onClick = { if (!seasonActive && !allDone) onDownloadSeason() }) {
+                        Icon(
+                            imageVector = if (allDone) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                            contentDescription = seasonLabel,
+                            tint = when {
+                                allDone -> Brand.Cyan
+                                seasonActive -> Brand.Cyan
+                                else -> Color.White
+                            },
+                            modifier = Modifier.size(24.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(seasonLabel, style = MaterialTheme.typography.labelLarge)
+                    }
+                }
             }
 
-            DetailsActionButton(onClick = onToggleFavorite) {
-                Icon(
-                    imageVector = if (isFavorite) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                    contentDescription = if (isFavorite) "Remove from favourites" else "Add to favourites",
-                    tint = if (isFavorite) Brand.Error else Color.White,
-                    modifier = Modifier.size(24.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(if (isFavorite) "Favourited" else "Favourite", style = MaterialTheme.typography.labelLarge)
-            }
-
-            // Movies: a focusable Mark watched / unwatched action beside Play + Favourite.
+            // Movie watched/download actions get their own compact row so Resume + Start over stay
+            // prominent and the action group remains inside the TV safe area.
             if (!state.isTv) {
-                val watched = state.isMovieWatched
-                DetailsActionButton(onClick = { if (watched) onMarkMovieUnwatched() else onMarkMovieWatched() }) {
-                    Icon(
-                        imageVector = if (watched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
-                        contentDescription = if (watched) "Mark unwatched" else "Mark watched",
-                        tint = if (watched) Brand.Cyan else Color.White,
-                        modifier = Modifier.size(24.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (watched) "Watched" else "Mark watched", style = MaterialTheme.typography.labelLarge)
-                }
-            }
+                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    val watched = state.isMovieWatched
+                    DetailsActionButton(onClick = { if (watched) onMarkMovieUnwatched() else onMarkMovieWatched() }) {
+                        Icon(
+                            imageVector = if (watched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
+                            contentDescription = if (watched) "Mark unwatched" else "Mark watched",
+                            tint = if (watched) Brand.Cyan else Color.White,
+                            modifier = Modifier.size(24.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (watched) "Watched" else "Mark watched", style = MaterialTheme.typography.labelLarge)
+                    }
 
-            // Download for offline. Movie: stateful (Download → % → Downloaded). TV: kick off the
-            // selected season, with a LIVE aggregate label so the tap visibly does something
-            // ("Downloading 2/8" → "Downloaded S1") instead of looking dead.
-            if (state.isTv) {
-                // Same predicate downloadSeason enqueues with (aired OR unknown air date) — the
-                // aggregate must count exactly what a tap creates or the label lies/freezes.
-                val aired = state.episodes.filter { it.isDownloadable() }
-                val doneCount = aired.count { seasonDownloads[it.episodeNumber]?.isComplete == true }
-                val seasonActive = aired.any {
-                    val s = seasonDownloads[it.episodeNumber]?.status
-                    s == com.slickstream.core.model.DownloadStatus.QUEUED ||
-                        s == com.slickstream.core.model.DownloadStatus.DOWNLOADING
-                }
-                val allDone = aired.isNotEmpty() && doneCount == aired.size
-                val sn = state.selectedSeasonNumber
-                val seasonLabel = when {
-                    allDone -> "Downloaded" + (sn?.let { " S$it" } ?: "")
-                    seasonActive -> "Downloading $doneCount/${aired.size}"
-                    sn != null -> "Download S$sn"
-                    else -> "Download season"
-                }
-                DetailsActionButton(onClick = { if (!seasonActive && !allDone) onDownloadSeason() }) {
-                    Icon(
-                        imageVector = if (allDone) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
-                        contentDescription = seasonLabel,
-                        tint = when {
-                            allDone -> Brand.Cyan
-                            seasonActive -> Brand.Cyan
-                            else -> Color.White
-                        },
-                        modifier = Modifier.size(24.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(seasonLabel, style = MaterialTheme.typography.labelLarge)
-                }
-            } else {
-                val done = downloadState?.isComplete == true
-                val downloading = downloadState?.status == com.slickstream.core.model.DownloadStatus.DOWNLOADING ||
-                    downloadState?.status == com.slickstream.core.model.DownloadStatus.QUEUED
-                val label = when {
-                    done -> "Downloaded"
-                    downloading -> "Downloading ${((downloadState?.progress ?: 0f) * 100).toInt()}%"
-                    else -> "Download"
-                }
-                DetailsActionButton(onClick = { if (!done && !downloading) onDownloadMovie() }) {
-                    Icon(
-                        imageVector = if (done) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
-                        contentDescription = label,
-                        tint = if (done) Brand.Cyan else Color.White,
-                        modifier = Modifier.size(24.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(label, style = MaterialTheme.typography.labelLarge)
+                    val done = downloadState?.isComplete == true
+                    val downloading = downloadState?.status == com.slickstream.core.model.DownloadStatus.DOWNLOADING ||
+                        downloadState?.status == com.slickstream.core.model.DownloadStatus.QUEUED
+                    val label = when {
+                        done -> "Downloaded"
+                        downloading -> "Downloading ${((downloadState?.progress ?: 0f) * 100).toInt()}%"
+                        else -> "Download"
+                    }
+                    DetailsActionButton(onClick = { if (!done && !downloading) onDownloadMovie() }) {
+                        Icon(
+                            imageVector = if (done) Icons.Rounded.DownloadDone else Icons.Rounded.Download,
+                            contentDescription = label,
+                            tint = if (done) Brand.Cyan else Color.White,
+                            modifier = Modifier.size(24.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(label, style = MaterialTheme.typography.labelLarge)
+                    }
                 }
             }
         }

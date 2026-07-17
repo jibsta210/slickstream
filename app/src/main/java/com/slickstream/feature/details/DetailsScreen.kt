@@ -29,6 +29,7 @@ import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -76,6 +77,7 @@ typealias OnPlay = (mediaType: MediaType, mediaId: Int, season: Int?, episode: I
 @Composable
 fun DetailsScreen(
     onPlay: OnPlay,
+    onStartOver: (mediaType: MediaType, mediaId: Int) -> Unit,
     onBack: () -> Unit,
     onMediaClick: (MediaItem) -> Unit,
     modifier: Modifier = Modifier,
@@ -98,6 +100,7 @@ fun DetailsScreen(
                 onDownloadSeason = viewModel::downloadSeason,
                 onDownloadEpisode = { ep -> viewModel.downloadEpisode(ep.seasonNumber, ep.episodeNumber, ep.name) },
                 onPlay = onPlay,
+                onStartOver = onStartOver,
                 onToggleFavorite = viewModel::toggleFavorite,
                 onSelectSeason = viewModel::selectSeason,
                 onMediaClick = onMediaClick,
@@ -143,6 +146,7 @@ private fun DetailsContent(
     onDownloadSeason: () -> Unit,
     onDownloadEpisode: (Episode) -> Unit,
     onPlay: OnPlay,
+    onStartOver: (mediaType: MediaType, mediaId: Int) -> Unit,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
@@ -224,6 +228,13 @@ private fun DetailsContent(
                             onClick = onDownloadMovie,
                         )
                     }
+                }
+                if (!isTv && state.hasMovieResume) {
+                    Spacer(Modifier.height(10.dp))
+                    StartOverButton(
+                        onClick = { onStartOver(item.mediaType, item.id) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
                 // Movies: an explicit Mark watched / unwatched toggle next to Play/Favourite.
                 if (!isTv) {
@@ -496,6 +507,34 @@ private fun PlayButton(
         Spacer(Modifier.width(8.dp))
         Text(
             text = label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+@Composable
+private fun StartOverButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(48.dp),
+        shape = RoundedCornerShape(14.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Brand.SurfaceVariant,
+            contentColor = Brand.OnSurface,
+        ),
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Replay,
+            contentDescription = null,
+            modifier = Modifier.size(21.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "Start from beginning",
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.Bold,
         )

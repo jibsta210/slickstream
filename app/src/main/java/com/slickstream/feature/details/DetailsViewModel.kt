@@ -48,6 +48,9 @@ data class DetailsUiState(
     val episodeProgress: Map<Int, Float> = emptyMap(),
     /** Whether this movie is marked watched (always false for TV titles). */
     val isMovieWatched: Boolean = false,
+    /** True only when this movie has a real unfinished position, so the UI can offer Resume AND
+     *  an explicit Start from beginning action. Always false for TV titles. */
+    val hasMovieResume: Boolean = false,
     /** Where the main Play button should go: the in-progress episode (Resume), the next episode after
      *  the last one you finished (Play SxEy), or the first episode if nothing's been watched. */
     val resumeTarget: ResumeTarget? = null,
@@ -186,7 +189,7 @@ class DetailsViewModel @Inject constructor(
         val latest = latestHistory
         val target = if (mediaType == MediaType.MOVIE) {
             when {
-                latest == null -> ResumeTarget(null, null, "Play")
+                latest == null || latest.progress.positionMs <= 0L -> ResumeTarget(null, null, "Play")
                 latest.progress.isFinished -> ResumeTarget(null, null, "Play again")
                 else -> ResumeTarget(null, null, "Resume")
             }
@@ -209,8 +212,13 @@ class DetailsViewModel @Inject constructor(
                 }
             }
         }
-        if (target != state.resumeTarget) {
-            _uiState.value = _uiState.value.copy(resumeTarget = target)
+        val hasMovieResume = mediaType == MediaType.MOVIE &&
+            latest != null && latest.progress.positionMs > 0L && !latest.progress.isFinished
+        if (target != state.resumeTarget || hasMovieResume != state.hasMovieResume) {
+            _uiState.value = _uiState.value.copy(
+                resumeTarget = target,
+                hasMovieResume = hasMovieResume,
+            )
         }
     }
 
