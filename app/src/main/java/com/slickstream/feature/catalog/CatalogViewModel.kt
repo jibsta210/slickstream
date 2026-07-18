@@ -14,6 +14,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -25,6 +30,7 @@ import javax.inject.Inject
 @HiltViewModel
 class CatalogViewModel @Inject constructor(
     private val catalog: CatalogRepository,
+    profileRepository: com.slickstream.core.repository.ProfileRepository,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(HomeUiState())
@@ -35,6 +41,19 @@ class CatalogViewModel @Inject constructor(
     val genres: StateFlow<List<Genre>> = _genres.asStateFlow()
 
     private var loadedType: MediaType? = null
+
+    init {
+        // Re-fetch on a profile identity/kids change: the repository gates content by the ACTIVE
+        // profile, so rows loaded for an adult profile must not survive a switch to a kids profile
+        // (this VM outlives the screen on the nav back stack). drop(1) skips the startup emission —
+        // the screen's own load() covers the first fetch.
+        profileRepository.activeProfile
+            .map { it?.id to (it?.isKids ?: false) }
+            .distinctUntilChanged()
+            .drop(1)
+            .onEach { loadedType?.let(::fetch) }
+            .launchIn(viewModelScope)
+    }
 
     /** Idempotent: the screen calls this with its [MediaType]; re-loads only on a type change. */
     fun load(mediaType: MediaType) {

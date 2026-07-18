@@ -14,7 +14,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -39,6 +42,7 @@ data class SearchUiState(
 class SearchViewModel @Inject constructor(
     private val catalogRepository: CatalogRepository,
     val voiceSearch: VoiceSearchManager,
+    profileRepository: com.slickstream.core.repository.ProfileRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(SearchUiState())
@@ -53,6 +57,18 @@ class SearchViewModel @Inject constructor(
     init {
         observeQueryDebounced()
         observeVoiceTranscripts()
+        // The repository gates results by the ACTIVE profile (kids quarantine). On a profile switch,
+        // results from the previous profile must not linger: re-run the live query under the new
+        // profile's rules, or clear if the field is empty. drop(1) skips the startup emission.
+        profileRepository.activeProfile
+            .map { it?.id to (it?.isKids ?: false) }
+            .distinctUntilChanged()
+            .drop(1)
+            .onEach {
+                val q = _uiState.value.query.trim()
+                if (q.isBlank()) clear() else runSearch(q)
+            }
+            .launchIn(viewModelScope)
     }
 
     /** Called as the user types — debounced before it hits the network. */

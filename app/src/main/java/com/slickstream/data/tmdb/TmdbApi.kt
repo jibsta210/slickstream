@@ -1,7 +1,9 @@
 package com.slickstream.data.tmdb
 
+import com.slickstream.data.tmdb.dto.ContentRatingsDto
 import com.slickstream.data.tmdb.dto.GenreListDto
 import com.slickstream.data.tmdb.dto.MediaListItemDto
+import com.slickstream.data.tmdb.dto.ReleaseDatesDto
 import com.slickstream.data.tmdb.dto.MovieDetailsDto
 import com.slickstream.data.tmdb.dto.PagedDto
 import com.slickstream.data.tmdb.dto.SeasonDetailsDto
@@ -68,11 +70,26 @@ interface TmdbApi {
     @GET("discover/{media_type}")
     suspend fun discover(
         @Path("media_type") mediaType: String,
-        @Query("with_genres") withGenres: String,
+        @Query("with_genres") withGenres: String? = null,
         @Query("page") page: Int = 1,
         @Query("sort_by") sortBy: String = "popularity.desc",
         @Query("include_adult") includeAdult: Boolean = false,
+        // Kids-profile quarantine (movie-only on TMDB): US certification cap, e.g. "PG-13".
+        @Query("certification_country") certificationCountry: String? = null,
+        @Query("certification.lte") certificationLte: String? = null,
+        // Quality floor so date-sorted / rating-sorted discover doesn't surface junk with 3 votes.
+        @Query("vote_count.gte") voteCountGte: Int? = null,
+        @Query("primary_release_date.lte") releasedBefore: String? = null,
+        @Query("first_air_date.lte") airedBefore: String? = null,
     ): PagedDto<MediaListItemDto>
+
+    /** Per-country movie certifications (kids-profile search/similar filtering). */
+    @GET("movie/{id}/release_dates")
+    suspend fun movieReleaseDates(@Path("id") id: Int): ReleaseDatesDto
+
+    /** Per-country TV content ratings (kids-profile search/similar filtering). */
+    @GET("tv/{id}/content_ratings")
+    suspend fun tvContentRatings(@Path("id") id: Int): ContentRatingsDto
 
     @GET("genre/{media_type}/list")
     suspend fun genres(
