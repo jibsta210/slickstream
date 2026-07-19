@@ -29,6 +29,21 @@ import javax.inject.Singleton
 class WebViewStreamResolver @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
+    /**
+     * Whether this device actually has a usable WebView provider. Many Android TV / Google TV boxes
+     * ship WITHOUT one (or with it disabled), and constructing a [WebView] there throws — historically
+     * a `java.lang.Error` (UnsatisfiedLinkError) that a `catch (Exception)` missed, crashing the app
+     * INSTANTLY the moment a live source was selected. Callers check this first to show a clear message
+     * instead of failing every source. Fully guarded — even probing can throw on a broken provider.
+     */
+    fun isWebViewAvailable(): Boolean = runCatching {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            WebView.getCurrentWebViewPackage() != null
+        } else {
+            // Pre-O has no query API; assume present (those devices virtually always bundle WebView).
+            true
+        }
+    }.getOrDefault(false)
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface", "AddJavascriptInterface")
     suspend fun resolve(
         embedUrl: String,

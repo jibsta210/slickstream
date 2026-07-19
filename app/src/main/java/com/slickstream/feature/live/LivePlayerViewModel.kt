@@ -80,6 +80,15 @@ class LivePlayerViewModel @Inject constructor(
             // Whole path guarded: a resolver/WebView/ExoPlayer failure must surface as an in-player
             // error (with a "try another source" affordance), never crash the app.
             runCatching {
+                // No WebView provider (common on Android TV boxes) — every embed source needs it, so
+                // say so plainly instead of spinning through "try another source" on each one.
+                if (feed.needsResolution && !resolver.isWebViewAvailable()) {
+                    _uiState.value = UiState.Error(
+                        "Live sports need Android System WebView, which isn't available on this device. " +
+                            "Install/enable it from the Play Store, then try again.",
+                    )
+                    return@launch
+                }
                 val playUrl = if (feed.needsResolution) {
                     // Resolve the embed -> m3u8 invisibly. The embed's referrer check wants its PARENT
                     // site (streamed.pk); the resulting m3u8 plays with the embed.st headers.
