@@ -77,21 +77,28 @@ class LivePlayerViewModel @Inject constructor(
         _player.value = null
         _uiState.value = UiState.Buffering
         playJob = viewModelScope.launch {
-            val playUrl = if (feed.needsResolution) {
-                // Resolve the embed -> m3u8 invisibly. The embed's referrer check wants its PARENT
-                // site (streamed.pk); the resulting m3u8 plays with the embed.st headers.
-                resolver.resolve(
-                    embedUrl = feed.url,
-                    pageReferer = "https://streamed.pk/",
-                    userAgent = feed.headers["User-Agent"] ?: DEFAULT_UA,
-                )
-            } else {
-                feed.url
-            }
-            if (playUrl.isNullOrBlank()) {
-                _uiState.value = UiState.Error("Couldn't find a playable stream for this feed. Try another source.")
-            } else {
-                buildPlayer(playUrl, feed.headers)
+            // Whole path guarded: a resolver/WebView/ExoPlayer failure must surface as an in-player
+            // error (with a "try another source" affordance), never crash the app.
+            runCatching {
+                val playUrl = if (feed.needsResolution) {
+                    // Resolve the embed -> m3u8 invisibly. The embed's referrer check wants its PARENT
+                    // site (streamed.pk); the resulting m3u8 plays with the embed.st headers.
+                    resolver.resolve(
+                        embedUrl = feed.url,
+                        pageReferer = "https://streamed.pk/",
+                        userAgent = feed.headers["User-Agent"] ?: DEFAULT_UA,
+                    )
+                } else {
+                    feed.url
+                }
+                if (playUrl.isNullOrBlank()) {
+                    _uiState.value = UiState.Error("Couldn't find a playable stream for this feed. Try another source.")
+                } else {
+                    buildPlayer(playUrl, feed.headers)
+                }
+            }.onFailure {
+                if (it is kotlinx.coroutines.CancellationException) throw it
+                _uiState.value = UiState.Error("This feed didn't load. Try another source.")
             }
         }
     }

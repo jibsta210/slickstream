@@ -74,14 +74,32 @@ class WebViewStreamResolver @Inject constructor(
                         // strip sandbox off any nested iframes so the embed's player can run.
                         view?.evaluateJavascript(HOOK_JS, null)
                     }
+
+                    // CRITICAL crash survival: a heavy/hostile embed page (e.g. a big live event) can
+                    // crash the WebView RENDERER process. If this returns false (the default), Android
+                    // tears down the WHOLE APP — the "was reliable, now instant crash on stream select"
+                    // report. Returning true keeps the app alive; we just fail this resolve (-> null ->
+                    // "try another source") instead of dying. (onRenderProcessGone: API 26+.)
+                    override fun onRenderProcessGone(
+                        view: WebView?,
+                        detail: android.webkit.RenderProcessGoneDetail?,
+                    ): Boolean {
+                        if (!captured.isCompleted) {
+                            captured.completeExceptionally(IllegalStateException("WebView renderer gone"))
+                        }
+                        runCatching { view?.destroy() }
+                        return true
+                    }
                 }
             }
             // Load the embed PAGE with a Referer of its parent site (streamed.pk), which is what the
             // embed's referrer check expects.
             webView.loadUrl(embedUrl, mapOf("Referer" to pageReferer))
 
-            withTimeoutOrNull(timeoutMs) { captured.await() }
-        } catch (e: Exception) {
+            // await() can throw (renderer-gone completes exceptionally) — treat any failure as "no
+            // stream found" so the caller shows "try another source" instead of the app crashing.
+            withTimeoutOrNull(timeoutMs) { runCatching { captured.await() }.getOrNull() }
+        } catch (e: Throwable) {
             null
         } finally {
             webView?.let { wv ->
