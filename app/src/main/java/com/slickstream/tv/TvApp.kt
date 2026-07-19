@@ -217,6 +217,7 @@ fun TvApp() {
                                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                                 onManageProfiles = { navController.navigate(Routes.PROFILE_PICKER) },
                                 onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) },
+                                onOpenDiagnostics = { navController.navigate(Routes.DIAGNOSTICS) },
                             )
                         }
 
@@ -224,6 +225,10 @@ fun TvApp() {
                             TvDownloadsScreen(
                                 onPlay = { type, id, season, episode -> openPlayer(type, id, season, episode) },
                             )
+                        }
+
+                        composable(Routes.DIAGNOSTICS) {
+                            com.slickstream.feature.diagnostics.DiagnosticsScreen(onBack = { navController.popBackStack() })
                         }
 
                         composable(Routes.PROFILE_PICKER) {

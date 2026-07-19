@@ -271,6 +271,7 @@ fun PhoneApp() {
                     onSignIn = onSignIn,
                     onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
                     onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) { launchSingleTop = true } },
+                    onOpenDiagnostics = { navController.navigate(Routes.DIAGNOSTICS) { launchSingleTop = true } },
                     onSwitchProfile = { navController.navigate(Routes.PROFILE_PICKER) { launchSingleTop = true } },
                     onBack = {
                         if (!navController.popBackStack()) {
@@ -278,6 +279,10 @@ fun PhoneApp() {
                         }
                     },
                 )
+            }
+
+            composable(Routes.DIAGNOSTICS) {
+                com.slickstream.feature.diagnostics.DiagnosticsScreen(onBack = { navController.popBackStack() })
             }
 
             composable(Routes.PROFILE_PICKER) {

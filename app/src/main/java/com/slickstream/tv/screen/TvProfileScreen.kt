@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SwitchAccount
@@ -89,6 +90,7 @@ fun TvProfileScreen(
     modifier: Modifier = Modifier,
     onManageProfiles: () -> Unit = {},
     onOpenDownloads: () -> Unit = {},
+    onOpenDiagnostics: () -> Unit = {},
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val context = LocalContext.current
@@ -187,6 +189,12 @@ fun TvProfileScreen(
                 icon = Icons.Rounded.Download,
                 label = "Downloads",
                 onClick = onOpenDownloads,
+            )
+
+            ProfileAction(
+                icon = Icons.Rounded.BugReport,
+                label = "Diagnostics",
+                onClick = onOpenDiagnostics,
             )
 
             if (user == null) {

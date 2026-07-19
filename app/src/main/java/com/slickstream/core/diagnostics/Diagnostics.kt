@@ -98,16 +98,19 @@ class Diagnostics @Inject constructor(
         }
     }
 
-    /** Upload a crash captured by the flight recorder on the PREVIOUS run, then delete it. Runs even in
-     *  debug so on-device testing surfaces the stack too (a crash is rare + important — not noise). */
+    /** Upload a crash captured by the flight recorder on the PREVIOUS run, then KEEP it as the "last
+     *  crash" so the in-app viewer can show it even when Firebase can't upload (a box with no Play
+     *  Services). Runs even in debug so on-device testing surfaces the stack too. */
     fun flushPendingCrash() {
         scope.launch {
             runCatching {
                 val f = java.io.File(context.filesDir, PENDING_CRASH_FILE)
                 if (!f.exists()) return@launch
                 val body = f.readText()
+                // Keep a copy for the on-screen viewer BEFORE any upload (upload may fail/no-op).
+                runCatching { java.io.File(context.filesDir, LAST_CRASH_FILE).writeText(body) }
                 f.delete()
-                // Crashlytics non-fatal (grouped) + a durable Firestore row with the full text.
+                // Best-effort upload (no-ops without Play Services / Firebase).
                 runCatching { crashlytics?.recordException(RecordedCrash(body.lineSequence().firstOrNull { it.startsWith("message=") } ?: "recorded crash")) }
                 firestore?.collection("diagnostics")?.document(installId)
                     ?.collection("crashes")?.add(
@@ -121,6 +124,36 @@ class Diagnostics @Inject constructor(
                     )
             }
         }
+    }
+
+    /** The most recent captured crash report (for the on-screen viewer), or null if none. */
+    fun lastCrashReport(): String? =
+        runCatching { java.io.File(context.filesDir, LAST_CRASH_FILE).takeIf { it.exists() }?.readText() }.getOrNull()
+
+    fun clearLastCrash() {
+        runCatching { java.io.File(context.filesDir, LAST_CRASH_FILE).delete() }
+    }
+
+    /** Human-readable environment snapshot for the viewer — the things that actually determine whether
+     *  live sports and diagnostics work on THIS box (WebView + Play Services + Firebase). */
+    fun environmentReport(): String = buildString {
+        append("App: ").append(BuildConfig.VERSION_NAME)
+            .append(if (BuildConfig.DEBUG) " (debug)" else "").append('\n')
+        append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+            .append(" · Android ").append(Build.VERSION.RELEASE)
+            .append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n")
+        val webview = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                android.webkit.WebView.getCurrentWebViewPackage()?.let { "${it.packageName} ${it.versionName}" }
+            else "assumed present (pre-O)"
+        }.getOrNull()
+        append("WebView: ").append(webview ?: "NOT AVAILABLE (live sports can't play)").append('\n')
+        val play = runCatching {
+            context.packageManager.getPackageInfo("com.google.android.gms", 0) != null
+        }.getOrDefault(false)
+        append("Play Services: ").append(if (play) "present" else "NOT PRESENT (Firebase diagnostics won't upload)").append('\n')
+        append("Firebase: ").append(if (firestore != null) "initialized" else "not initialized").append('\n')
+        append("Install id: ").append(installId).append('\n')
     }
 
     private class RecordedCrash(msg: String) : Exception(msg)
@@ -183,6 +216,7 @@ class Diagnostics @Inject constructor(
         const val KEY_INSTALL_ID = "install_id"
         const val KEY_HEARTBEAT_VERSION = "heartbeat_version"
         const val PENDING_CRASH_FILE = "pending_crash.txt"
+        const val LAST_CRASH_FILE = "last_crash.txt"
         const val TRAIL_MAX = 50
     }
 }

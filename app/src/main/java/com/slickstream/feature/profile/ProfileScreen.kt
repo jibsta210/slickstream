@@ -21,6 +21,7 @@ import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SwitchAccount
@@ -65,6 +66,7 @@ fun ProfileScreen(
     onSignIn: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenDownloads: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
     onSwitchProfile: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -135,6 +137,12 @@ fun ProfileScreen(
             title = "Settings",
             subtitle = "Streaming quality per network and display density.",
             onClick = onOpenSettings,
+        )
+        SettingRow(
+            icon = { Icon(Icons.Rounded.BugReport, contentDescription = null, tint = Brand.Cyan) },
+            title = "Diagnostics",
+            subtitle = "Device info + last crash report (for troubleshooting).",
+            onClick = onOpenDiagnostics,
         )
 
         if (user != null) {
