@@ -53,10 +53,77 @@ class Diagnostics @Inject constructor(
 
     private val firestore: FirebaseFirestore? by lazy { runCatching { FirebaseFirestore.getInstance() }.getOrNull() }
 
-    /** A cheap breadcrumb — attaches to the NEXT crash report only. Safe to call often. */
+    /** In-memory ring of recent breadcrumbs (with uptime stamps) so a captured crash carries the exact
+     *  trail of what ran just before it — the "flight recorder" tape. */
+    private val trail = java.util.concurrent.ConcurrentLinkedDeque<String>()
+
+    /** A cheap breadcrumb — into Crashlytics AND the local trail (so the flight recorder can attach it
+     *  to a fatal even when Crashlytics can't, e.g. a native abort). Safe to call often. */
     fun breadcrumb(message: String) {
+        val stamped = "+${android.os.SystemClock.elapsedRealtime()}ms $message"
+        trail.addLast(stamped)
+        while (trail.size > TRAIL_MAX) trail.pollFirst()
         runCatching { crashlytics?.log(message) }
     }
+
+    /**
+     * FLIGHT RECORDER: chain the process's uncaught-exception handler so a FATAL crash is written to a
+     * local file SYNCHRONOUSLY (before the process dies), together with the breadcrumb trail. Uploaded
+     * to Firestore on the NEXT launch by [flushPendingCrash]. This captures crashes our try/catches
+     * miss (e.g. a WebView Error, a Compose/main-thread throw) and — unlike Crashlytics, which also
+     * uploads next-launch — lands the FULL stack in a place we can read directly. Call once at launch.
+     */
+    fun installCrashRecorder() {
+        runCatching {
+            val previous = Thread.getDefaultUncaughtExceptionHandler()
+            Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+                runCatching {
+                    val sw = java.io.StringWriter()
+                    throwable.printStackTrace(java.io.PrintWriter(sw))
+                    val body = buildString {
+                        append("thread=").append(thread.name).append('\n')
+                        append("version=").append(BuildConfig.VERSION_NAME).append('\n')
+                        append("device=").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+                            .append(" sdk=").append(Build.VERSION.SDK_INT).append('\n')
+                        append("message=").append(throwable.toString()).append('\n')
+                        append("--- trail (most recent last) ---\n")
+                        trail.forEach { append(it).append('\n') }
+                        append("--- stack ---\n").append(sw.toString())
+                    }
+                    java.io.File(context.filesDir, PENDING_CRASH_FILE).writeText(body)
+                }
+                // Always chain to the prior handler (Crashlytics) so its own capture still runs.
+                previous?.uncaughtException(thread, throwable)
+            }
+        }
+    }
+
+    /** Upload a crash captured by the flight recorder on the PREVIOUS run, then delete it. Runs even in
+     *  debug so on-device testing surfaces the stack too (a crash is rare + important — not noise). */
+    fun flushPendingCrash() {
+        scope.launch {
+            runCatching {
+                val f = java.io.File(context.filesDir, PENDING_CRASH_FILE)
+                if (!f.exists()) return@launch
+                val body = f.readText()
+                f.delete()
+                // Crashlytics non-fatal (grouped) + a durable Firestore row with the full text.
+                runCatching { crashlytics?.recordException(RecordedCrash(body.lineSequence().firstOrNull { it.startsWith("message=") } ?: "recorded crash")) }
+                firestore?.collection("diagnostics")?.document(installId)
+                    ?.collection("crashes")?.add(
+                        mapOf(
+                            "at" to Timestamp.now(),
+                            "versionName" to BuildConfig.VERSION_NAME,
+                            "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+                            "sdk" to Build.VERSION.SDK_INT,
+                            "report" to body.take(9000),   // Firestore field cap headroom
+                        ),
+                    )
+            }
+        }
+    }
+
+    private class RecordedCrash(msg: String) : Exception(msg)
 
     /** A notable event: breadcrumb + Crashlytics custom keys (for crash context) + a durable, queryable
      *  Firestore row aggregated across all RELEASE installs. Keep [data] free of secrets. */
@@ -115,5 +182,7 @@ class Diagnostics @Inject constructor(
     private companion object {
         const val KEY_INSTALL_ID = "install_id"
         const val KEY_HEARTBEAT_VERSION = "heartbeat_version"
+        const val PENDING_CRASH_FILE = "pending_crash.txt"
+        const val TRAIL_MAX = 50
     }
 }

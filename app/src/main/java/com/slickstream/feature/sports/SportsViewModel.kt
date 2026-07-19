@@ -22,6 +22,7 @@ import javax.inject.Inject
 class SportsViewModel @Inject constructor(
     private val repo: SportsRepository,
     private val playbackHolder: LivePlaybackHolder,
+    private val diagnostics: com.slickstream.core.diagnostics.Diagnostics,
 ) : ViewModel() {
 
     data class State(
@@ -105,6 +106,10 @@ class SportsViewModel @Inject constructor(
 
     /** Stash the chosen feed for [com.slickstream.feature.live.LivePlayerViewModel] and clear the sheet. */
     fun prepareToPlay(sheet: StreamSheet, stream: SportStream) {
+        diagnostics.breadcrumb(
+            "sports.prepareToPlay id=${stream.id} needsResolution=${stream.needsResolution} " +
+                "feeds=${sheet.streams.size}",
+        )
         val feeds = sheet.streams.map {
             com.slickstream.feature.live.LivePlaybackHolder.Feed(it.label, it.url, it.headers, it.needsResolution)
         }
@@ -114,5 +119,6 @@ class SportsViewModel @Inject constructor(
             index = sheet.streams.indexOf(stream).coerceAtLeast(0),
         )
         _sheet.value = null
+        diagnostics.breadcrumb("sports.prepareToPlay done -> navigating to live player")
     }
 }

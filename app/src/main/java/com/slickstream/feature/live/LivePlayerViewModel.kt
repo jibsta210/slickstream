@@ -33,6 +33,7 @@ class LivePlayerViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val holder: LivePlaybackHolder,
     private val resolver: WebViewStreamResolver,
+    private val diagnostics: com.slickstream.core.diagnostics.Diagnostics,
 ) : ViewModel() {
 
     sealed interface UiState {
@@ -59,6 +60,7 @@ class LivePlayerViewModel @Inject constructor(
     private var playJob: kotlinx.coroutines.Job? = null
 
     init {
+        diagnostics.breadcrumb("live.vm init title='$title' feeds=${feeds.size} hasSelection=${holder.current != null}")
         if (holder.current == null) _uiState.value = UiState.NoStream
         else play(_currentIndex.value)
     }
@@ -72,6 +74,7 @@ class LivePlayerViewModel @Inject constructor(
 
     private fun play(index: Int) {
         val feed = feeds.getOrNull(index) ?: return
+        diagnostics.breadcrumb("live.play idx=$index needsResolution=${feed.needsResolution}")
         playJob?.cancel()
         _player.value?.release()
         _player.value = null
@@ -82,7 +85,9 @@ class LivePlayerViewModel @Inject constructor(
             runCatching {
                 // No WebView provider (common on Android TV boxes) — every embed source needs it, so
                 // say so plainly instead of spinning through "try another source" on each one.
+                diagnostics.breadcrumb("live.play checking webview availability")
                 if (feed.needsResolution && !resolver.isWebViewAvailable()) {
+                    diagnostics.breadcrumb("live.play webview UNAVAILABLE -> showing message")
                     _uiState.value = UiState.Error(
                         "Live sports need Android System WebView, which isn't available on this device. " +
                             "Install/enable it from the Play Store, then try again.",
@@ -92,6 +97,7 @@ class LivePlayerViewModel @Inject constructor(
                 val playUrl = if (feed.needsResolution) {
                     // Resolve the embed -> m3u8 invisibly. The embed's referrer check wants its PARENT
                     // site (streamed.pk); the resulting m3u8 plays with the embed.st headers.
+                    diagnostics.breadcrumb("live.play resolving embed via webview")
                     resolver.resolve(
                         embedUrl = feed.url,
                         pageReferer = "https://streamed.pk/",

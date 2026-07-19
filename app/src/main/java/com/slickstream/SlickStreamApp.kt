@@ -30,6 +30,9 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
     @Inject
     lateinit var torrentStreamer: TorrentStreamer
 
+    @Inject
+    lateinit var diagnostics: com.slickstream.core.diagnostics.Diagnostics
+
     /** True on RAM-starved TV boxes (the common cheap Android TV) — used to shrink the image cache so a
      *  long session with big backdrops + multi-GB torrents doesn't get OOM-killed mid-playback. */
     private val lowRam: Boolean by lazy {
@@ -39,6 +42,13 @@ class SlickStreamApp : Application(), ImageLoaderFactory {
 
     override fun onCreate() {
         super.onCreate()
+        // FLIGHT RECORDER: arm the crash handler FIRST (before anything can throw) so a fatal on any
+        // path — including one our try/catches miss — is written to disk with its stack + breadcrumb
+        // trail, then uploaded to Firestore on the next launch. Then flush any crash from the last run.
+        runCatching {
+            diagnostics.installCrashRecorder()
+            diagnostics.flushPendingCrash()
+        }
         // Warm the libtorrent session + DHT at launch (off-main) so the DHT routing table is already
         // bootstrapped — and the persisted .session_state restored — by the time the user presses
         // Play. Otherwise the first stream pays session.start + DHT bootstrap on the critical path.
