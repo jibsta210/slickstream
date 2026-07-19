@@ -211,6 +211,9 @@ class PlayerViewModel @Inject constructor(
     // forces the source panel open so the user always has an escape hatch (never stranded on black).
     @Volatile private var firstFrameRendered = false
     private var firstFrameWatchdogJob: Job? = null
+
+    /** One-shot per source: has the foreign-audio check (onTracksChanged) already run? */
+    private var foreignAudioChecked = false
     private val _forceSourcePanel = MutableStateFlow(false)
     /** Set true when a fresh source reaches "Playing" but never renders a frame — the UI opens the source
      *  picker in response (an escape hatch that doesn't depend on D-pad focus). UI clears it via [consumeForceSourcePanel]. */
@@ -716,6 +719,7 @@ class PlayerViewModel @Inject constructor(
         hasReachedPlaying = false       // new source starts in the STARTUP phase (failover watchdog owns it)
         firstFrameRendered = false      // fresh source hasn't painted yet — re-arm the no-frame watchdog on READY
         firstFrameWatchdogJob?.cancel()
+        foreignAudioChecked = false     // fresh source -> re-check its declared audio languages once
         latestStatus = null
         firstReadyAtMs = 0L
         // The old source's audio-track list is meaningless for the new stream (and on the VLC path it
@@ -1038,10 +1042,18 @@ class PlayerViewModel @Inject constructor(
         rebufferWatchdogJob?.cancel()
         firstFrameWatchdogJob?.cancel()
         progressTickJob?.cancel()
+        // Defer the ExoPlayer release until AFTER the UI unbinds (mirror of the VLC pattern below).
+        // Releasing synchronously here left the TV PlayerView bound to a RELEASED player for one
+        // recompose frame — its setPlayer(next/null) then calls clearVideoSurfaceView() on the freed
+        // player: the rapid-source-switching crash ("switch 2-3 sources fast and it dies"). Pause now
+        // so there's no double audio during the hand-off; release once the UI has rebound.
         val exo = _player.value
         playerListener?.let { exo?.removeListener(it) }
-        exo?.release()
+        exo?.let { runCatching { it.playWhenReady = false } }
         _player.value = null
+        exo?.let { e ->
+            viewModelScope.launch { try { delay(80) } finally { runCatching { e.release() } } }
+        }
         // RELEASE (not just stop) the VLC player, and do it AFTER the UI unbinds. The old code only
         // stop()'d it, so its vout/surface state stayed latched: on a later source that remounted the
         // TV PlayerView with a fresh SurfaceView, VLC's stale "already attached" latch skipped the
@@ -1457,6 +1469,33 @@ class PlayerViewModel @Inject constructor(
                 // it can't loop. A release with a SUPPORTED track (e.g. an AAC alongside the AC3) keeps
                 // playing on ExoPlayer (isTypeSupported stays true) and is untouched.
                 if (usingVlcForSource || _isCasting.value) return
+                // FOREIGN-AUDIO auto-advance: name-based language detection can't catch a foreign film
+                // behind a clean Latin-script release name ("Black Box" = the French "Boîte noire" —
+                // most of its releases are French but look English). The stream's own track metadata is
+                // authoritative: when every audio track DECLARES a language and NONE is English, this
+                // source is confidently foreign — advance to the next candidate like a dead link.
+                // "und"/missing languages are benign (most legit English releases declare nothing), so
+                // they never trigger this. Once per source; only when untried alternatives remain.
+                if (!foreignAudioChecked) {
+                    val langs = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+                        .flatMap { g -> (0 until g.length).map { g.getTrackFormat(it).language } }
+                    if (langs.isNotEmpty()) {
+                        foreignAudioChecked = true
+                        val declared = langs.filterNotNull().filter { it.isNotBlank() && it != "und" }
+                        val confidentlyForeign =
+                            declared.size == langs.size && declared.none { it.lowercase().startsWith("en") }
+                        if (confidentlyForeign &&
+                            _sources.value.any { it.infoHash !in triedInfoHashes }
+                        ) {
+                            diagnostics.event(
+                                "player_foreign_audio_advance",
+                                mapOf("langs" to declared.distinct().joinToString(","), "source" to _currentSource.value.diagTag()),
+                            )
+                            viewModelScope.launch { failoverToNext() }
+                            return
+                        }
+                    }
+                }
                 val hasAudio = tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }
                 if (hasAudio && !tracks.isTypeSupported(C.TRACK_TYPE_AUDIO)) {
                     val url = currentMediaUrl ?: return

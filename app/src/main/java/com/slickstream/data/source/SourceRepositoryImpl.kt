@@ -38,6 +38,7 @@ class SourceRepositoryImpl @Inject constructor(
     private val api: IndexerApi,
     private val addonRegistry: AddonRegistry,
     private val settingsRepository: SettingsRepository,
+    private val sourceStatusStore: SourceStatusStore,
 ) : SourceRepository {
 
     /** Successful resolves are briefly reusable by details prewarm + player startup. [inFlight] also
@@ -135,6 +136,10 @@ class SourceRepositoryImpl @Inject constructor(
                 resolveMutex.withLock {
                     resolveCache[key] = CachedResolve(result, System.nanoTime())
                 }
+                // FREE availability signal: every real resolution (details open, prewarm, play) records
+                // whether this title has anything to play, so the catalog can stop headlining dead
+                // titles. Success-only — a network error says nothing about availability.
+                sourceStatusStore.record(details.item.id, details.item.mediaType, result.data.isNotEmpty())
             }
             return result
         } catch (e: CancellationException) {

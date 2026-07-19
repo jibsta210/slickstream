@@ -28,9 +28,15 @@ import javax.inject.Singleton
 class CatalogRepositoryImpl @Inject constructor(
     private val api: TmdbApi,
     private val profiles: com.slickstream.core.repository.ProfileRepository,
+    private val sourceStatus: com.slickstream.data.source.SourceStatusStore,
 ) : CatalogRepository {
 
     private val io: CoroutineDispatcher = Dispatchers.IO
+
+    /** Drop titles RECENTLY confirmed to have no playable sources (an unreleased film trending at #1
+     *  must not headline the hero). Synchronous in-memory lookup — adds zero latency; unknown titles
+     *  pass so lists never wait on an indexer. Applied to every list this repository returns. */
+    private fun List<MediaItem>.browsable(): List<MediaItem> = sourceStatus.filterBrowsable(this)
 
     // --- Kids-profile quarantine ------------------------------------------------------------------
     // Gated HERE, in the repository, so EVERY surface inherits it — Home rows, the Movies/TV catalog
@@ -124,7 +130,7 @@ class CatalogRepositoryImpl @Inject constructor(
         certificationLte = "PG-13",
         voteCountGte = voteFloor,
         releasedBefore = releasedBefore,
-    ).results.toDomain(MediaType.MOVIE)
+    ).results.toDomain(MediaType.MOVIE).browsable()
 
     /** Kid-safe TV discover: TMDB can't rating-filter TV, so constrain to kid genres. A specific
      *  [genre] is ANDed with the kid OR-group ("35,10762|10751|16" = Comedy AND kid-flavoured). */
@@ -141,7 +147,7 @@ class CatalogRepositoryImpl @Inject constructor(
         sortBy = sortBy,
         voteCountGte = voteFloor,
         airedBefore = airedBefore,
-    ).results.toDomain(MediaType.TV)
+    ).results.toDomain(MediaType.TV).browsable()
 
     /** Alternate movie/TV so a mixed kids rail isn't all-movies-then-all-shows. */
     private fun interleave(a: List<MediaItem>, b: List<MediaItem>): List<MediaItem> = buildList {
@@ -193,7 +199,7 @@ class CatalogRepositoryImpl @Inject constructor(
                         api.trending(mediaType.path(), window = "week", page = page)
                     }
                     // trending/all has no media_type forcing — items carry their own discriminator.
-                    dto.results.toDomain(forcedType = mediaType)
+                    dto.results.toDomain(forcedType = mediaType).browsable()
                 }
             }
         }
@@ -205,7 +211,7 @@ class CatalogRepositoryImpl @Inject constructor(
                     MediaType.MOVIE -> kidMovies("popularity.desc", page, voteFloor = 100)
                     MediaType.TV -> kidTv("popularity.desc", page, voteFloor = 50)
                 } else {
-                    api.popular(mediaType.path(), page).results.toDomain(mediaType)
+                    api.popular(mediaType.path(), page).results.toDomain(mediaType).browsable()
                 }
             }
         }
@@ -217,7 +223,7 @@ class CatalogRepositoryImpl @Inject constructor(
                     MediaType.MOVIE -> kidMovies("vote_average.desc", page, voteFloor = 300)
                     MediaType.TV -> kidTv("vote_average.desc", page, voteFloor = 150)
                 } else {
-                    api.topRated(mediaType.path(), page).results.toDomain(mediaType)
+                    api.topRated(mediaType.path(), page).results.toDomain(mediaType).browsable()
                 }
             }
         }
@@ -240,7 +246,7 @@ class CatalogRepositoryImpl @Inject constructor(
                         MediaType.MOVIE -> api.movieNowPlaying(page)
                         MediaType.TV -> api.tvOnTheAir(page)
                     }
-                    dto.results.toDomain(mediaType)
+                    dto.results.toDomain(mediaType).browsable()
                 }
             }
         }
@@ -256,7 +262,7 @@ class CatalogRepositoryImpl @Inject constructor(
                         mediaType = mediaType.path(),
                         withGenres = genreId.toString(),
                         page = page,
-                    ).results.toDomain(mediaType)
+                    ).results.toDomain(mediaType).browsable()
                 }
             }
         }
@@ -293,7 +299,7 @@ class CatalogRepositoryImpl @Inject constructor(
             result {
                 val dtos = api.similar(mediaType.path(), id).results
                 val safe = if (kids) dtos.filterKidsSafe(forcedType = mediaType) else dtos
-                safe.toDomain(mediaType)
+                safe.toDomain(mediaType).browsable()
             }
         }
 

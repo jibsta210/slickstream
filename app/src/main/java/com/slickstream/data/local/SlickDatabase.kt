@@ -15,7 +15,10 @@ import com.slickstream.data.local.entity.ProfileEntity
 import com.slickstream.data.local.entity.WatchHistoryEntity
 
 @Database(
-    entities = [FavoriteEntity::class, WatchHistoryEntity::class, ProfileEntity::class, DownloadEntity::class],
+    entities = [
+        FavoriteEntity::class, WatchHistoryEntity::class, ProfileEntity::class, DownloadEntity::class,
+        com.slickstream.data.local.entity.SourceStatusEntity::class,
+    ],
     // v3: multi-profile — favorites/watch_history scoped by profileId + a profiles table.
     // v4: profiles gain an avatarIndex (pickable emoji avatar) — migrated in place (see MIGRATION_3_4)
     // so existing profiles/favourites/history are NOT wiped.
@@ -23,7 +26,9 @@ import com.slickstream.data.local.entity.WatchHistoryEntity
     // v6: a downloads table (offline downloads) — MIGRATION_5_6 (additive CREATE TABLE).
     // v7: downloads.fileIndex — which file inside a season-pack torrent, so a resumed pack episode
     //     re-selects the RIGHT file instead of the largest — MIGRATION_6_7 (additive column).
-    version = 7,
+    // v8: source_status table — cached per-title source availability so the catalog stops headlining
+    //     titles with nothing to play — MIGRATION_7_8 (additive CREATE TABLE).
+    version = 8,
     exportSchema = false,
 )
 @TypeConverters(MediaTypeConverter::class)
@@ -32,6 +37,7 @@ abstract class SlickDatabase : RoomDatabase() {
     abstract fun watchHistoryDao(): WatchHistoryDao
     abstract fun profileDao(): ProfileDao
     abstract fun downloadDao(): DownloadDao
+    abstract fun sourceStatusDao(): com.slickstream.data.local.dao.SourceStatusDao
 
     companion object {
         const val NAME = "slickstream.db"
@@ -73,6 +79,18 @@ abstract class SlickDatabase : RoomDatabase() {
         val MIGRATION_6_7 = object : Migration(6, 7) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE downloads ADD COLUMN fileIndex INTEGER")
+            }
+        }
+
+        /** Add the source_status availability cache (additive). */
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS source_status (" +
+                        "mediaId INTEGER NOT NULL, mediaType TEXT NOT NULL, " +
+                        "hasSources INTEGER NOT NULL, checkedAt INTEGER NOT NULL, " +
+                        "PRIMARY KEY(mediaId, mediaType))",
+                )
             }
         }
     }

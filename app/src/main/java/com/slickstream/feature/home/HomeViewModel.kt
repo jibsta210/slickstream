@@ -20,6 +20,8 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -71,6 +73,8 @@ class HomeViewModel @Inject constructor(
     private val profileRepository: ProfileRepository,
     private val settingsRepository: SettingsRepository,
     downloadManager: com.slickstream.data.download.DownloadManager,
+    private val sourceRepository: com.slickstream.core.repository.SourceRepository,
+    private val sourceStatusStore: com.slickstream.data.source.SourceStatusStore,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -436,6 +440,48 @@ class HomeViewModel @Inject constructor(
                 featured = featured,
                 rows = rows,
             )
+            probeHeroCandidates()
+        }
+    }
+
+    /** Verify the HERO candidates actually have something to play — an unreleased film can trend at #1
+     *  with zero sources ("The Odyssey") and headline the hero. Probes only the featured item + the
+     *  first few of the first row, only when their status is unknown/stale, 2 at a time. Results land
+     *  in [sourceStatusStore] (resolve() records them itself), so every FUTURE list filters them at the
+     *  repository with zero latency; any title confirmed empty NOW is stripped from the live state so
+     *  the hero corrects within seconds instead of on the next visit. */
+    private var heroProbeJob: Job? = null
+    private fun probeHeroCandidates() {
+        heroProbeJob?.cancel()
+        heroProbeJob = viewModelScope.launch {
+            val state = _uiState.value
+            val candidates = (listOfNotNull(state.featured) + state.rows.firstOrNull()?.items?.take(4).orEmpty())
+                .distinctBy { "${it.mediaType.name}:${it.id}" }
+                .filter { sourceStatusStore.shouldProbe(it.id, it.mediaType) }
+            if (candidates.isEmpty()) return@launch
+            val gate = Semaphore(2)
+            candidates.map { item ->
+                viewModelScope.async {
+                    gate.withPermit {
+                        runCatching {
+                            val d = (catalogRepository.getDetails(item.id, item.mediaType) as? DataResult.Success)
+                                ?.data ?: return@withPermit
+                            val season = if (item.mediaType == MediaType.TV) 1 else null
+                            // resolve() piggybacks the availability verdict into the store on success.
+                            sourceRepository.resolve(d, season, season)
+                        }
+                    }
+                }
+            }.awaitAll()
+            // Strip anything now KNOWN empty from the live rows + hero (visible correction).
+            val cleaned = _uiState.value.rows
+                .map { row -> row.copy(items = sourceStatusStore.filterBrowsable(row.items)) }
+                .filter { it.items.isNotEmpty() }
+            val fea = _uiState.value.featured
+                ?.takeUnless { sourceStatusStore.isKnownEmpty(it.id, it.mediaType) }
+                ?: cleaned.asSequence().flatMap { it.items.asSequence() }
+                    .firstOrNull { !it.backdropUrl.isNullOrBlank() }
+            _uiState.update { it.copy(rows = cleaned, featured = fea) }
         }
     }
 
