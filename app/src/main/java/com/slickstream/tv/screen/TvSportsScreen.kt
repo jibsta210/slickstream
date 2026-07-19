@@ -202,6 +202,8 @@ private fun TvEventList(events: List<SportEvent>, loading: Boolean, error: Strin
             contentPadding = PaddingValues(bottom = 48.dp, end = 24.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
+            // events are deduped by id in the ViewModel, so this key is collision-free (a duplicate
+            // provider id used to crash the grid with "Key was already used").
             gridItems(events, key = { it.id }) { event -> TvEventCard(event, onClick) }
         }
     }

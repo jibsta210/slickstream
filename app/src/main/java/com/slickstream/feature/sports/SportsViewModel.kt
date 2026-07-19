@@ -62,8 +62,9 @@ class SportsViewModel @Inject constructor(
         viewModelScope.launch {
             when (val r = repo.categories()) {
                 is DataResult.Success -> {
-                    val first = r.data.firstOrNull()
-                    _state.update { it.copy(categories = r.data, loadingCategories = false) }
+                    val cats = r.data.distinctBy { it.id }
+                    val first = cats.firstOrNull()
+                    _state.update { it.copy(categories = cats, loadingCategories = false) }
                     first?.let { select(it.id) }
                 }
                 is DataResult.Error ->
@@ -82,7 +83,11 @@ class SportsViewModel @Inject constructor(
         _state.update { it.copy(selectedId = categoryId, loadingEvents = true, events = emptyList(), error = null) }
         eventsJob = viewModelScope.launch {
             when (val r = repo.events(categoryId)) {
-                is DataResult.Success -> _state.update { it.copy(events = r.data, loadingEvents = false) }
+                // distinctBy id: the provider lists the SAME PPV event in multiple categories (and
+                // sometimes twice in "Live now"), and the events grid keys on id — a duplicate id made
+                // Compose's LazyColumn/Row throw IllegalArgumentException (the instant Android-TV sports
+                // crash on stream select, once a recompose re-measured the list).
+                is DataResult.Success -> _state.update { it.copy(events = r.data.distinctBy { e -> e.id }, loadingEvents = false) }
                 is DataResult.Error -> _state.update { it.copy(loadingEvents = false, error = r.message) }
             }
         }
@@ -95,7 +100,8 @@ class SportsViewModel @Inject constructor(
         viewModelScope.launch {
             when (val r = repo.streams(event)) {
                 is DataResult.Success -> _sheet.update {
-                    it?.copy(loading = false, streams = r.data, error = if (r.data.isEmpty()) "No live feeds for this event yet." else null)
+                    val streams = r.data.distinctBy { s -> s.id }   // same guard for the feed list's keys
+                    it?.copy(loading = false, streams = streams, error = if (streams.isEmpty()) "No live feeds for this event yet." else null)
                 }
                 is DataResult.Error -> _sheet.update { it?.copy(loading = false, error = r.message) }
             }
