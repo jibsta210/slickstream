@@ -548,13 +548,22 @@ class TorrentEngine @Inject constructor(
     /** Read previously-cached bencoded metadata for [hash] (written by an older build), or null. */
     private fun loadCachedMetadata(hash: String): TorrentInfo? {
         val cached = metadataFileFor(hash).takeIf { it.exists() } ?: return null
-        return runCatching { TorrentInfo.bdecode(cached.readBytes()) }.getOrNull()
+        val info = runCatching { TorrentInfo.bdecode(cached.readBytes()) }.getOrNull()
+        // SELF-HEAL poisoned caches: builds hit by the empty-file-table bug persisted .meta files with
+        // numFiles=0 — a cache hit on one re-fails the add forever. Parse-but-fileless = delete + refetch.
+        if (info == null || runCatching { info.files().numFiles() }.getOrDefault(0) <= 0) {
+            runCatching { cached.delete() }
+            return null
+        }
+        return info
     }
 
     /** Persist a minimal .torrent immediately after the first successful metadata exchange. Without
      *  this, the separately-saved resume blob is unreachable after process death because reopening a
      *  magnet first needs the same metadata all over again. */
     private fun persistMetadata(infoHash: String, info: TorrentInfo, handle: TorrentHandle) {
+        // Never persist a file-less info — a poisoned .meta re-breaks this hash on every future open.
+        if (runCatching { info.files().numFiles() }.getOrDefault(0) <= 0) return
         runCatching {
             val params = AddTorrentParams().apply {
                 setTorrentInfo(info)
@@ -601,8 +610,14 @@ class TorrentEngine @Inject constructor(
                 runCatching {
                     if (handle.status().hasMetadata()) {
                         // The plain torrentFile() view may omit v2/hybrid piece layers, making
-                        // write_torrent_file fail and silently defeating cold metadata reuse.
-                        handle.torrentFileWithHashes() ?: handle.torrentFile()
+                        // write_torrent_file fail and silently defeating cold metadata reuse — BUT
+                        // torrentFileWithHashes() can itself hand back a valid-looking info whose FILE
+                        // TABLE is EMPTY (numFiles=0). Trusting it made selectFile see "no video files"
+                        // and throw archive/RAR for EVERY torrent of EVERY title — the "cannot find any
+                        // sources for Alien Covenant" outage. Only accept an info that actually carries
+                        // files; otherwise keep polling until one does.
+                        listOfNotNull(handle.torrentFileWithHashes(), handle.torrentFile())
+                            .firstOrNull { i -> runCatching { i.files().numFiles() > 0 }.getOrDefault(false) }
                     } else null
                 }.getOrNull()
             }
@@ -781,7 +796,13 @@ class TorrentEngine @Inject constructor(
         val chosen = episodeMatch ?: prefValid ?: largestVideo?.takeIf {
             expectedSeason == null || expectedEpisode == null || playableVideos.size == 1
         }
-            ?: error("No playable video file in this torrent (archive/RAR release)")
+            ?: run {
+                val names = (0 until minOf(numFiles, 8)).joinToString { files.fileName(it) }
+                error(
+                    "No playable video file in this torrent (archive/RAR release) — " +
+                        "numFiles=$numFiles s=$expectedSeason e=$expectedEpisode pref=$preferredFileIndex files=[$names]",
+                )
+            }
 
         active.fileIndex = chosen
         active.fileLength = files.fileSize(chosen)
