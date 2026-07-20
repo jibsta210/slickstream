@@ -105,7 +105,7 @@ fun TvSearchScreen(
             // No background here — TvApp's shell already fills Brand.Background; repeating it was
             // a second full-screen fill pass per frame on a fill-rate-bound GPU.
             // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(start = 48.dp, end = 48.dp, top = 27.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         Text(
@@ -114,8 +114,12 @@ fun TvSearchScreen(
             color = Brand.OnSurface,
         )
 
+        // Once results are on screen the giant voice hero is pure overhead — on a 540dp-tall TV it
+        // squeezed the grid to a single clipped row. Collapse it (and the prompt) while browsing.
+        val hasResults = state.results.isNotEmpty()
+
         // --- Voice-first hero -------------------------------------------------
-        Box(
+        if (!hasResults) Box(
             modifier = Modifier.fillMaxWidth(),
             contentAlignment = Alignment.Center,
         ) {
@@ -145,15 +149,17 @@ fun TvSearchScreen(
             state.query.isNotBlank() -> "\"${state.query}\""
             else -> "Press the mic and say a title, actor, or genre"
         }
-        Text(
-            text = transcript,
-            style = MaterialTheme.typography.titleMedium,
-            color = if (voice.error != null && !voice.isListening) Brand.Error else Brand.OnSurfaceDim,
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.fillMaxWidth(),
-        )
+        if (!hasResults) {
+            Text(
+                text = transcript,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (voice.error != null && !voice.isListening) Brand.Error else Brand.OnSurfaceDim,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
 
         // Optional on-screen text entry.
         if (showKeyboard) {
@@ -276,15 +282,27 @@ private fun ResultsGrid(
     results: List<MediaItem>,
     onMediaClick: (MediaItem) -> Unit,
 ) {
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = 150.dp),
-        contentPadding = PaddingValues(top = 8.dp, bottom = 32.dp),
-        horizontalArrangement = Arrangement.spacedBy(20.dp),
-        verticalArrangement = Arrangement.spacedBy(24.dp),
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        items(results, key = { "${it.mediaType.name}-${it.id}" }) { item ->
-            TvPosterCard(item = item, onClick = onMediaClick, fillCell = true, modifier = Modifier.fillMaxWidth())
+    // Size cards FROM THE VIEWPORT so a whole card (poster + title + year) fits and ~2 rows show —
+    // a fixed 150dp minimum overflowed a 960x540dp TV and cut the titles off.
+    androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+        val hGap = 16.dp
+        val vGap = 18.dp
+        val textBlock = 46.dp
+        val rowHeight = (maxHeight - vGap) / 2
+        val posterHeight = (rowHeight - textBlock).coerceAtLeast(80.dp)
+        val targetCardWidth = (posterHeight * (2f / 3f)).coerceIn(90.dp, 165.dp)
+        val columns = kotlin.math.ceil(maxWidth / (targetCardWidth + hGap)).toInt().coerceAtLeast(3)
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(columns),
+            contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+            horizontalArrangement = Arrangement.spacedBy(hGap),
+            verticalArrangement = Arrangement.spacedBy(vGap),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            items(results, key = { "${it.mediaType.name}-${it.id}" }) { item ->
+                TvPosterCard(item = item, onClick = onMediaClick, fillCell = true, modifier = Modifier.fillMaxWidth())
+            }
         }
     }
 }

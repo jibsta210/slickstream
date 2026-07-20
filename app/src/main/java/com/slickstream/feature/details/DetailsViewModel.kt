@@ -51,6 +51,8 @@ data class DetailsUiState(
     /** True only when this movie has a real unfinished position, so the UI can offer Resume AND
      *  an explicit Start from beginning action. Always false for TV titles. */
     val hasMovieResume: Boolean = false,
+    /** True when the series' resume target is a PART-WATCHED episode (so "Start over" is meaningful). */
+    val hasEpisodeResume: Boolean = false,
     /** Where the main Play button should go: the in-progress episode (Resume), the next episode after
      *  the last one you finished (Play SxEy), or the first episode if nothing's been watched. */
     val resumeTarget: ResumeTarget? = null,
@@ -212,12 +214,21 @@ class DetailsViewModel @Inject constructor(
                 }
             }
         }
-        val hasMovieResume = mediaType == MediaType.MOVIE &&
-            latest != null && latest.progress.positionMs > 0L && !latest.progress.isFinished
-        if (target != state.resumeTarget || hasMovieResume != state.hasMovieResume) {
+        // "Start over" is offered whenever the thing Play would RESUME is genuinely part-watched —
+        // for a movie, and (new) for a series whose resume target is the in-progress episode. It is
+        // NOT offered when Play would start something fresh (next episode / never watched), where
+        // restarting is a no-op.
+        val partWatched = latest != null && latest.progress.positionMs > 0L && !latest.progress.isFinished
+        val hasMovieResume = mediaType == MediaType.MOVIE && partWatched
+        val hasEpisodeResume = mediaType == MediaType.TV && partWatched
+        if (target != state.resumeTarget ||
+            hasMovieResume != state.hasMovieResume ||
+            hasEpisodeResume != state.hasEpisodeResume
+        ) {
             _uiState.value = _uiState.value.copy(
                 resumeTarget = target,
                 hasMovieResume = hasMovieResume,
+                hasEpisodeResume = hasEpisodeResume,
             )
         }
     }

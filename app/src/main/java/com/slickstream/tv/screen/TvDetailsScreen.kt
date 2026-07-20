@@ -79,7 +79,7 @@ import com.slickstream.ui.theme.Brand
 @Composable
 fun TvDetailsScreen(
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
-    onStartOver: (MediaType, Int) -> Unit,
+    onStartOver: (MediaType, Int, Int?, Int?) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -123,7 +123,7 @@ private fun DetailsContent(
     downloadState: com.slickstream.core.model.Download?,
     seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
-    onStartOver: (MediaType, Int) -> Unit,
+    onStartOver: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
     onSelectSeason: (Int) -> Unit,
     onMediaClick: (MediaItem) -> Unit,
@@ -140,7 +140,13 @@ private fun DetailsContent(
     val item = details.item
 
     // No screen-level background — TvApp's shell already fills Brand.Background.
-    Box(modifier = modifier.fillMaxSize()) {
+    androidx.compose.foundation.layout.BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+        // The hero (title -> Play) must fit the VIEWPORT. A fixed 560dp backdrop + 220dp top inset was
+        // taller than a 960x540dp TV, so focusing Play scrolled the list and pushed the TITLE off the
+        // top — the "description starts at the very top, no title" bug. Derive both from the height.
+        val shortViewport = maxHeight < 620.dp
+        val backdropHeight = (maxHeight * 0.78f).coerceIn(240.dp, 560.dp)
+        val heroTopInset = if (shortViewport) 32.dp else (maxHeight * 0.28f).coerceIn(56.dp, 220.dp)
         // Backdrop fills the top of the screen, fading into the background.
         val context = LocalContext.current
         val backdropRequest = remember(item.backdropUrl, item.posterUrl) {
@@ -156,7 +162,7 @@ private fun DetailsContent(
             contentScale = ContentScale.Crop,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(560.dp),
+                .height(backdropHeight),
         )
         // Both scrims in ONE draw node, bounded to the 560dp hero (the horizontal one used to be a
         // fillMaxSize layer under the scrolling list — a full-screen composite re-blended every
@@ -164,7 +170,7 @@ private fun DetailsContent(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(560.dp)
+                .height(backdropHeight)
                 .drawWithCache {
                     val vertical = Brush.verticalGradient(
                         0.3f to Color.Transparent,
@@ -185,11 +191,12 @@ private fun DetailsContent(
 
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(top = 220.dp, bottom = 48.dp),
-            verticalArrangement = Arrangement.spacedBy(28.dp),
+            contentPadding = PaddingValues(top = heroTopInset, bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(if (shortViewport) 18.dp else 28.dp),
         ) {
             item(key = "hero") {
                 HeroBlock(
+                    compact = shortViewport,
                     state = state,
                     isFavorite = isFavorite,
                     downloadState = downloadState,
@@ -325,12 +332,14 @@ private fun TvCastRow(cast: List<com.slickstream.core.model.CastMember>) {
 
 @Composable
 private fun HeroBlock(
+    /** Short viewport (e.g. 960x540dp TV): tighten spacing + overview so title..Play all fit. */
+    compact: Boolean = false,
     state: DetailsUiState,
     isFavorite: Boolean,
     downloadState: com.slickstream.core.model.Download?,
     seasonDownloads: Map<Int, com.slickstream.core.model.Download>,
     onPlay: (MediaType, Int, Int?, Int?) -> Unit,
-    onStartOver: (MediaType, Int) -> Unit,
+    onStartOver: (MediaType, Int, Int?, Int?) -> Unit,
     onToggleFavorite: () -> Unit,
     onMarkMovieWatched: () -> Unit,
     onMarkMovieUnwatched: () -> Unit,
@@ -356,7 +365,7 @@ private fun HeroBlock(
         modifier = Modifier
             .fillMaxWidth(0.62f)
             .padding(start = 48.dp, end = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
+        verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 14.dp),
     ) {
         Text(
             text = item.title,
@@ -367,14 +376,18 @@ private fun HeroBlock(
             overflow = TextOverflow.Ellipsis,
         )
 
-        details.tagline?.takeIf { it.isNotBlank() }?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.titleMedium,
-                color = Brand.Cyan,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+        // Tagline is the first thing to go on a short viewport — it buys the vertical slack that keeps
+        // the TITLE on screen when focus scrolls the list to reveal Play.
+        if (!compact) {
+            details.tagline?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Brand.Cyan,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -409,7 +422,7 @@ private fun HeroBlock(
             text = item.overview,
             style = MaterialTheme.typography.bodyLarge,
             color = Brand.OnSurface.copy(alpha = 0.92f),
-            maxLines = 4,
+            maxLines = if (compact) 2 else 4,
             overflow = TextOverflow.Ellipsis,
         )
 
@@ -447,8 +460,16 @@ private fun HeroBlock(
                     )
                 }
 
-                if (!state.isTv && state.hasMovieResume) {
-                    DetailsActionButton(onClick = { onStartOver(MediaType.MOVIE, item.id) }) {
+                // Start over sits right beside Resume — for a part-watched MOVIE and (new) a
+                // part-watched EPISODE, where Play resumes mid-way and there was no way to restart it.
+                if (state.hasMovieResume || state.hasEpisodeResume) {
+                    val rt = state.resumeTarget
+                    DetailsActionButton(
+                        onClick = {
+                            if (state.isTv) onStartOver(MediaType.TV, item.id, rt?.season, rt?.episode)
+                            else onStartOver(MediaType.MOVIE, item.id, null, null)
+                        },
+                    ) {
                         Icon(
                             imageVector = Icons.Rounded.Replay,
                             contentDescription = null,

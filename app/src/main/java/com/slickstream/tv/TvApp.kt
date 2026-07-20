@@ -263,8 +263,8 @@ fun TvApp() {
                                 onPlay = { type, id, season, episode ->
                                     openPlayer(type, id, season, episode)
                                 },
-                                onStartOver = { type, id ->
-                                    openPlayer(type, id, startOver = true)
+                                onStartOver = { type, id, season, episode ->
+                                    openPlayer(type, id, season, episode, startOver = true)
                                 },
                                 onMediaClick = ::openDetails,
                                 onBack = { navController.popBackStack() },

@@ -85,8 +85,11 @@ fun TvCategoryScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            // 10-foot SAFE AREA. TvApp deliberately applies ZERO shell inset (so backdrops/video can
+            // bleed to the physical edge), so every full-screen route must supply its own margin —
+            // without it the title sat ON the top edge and the first poster on the left edge, and TV
+            // overscan cropped them. ~5% of 1920x1080 is the broadcast-standard safe area.
+            .padding(start = 48.dp, end = 48.dp, top = 27.dp, bottom = 12.dp),
     ) {
         Text(
             text = "$genreName  ·  ${if (mediaType == MediaType.MOVIE) "Movies" else "TV"}",
@@ -125,25 +128,43 @@ fun TvCategoryScreen(
                     color = Brand.OnSurfaceDim,
                 )
             }
-            else -> LazyVerticalGrid(
-                state = gridState,
-                columns = GridCells.Adaptive(minSize = 150.dp),
-                contentPadding = PaddingValues(top = 4.dp, bottom = 48.dp),
-                horizontalArrangement = Arrangement.spacedBy(20.dp),
-                verticalArrangement = Arrangement.spacedBy(24.dp),
-                modifier = Modifier.fillMaxSize(),
-            ) {
-                itemsIndexed(visibleItems, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
-                    TvPosterCard(
-                        item = item,
-                        onClick = onMediaClick,
-                        fillCell = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
-                    )
+            // Size the cards FROM THE VIEWPORT so a whole card (poster + title + year) always fits and
+            // ~2 rows are visible. A fixed 150dp minimum made each poster ~285dp tall on a 960x540dp
+            // TV — one row plus a sliced-off second, with the titles cut off ("bleeds over the edges").
+            else -> androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+                val hGap = 16.dp
+                val vGap = 18.dp
+                val textBlock = 46.dp          // title + year rendered UNDER the poster
+                val rowHeight = (maxHeight - vGap) / TARGET_ROWS
+                val posterHeight = (rowHeight - textBlock).coerceAtLeast(80.dp)
+                // 2:3 poster -> width, clamped so it stays legible at 10 feet but never overflows.
+                val targetCardWidth = (posterHeight * (2f / 3f)).coerceIn(90.dp, 165.dp)
+                // Ceil so each cell ends up <= target (Adaptive would round the other way and overflow).
+                val columns = kotlin.math.ceil(maxWidth / (targetCardWidth + hGap)).toInt().coerceAtLeast(3)
+
+                LazyVerticalGrid(
+                    state = gridState,
+                    columns = GridCells.Fixed(columns),
+                    contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(hGap),
+                    verticalArrangement = Arrangement.spacedBy(vGap),
+                    modifier = Modifier.fillMaxSize(),
+                ) {
+                    itemsIndexed(visibleItems, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
+                        TvPosterCard(
+                            item = item,
+                            onClick = onMediaClick,
+                            fillCell = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
+                        )
+                    }
                 }
             }
         }
     }
 }
+
+/** How many poster rows the category/search grids aim to fit in the viewport at once. */
+private const val TARGET_ROWS = 2
