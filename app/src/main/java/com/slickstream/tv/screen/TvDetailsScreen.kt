@@ -146,7 +146,7 @@ private fun DetailsContent(
         // top — the "description starts at the very top, no title" bug. Derive both from the height.
         val shortViewport = maxHeight < 620.dp
         val backdropHeight = (maxHeight * 0.78f).coerceIn(240.dp, 560.dp)
-        val heroTopInset = if (shortViewport) 32.dp else (maxHeight * 0.28f).coerceIn(56.dp, 220.dp)
+        val heroTopInset = if (shortViewport) 48.dp else (maxHeight * 0.28f).coerceIn(56.dp, 220.dp)
         // Backdrop fills the top of the screen, fading into the background.
         val context = LocalContext.current
         val backdropRequest = remember(item.backdropUrl, item.posterUrl) {
@@ -189,7 +189,21 @@ private fun DetailsContent(
                 },
         )
 
+        // Landing focus on Play makes Compose bringIntoView-scroll the list, which ate the top inset
+        // and clipped the TITLE. The hero fits the viewport, so once focus has settled we simply undo
+        // any offset WITHIN the hero item — the title keeps its margin and Play stays visible/focused.
+        val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+        androidx.compose.runtime.LaunchedEffect(item.id) {
+            repeat(6) {
+                kotlinx.coroutines.delay(150)
+                if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset > 0) {
+                    runCatching { listState.scrollToItem(0) }
+                }
+            }
+        }
+
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = heroTopInset, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(if (shortViewport) 18.dp else 28.dp),

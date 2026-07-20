@@ -76,7 +76,7 @@ fun TvFavoritesScreen(
             .fillMaxSize()
             .background(Brand.Background)
             // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(start = 48.dp, end = 48.dp, top = 27.dp, bottom = 12.dp),
     ) {
         Text(
             text = "Favorites",
@@ -93,25 +93,37 @@ fun TvFavoritesScreen(
                     selected = state.filter,
                     onSelect = viewModel::setFilter,
                 )
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 150.dp),
-                    contentPadding = PaddingValues(top = 8.dp, bottom = 40.dp),
-                    horizontalArrangement = Arrangement.spacedBy(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(24.dp),
-                    modifier = Modifier.fillMaxSize(),
-                ) {
-                    itemsIndexed(
-                        state.filtered.map { it.media },
-                        key = { _, it -> "${it.mediaType.name}-${it.id}" },
-                    ) { index, item ->
-                        TvPosterCard(
-                            item = item,
-                            onClick = onMediaClick,
-                            fillCell = true,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
-                        )
+                // Same viewport-derived sizing as the category/search grids — a fixed 150dp minimum
+                // made favourites huge on a 540dp-tall TV (one clipped row).
+                androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val hGap = 16.dp
+                    val vGap = 18.dp
+                    val textBlock = 46.dp
+                    val rowHeight = (maxHeight - vGap) / 2
+                    val posterHeight = (rowHeight - textBlock).coerceAtLeast(80.dp)
+                    val targetCardWidth = (posterHeight * (2f / 3f)).coerceIn(90.dp, 165.dp)
+                    val columns = kotlin.math.ceil(maxWidth / (targetCardWidth + hGap)).toInt().coerceAtLeast(3)
+
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(columns),
+                        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+                        horizontalArrangement = Arrangement.spacedBy(hGap),
+                        verticalArrangement = Arrangement.spacedBy(vGap),
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        itemsIndexed(
+                            state.filtered.map { it.media },
+                            key = { _, it -> "${it.mediaType.name}-${it.id}" },
+                        ) { index, item ->
+                            TvPosterCard(
+                                item = item,
+                                onClick = onMediaClick,
+                                fillCell = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
+                            )
+                        }
                     }
                 }
             }
