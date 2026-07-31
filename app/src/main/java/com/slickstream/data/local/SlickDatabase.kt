@@ -28,7 +28,9 @@ import com.slickstream.data.local.entity.WatchHistoryEntity
     //     re-selects the RIGHT file instead of the largest — MIGRATION_6_7 (additive column).
     // v8: source_status table — cached per-title source availability so the catalog stops headlining
     //     titles with nothing to play — MIGRATION_7_8 (additive CREATE TABLE).
-    version = 8,
+    // v9: source_status.camOnly — is EVERY playable release a CAM/TS cinema-rip, so cards can badge
+    //     "CAM" — MIGRATION_8_9 (additive column).
+    version = 9,
     exportSchema = false,
 )
 @TypeConverters(MediaTypeConverter::class)
@@ -91,6 +93,13 @@ abstract class SlickDatabase : RoomDatabase() {
                         "hasSources INTEGER NOT NULL, checkedAt INTEGER NOT NULL, " +
                         "PRIMARY KEY(mediaId, mediaType))",
                 )
+            }
+        }
+
+        /** Add source_status.camOnly (default 0) — is every playable release a CAM cinema-rip. Additive. */
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE source_status ADD COLUMN camOnly INTEGER NOT NULL DEFAULT 0")
             }
         }
     }

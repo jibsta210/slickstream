@@ -162,6 +162,12 @@ fun TvSettingsScreen(
         }
 
         item {
+            TvSettingSection("Content") {
+                TvOptionRow("Hide Indian films & TV", listOf(true, false), settings.hideIndianContent, { if (it) "On" else "Off" }, viewModel::setHideIndianContent)
+            }
+        }
+
+        item {
             TvSettingSection("Subtitles") {
                 TvOptionRow("Show by default", listOf(true, false), settings.subtitlesEnabled, { if (it) "On" else "Off" }, viewModel::setSubtitlesEnabled)
                 TvOptionRow("Preferred language", SubtitleLanguage.entries, settings.subtitleLanguage, { it.label }, viewModel::setSubtitleLanguage)

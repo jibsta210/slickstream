@@ -33,4 +33,6 @@ data class MediaListItemDto(
     @SerialName("backdrop_path") val backdropPath: String? = null,
     @SerialName("vote_average") val voteAverage: Double? = null,
     @SerialName("genre_ids") val genreIds: List<Int>? = null,
+    /** ISO-639-1 original language ("en", "hi", "ta"…) — used to hide Indian-language content. */
+    @SerialName("original_language") val originalLanguage: String? = null,
 )

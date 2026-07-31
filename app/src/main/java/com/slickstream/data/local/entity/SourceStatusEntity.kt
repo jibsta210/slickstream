@@ -14,5 +14,7 @@ data class SourceStatusEntity(
     val mediaId: Int,
     val mediaType: MediaType,
     val hasSources: Boolean,
+    /** True when every playable source found for this title was a CAM/TS cinema-rip (only-CAM). */
+    val camOnly: Boolean = false,
     val checkedAt: Long,
 )

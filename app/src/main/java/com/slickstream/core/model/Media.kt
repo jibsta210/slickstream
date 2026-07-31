@@ -32,6 +32,7 @@ data class MediaItem(
     val releaseDate: String?,    // "YYYY-MM-DD"
     val genreIds: List<Int> = emptyList(),
     val imdbId: String? = null,  // populated on details fetch ("tt1234567")
+    val originalLanguage: String? = null,  // ISO-639-1 ("en","hi","ta"…), for the region filter
 ) {
     val year: String? get() = releaseDate?.takeIf { it.length >= 4 }?.substring(0, 4)
 }

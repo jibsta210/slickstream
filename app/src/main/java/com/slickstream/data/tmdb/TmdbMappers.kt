@@ -62,6 +62,7 @@ internal fun MediaListItemDto.toDomain(forcedType: MediaType?): MediaItem {
         voteAverage = voteAverage ?: 0.0,
         releaseDate = date,
         genreIds = genreIds.orEmpty(),
+        originalLanguage = originalLanguage,
     )
 }
 

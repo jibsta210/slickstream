@@ -149,6 +149,8 @@ data class AppSettings(
     /** Within [downloadQuality], bias downloads toward smaller files vs best bitrate. Default SMALLEST
      *  (the "cache a season in 720p/300 MB" case). */
     val downloadSize: StreamSizePreference = StreamSizePreference.SMALLEST,
+    /** Hide Indian-language films & TV (Hindi/Tamil/Telugu/…) from every listing. Per-device. */
+    val hideIndianContent: Boolean = false,
 )
 
 /** Screen-calibration triple (uniform scale + dp shift) used for the live, in-memory preview. */
@@ -216,6 +218,7 @@ class SettingsRepository @Inject constructor(
             downloadQuality = p[KEY_DL_QUALITY].toQuality(QualityPreference.HD_720),
             downloadSize = p[KEY_DL_SIZE]?.let { runCatching { StreamSizePreference.valueOf(it) }.getOrNull() }
                 ?: StreamSizePreference.SMALLEST,
+            hideIndianContent = p[KEY_HIDE_INDIAN] ?: false,
         )
     }
 
@@ -236,6 +239,7 @@ class SettingsRepository @Inject constructor(
     suspend fun setMaxCacheSize(size: CacheSize) = dataStore.edit { it[KEY_MAX_CACHE] = size.name }
     suspend fun setDownloadQuality(q: QualityPreference) = dataStore.edit { it[KEY_DL_QUALITY] = q.name }
     suspend fun setDownloadSize(s: StreamSizePreference) = dataStore.edit { it[KEY_DL_SIZE] = s.name }
+    suspend fun setHideIndianContent(hide: Boolean) = dataStore.edit { it[KEY_HIDE_INDIAN] = hide }
     suspend fun setCustomSourceUrl(url: String) = dataStore.edit {
         it[KEY_CUSTOM_SOURCE] = url.trim()
         it.stampSynced()
@@ -326,6 +330,7 @@ class SettingsRepository @Inject constructor(
         val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
         val KEY_MAX_CACHE = stringPreferencesKey("max_cache_size")
         val KEY_CUSTOM_SOURCE = stringPreferencesKey("custom_source_url")
+        val KEY_HIDE_INDIAN = booleanPreferencesKey("hide_indian_content")
         val KEY_DL_QUALITY = stringPreferencesKey("download_quality")
         val KEY_DL_SIZE = stringPreferencesKey("download_size")
         val KEY_UP_NEXT_PCT = intPreferencesKey("up_next_pct")

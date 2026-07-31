@@ -236,14 +236,20 @@ object StreamPicker {
     /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */
     fun looksPlayable(text: String): Boolean = !BAD_CODEC.containsMatchIn(text)
 
-    // CAM-class source markers: a cinema-filmed rip (CAM/CAMRIP/HDCAM), a telesync (TS/HDTS/TELESYNC) or
-    // a telecine (TC/TELECINE) — terrible quality, common for brand-new releases. NO screener (SCR) — it's
-    // frequently a clean high-bitrate source, so badging it CAM would mislead. The short tags TS/TC are
-    // word-bounded and applied only AFTER the movie's own title words are stripped (so the 2018 film "Cam"
-    // or a title containing "ts" isn't flagged). Still slightly fuzzy on a literal ".ts" container hint,
-    // but a real telesync is the far more likely meaning in a release name.
+    // CAM-class source markers: a cinema-filmed rip (CAM/CAMRIP/HDCAM/HQCAM/CAMHD), a telesync
+    // (TS/HDTS/TELESYNC), a telecine (TC/TELECINE/HDTC) or an early cammed DVD (PDVD/PreDVDRip) —
+    // terrible quality, common for brand-new releases. NO screener (SCR) — it's frequently a clean
+    // high-bitrate source, so badging it CAM would mislead. The short tags TS/TC are word-bounded and
+    // applied only AFTER the movie's own title words are stripped (so the 2018 film "Cam" or a title
+    // containing "ts" isn't flagged). Still slightly fuzzy on a literal ".ts" container hint, but a
+    // real telesync is the far more likely meaning in a release name.
     private val CAM_MARKERS = Regex(
-        "(?i)\\b(cam|camrip|hdcam|hd-?cam|ts|hdts|hd-?ts|telesync|tc|telecine)\\b",
+        "(?i)\\b(" +
+            "cam|camrip|hd-?cam|hq-?cam|cam-?hd|cam-?rip|" +   // camcorder rips
+            "ts|hd-?ts|hq-?ts|telesync|hd-?telesync|" +        // telesync
+            "tc|hd-?tc|telecine|hd-?telecine|" +               // telecine
+            "pdvd|pre-?dvd(rip)?|dvdcam" +                     // early cammed DVD rips (NOT DVDSCR — often clean)
+        ")\\b",
     )
 
     /** True when the release name marks it a CAM/TS/TELESYNC (title-word-aware, like [noForeignTag]). */

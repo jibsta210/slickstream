@@ -42,7 +42,10 @@ import androidx.tv.material3.Text
 import coil.compose.AsyncImage
 import com.slickstream.core.common.Img
 import com.slickstream.core.model.MediaItem
+import com.slickstream.ui.components.CamBadgeSmall
+import com.slickstream.ui.components.LocalCamOnlyKeys
 import com.slickstream.ui.components.RatingBadge
+import com.slickstream.ui.components.isCamOnly
 import com.slickstream.ui.components.shimmer
 import com.slickstream.ui.theme.Brand
 
@@ -195,6 +198,15 @@ fun TvPosterCard(
                         vote = item.voteAverage,
                         modifier = Modifier
                             .align(Alignment.TopEnd)
+                            .padding(6.dp),
+                    )
+                }
+
+                // Only-CAM warning, top-left — the sole release is a bad cinema cam.
+                if (LocalCamOnlyKeys.current.isCamOnly(item)) {
+                    CamBadgeSmall(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
                             .padding(6.dp),
                     )
                 }

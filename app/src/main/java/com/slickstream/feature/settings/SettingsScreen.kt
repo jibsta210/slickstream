@@ -213,6 +213,18 @@ fun SettingsScreen(
             Hint("Compact fits more on screen; Spacious makes everything larger. Applies instantly across the whole app.")
         }
 
+        SettingsSection("Content") {
+            OptionGroup(
+                label = "Hide Indian films & TV",
+                options = listOf(true, false),
+                selected = settings.hideIndianContent,
+                labelOf = { if (it) "On" else "Off" },
+                onSelect = viewModel::setHideIndianContent,
+            )
+            Spacer(Modifier.height(6.dp))
+            Hint("Hides Hindi, Tamil, Telugu, Malayalam and other Indian-language titles from every listing — Home, Movies, TV and search. Doesn't affect anything you've already saved.")
+        }
+
         SettingsSection("Subtitles") {
             OptionGroup(
                 label = "Show subtitles by default",

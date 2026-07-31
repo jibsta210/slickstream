@@ -68,6 +68,9 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var diagnostics: com.slickstream.core.diagnostics.Diagnostics
 
+    @Inject
+    lateinit var sourceStatusStore: com.slickstream.data.source.SourceStatusStore
+
     // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
     private val onTv: Boolean get() = deviceProfile.isTv
 
@@ -183,10 +186,14 @@ class MainActivity : ComponentActivity() {
                 offsetY = settings.screenOffsetY,
             )
             val base = LocalDensity.current
+            // Titles whose only playable sources are CAM rips — cards read this to show a "CAM" badge.
+            val camOnlyKeys by sourceStatusStore.camOnlyKeys
+                .collectAsStateWithLifecycle()
             CompositionLocalProvider(
                 // Scale dp (and therefore sp) uniformly — a true "DPI" change.
                 LocalDensity provides Density(base.density * settings.density.scale, base.fontScale),
                 LocalPipController provides pipController,
+                com.slickstream.ui.components.LocalCamOnlyKeys provides camOnlyKeys,
             ) {
                 SlickStreamTheme {
                     Box(Modifier.fillMaxSize()) {

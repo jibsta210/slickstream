@@ -12,7 +12,10 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import retrofit2.HttpException
 import java.io.IOException
@@ -29,14 +32,34 @@ class CatalogRepositoryImpl @Inject constructor(
     private val api: TmdbApi,
     private val profiles: com.slickstream.core.repository.ProfileRepository,
     private val sourceStatus: com.slickstream.data.source.SourceStatusStore,
+    private val settings: com.slickstream.data.settings.SettingsRepository,
 ) : CatalogRepository {
 
     private val io: CoroutineDispatcher = Dispatchers.IO
 
+    // Live mirror of the "hide Indian content" toggle so the sync list filters add zero latency.
+    @Volatile private var hideIndian = false
+    init {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching { settings.settings.collect { hideIndian = it.hideIndianContent } }
+        }
+    }
+
+    /** Original-language codes treated as "Indian content" for the hide-Indian-content filter. */
+    private val INDIAN_LANGS = setOf("hi", "ta", "te", "ml", "kn", "bn", "pa", "gu", "mr", "or", "as")
+
     /** Drop titles RECENTLY confirmed to have no playable sources (an unreleased film trending at #1
-     *  must not headline the hero). Synchronous in-memory lookup — adds zero latency; unknown titles
-     *  pass so lists never wait on an indexer. Applied to every list this repository returns. */
-    private fun List<MediaItem>.browsable(): List<MediaItem> = sourceStatus.filterBrowsable(this)
+     *  must not headline the hero) AND — when the user opted in — Indian-language films/TV. Synchronous
+     *  in-memory lookups, zero latency; unknown source-status passes so lists never wait on an indexer.
+     *  Applied to every BROWSE list this repository returns. */
+    private fun List<MediaItem>.browsable(): List<MediaItem> =
+        sourceStatus.filterBrowsable(this).regionFiltered()
+
+    /** The region filter alone — for surfaces (search) that must still hide Indian content but should
+     *  NOT be source-status-filtered (hiding an explicitly searched title reads as "app doesn't have it"). */
+    private fun List<MediaItem>.regionFiltered(): List<MediaItem> =
+        if (!hideIndian) this
+        else filterNot { it.originalLanguage?.lowercase() in INDIAN_LANGS }
 
     // --- Kids-profile quarantine ------------------------------------------------------------------
     // Gated HERE, in the repository, so EVERY surface inherits it — Home rows, the Movies/TV catalog
@@ -313,7 +336,7 @@ class CatalogRepositoryImpl @Inject constructor(
                 // surface R/TV-MA content on a kids profile. Unrated falls back to kid-genre only.
                 val safe = if (kids) dtos.filterKidsSafe(forcedType = null) else dtos
                 // forcedType = null -> mapper keeps only movie/tv from the multi results.
-                safe.toDomain(forcedType = null)
+                safe.toDomain(forcedType = null).regionFiltered()
             }
         }
 }

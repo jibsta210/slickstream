@@ -98,6 +98,21 @@ fun CamBadge(modifier: Modifier = Modifier) {
     )
 }
 
+/** Compact CAM pill for poster-card corner overlays — smaller than [CamBadge] so it fits a ~130dp card
+ *  without dominating it. Signals "only a cinema-cam exists for this title". */
+@Composable
+fun CamBadgeSmall(modifier: Modifier = Modifier) {
+    Text(
+        text = "CAM",
+        style = MaterialTheme.typography.labelSmall,
+        fontWeight = FontWeight.Bold,
+        color = Color.White,
+        modifier = modifier
+            .background(color = Brand.Error, shape = RoundedCornerShape(5.dp))
+            .padding(horizontal = 5.dp, vertical = 2.dp),
+    )
+}
+
 /** A green "DIRECT" pill — a non-torrent file-server/HLS source that plays instantly with no swarm.
  *  Shown next to the quality chip so a direct stream is obviously distinct from a torrent in the picker. */
 @Composable

@@ -85,6 +85,7 @@ class SettingsViewModel @Inject constructor(
     fun setCellularQuality(q: QualityPreference) = viewModelScope.launch { repo.setCellularQuality(q) }
     fun setDensity(d: UiDensity) = viewModelScope.launch { repo.setDensity(d) }
     fun setSubtitlesEnabled(enabled: Boolean) = viewModelScope.launch { repo.setSubtitlesEnabled(enabled) }
+    fun setHideIndianContent(hide: Boolean) = viewModelScope.launch { repo.setHideIndianContent(hide) }
     fun setSubtitleLanguage(lang: SubtitleLanguage) = viewModelScope.launch { repo.setSubtitleLanguage(lang) }
     fun setSubtitleSize(size: SubtitleSize) = viewModelScope.launch { repo.setSubtitleSize(size) }
     fun setSubtitleStyle(style: SubtitleStyle) = viewModelScope.launch { repo.setSubtitleStyle(style) }

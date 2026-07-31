@@ -33,7 +33,7 @@ object LocalModule {
             .addMigrations(
                 SlickDatabase.MIGRATION_3_4, SlickDatabase.MIGRATION_4_5,
                 SlickDatabase.MIGRATION_5_6, SlickDatabase.MIGRATION_6_7,
-                SlickDatabase.MIGRATION_7_8,
+                SlickDatabase.MIGRATION_7_8, SlickDatabase.MIGRATION_8_9,
             )
             .fallbackToDestructiveMigration()
             .build()

@@ -64,6 +64,7 @@ fun PosterCard(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
+    val camOnly = LocalCamOnlyKeys.current.isCamOnly(item)
     // Not delegated: read inside graphicsLayer's lambda so each spring frame is a draw-phase
     // update — the old Modifier.scale(read-in-composition) recomposed the whole card per frame.
     val scale = animateFloatAsState(
@@ -120,6 +121,16 @@ fun PosterCard(
                     vote = item.voteAverage,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
+                        .padding(6.dp),
+                )
+            }
+
+            // Only-CAM warning, top-left (opposite the rating). Lets the user avoid a title whose
+            // sole release is a bad cinema cam before ever opening it.
+            if (camOnly) {
+                CamBadgeSmall(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
                         .padding(6.dp),
                 )
             }

@@ -139,7 +139,15 @@ class SourceRepositoryImpl @Inject constructor(
                 // FREE availability signal: every real resolution (details open, prewarm, play) records
                 // whether this title has anything to play, so the catalog can stop headlining dead
                 // titles. Success-only — a network error says nothing about availability.
-                sourceStatusStore.record(details.item.id, details.item.mediaType, result.data.isNotEmpty())
+                // Also derive a CAM-only verdict: among the sources a user could actually PLAY, are they
+                // ALL cinema-cams? If so the card gets a "CAM" badge. Basing it on playable rows (not the
+                // whole list) means a lone unplayable junk row can't hide a real CAM-only title, and a
+                // single real WEB/BluRay release clears the badge.
+                val playable = result.data.filter { it.playable }
+                val camOnly = playable.isNotEmpty() && playable.all { it.isCam }
+                sourceStatusStore.record(
+                    details.item.id, details.item.mediaType, result.data.isNotEmpty(), camOnly,
+                )
             }
             return result
         } catch (e: CancellationException) {
