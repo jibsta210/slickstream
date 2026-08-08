@@ -141,8 +141,10 @@ interface SourceRepository {
  * then keeps emitting progress. Recently used torrents are cached for fast resume.
  */
 interface TorrentStreamer {
-    /** Begin streaming. The returned flow stays hot until cancelled. */
-    fun start(source: StreamSource): Flow<StreamStatus>
+    /** Begin streaming. [startPositionFraction] (0f..1f) anchors the bulk download at a RESUME position
+     *  so playback buffers where the user will actually start, not the file head; 0f = play from start.
+     *  The returned flow stays hot until cancelled. */
+    fun start(source: StreamSource, startPositionFraction: Float = 0f): Flow<StreamStatus>
     suspend fun pause(infoHash: String)
     suspend fun resume(infoHash: String)
     /** Stop a stream. [removeFiles]=false keeps the partial download in cache. */

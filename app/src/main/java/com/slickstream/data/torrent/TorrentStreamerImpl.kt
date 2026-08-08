@@ -71,7 +71,7 @@ class TorrentStreamerImpl @Inject constructor(
      *  current episode can't evict the precache before the user advances. Cleared once it streams. */
     @Volatile private var warmedHash: String? = null
 
-    override fun start(source: StreamSource): Flow<StreamStatus> = callbackFlow {
+    override fun start(source: StreamSource, startPositionFraction: Float): Flow<StreamStatus> = callbackFlow {
         sources[source.infoHash] = source
 
         if (!engine.isAvailable()) {
@@ -137,6 +137,12 @@ class TorrentStreamerImpl @Inject constructor(
         } finally {
             unmarkAcquiring(requestedHash)
         }
+
+        // Anchor the bulk download at the RESUME position so we buffer where the user will actually start
+        // watching, not the file head they'll skip past (the "resume near the end but it downloads from
+        // 0% for a minute first" bug). No-op for a from-start play (fraction ~0). The file header still
+        // downloads via its own deadline band — ExoPlayer needs it to parse the container before it seeks.
+        runCatching { engine.setStreamStart(infoHash, startPositionFraction) }
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
         // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
@@ -221,7 +227,11 @@ class TorrentStreamerImpl @Inject constructor(
                 }
 
                 val headBytes = snap.contiguousHeadBytes
-                val headReady = headBytes >= READY_HEAD_BYTES
+                // Container header at the file start (needed to PARSE the container) AND the RESUME region
+                // (needed to PLAY from where the user actually starts). For a from-start play the two are
+                // the same piece, so resumeReady == headReady and nothing changes; on a resume this also
+                // waits for the bytes under the resume point so READY→seek doesn't instantly rebuffer.
+                val headReady = headBytes >= READY_HEAD_BYTES && snap.contiguousResumeBytes >= READY_HEAD_BYTES
                 // Tail gate is CONTAINER-AWARE: mkv/webm start on head alone; only mp4 waits for the EOF
                 // moov (so prepare() never ranges into an absent atom). mp4 needs the moov ONLY when it's
                 // not faststart (moov already up front in the head).

@@ -116,6 +116,10 @@ class TorrentEngine @Inject constructor(
         @Volatile var fileOffset: Long = 0L,
         @Volatile var readHeadPiece: Int = -1,
         @Volatile var startupTailArmed: Boolean = false,
+        /** Piece the BULK download should begin at — the file's first piece normally, but on a RESUME the
+         *  piece under the resume position, so we buffer where the user will actually watch instead of
+         *  wasting the startup window downloading the file head they'll skip. Set by [setStreamStart]. */
+        @Volatile var streamStartPiece: Int = 0,
     )
 
     @Synchronized
@@ -810,6 +814,8 @@ class TorrentEngine @Inject constructor(
         active.pieceLength = info.pieceLength()
         active.firstPiece = (active.fileOffset / active.pieceLength).toInt()
         active.lastPiece = ((active.fileOffset + active.fileLength - 1) / active.pieceLength).toInt()
+        // Default the bulk-start anchor to the file head; a resume overrides it via setStreamStart().
+        active.streamStartPiece = active.firstPiece
 
         val relPath = files.filePath(chosen)
         active.filePath = File(torrentSavePath(active.infoHash), relPath).absolutePath
@@ -862,20 +868,47 @@ class TorrentEngine @Inject constructor(
                     .or_(TorrentFlags.PAUSED)
                     .or_(TorrentFlags.AUTO_MANAGED),
             )
-            // Park the sequential cursor AT THE SELECTED FILE'S first piece, not torrent piece 0. In a
-            // season pack the wanted episode sits at a big fileOffset (firstPiece is hundreds of pieces
-            // in); the torrent-wide SEQUENTIAL_DOWNLOAD flag aims libtorrent's "lowest piece" cursor at
-            // piece 0, so the selected file's contiguous head filled only as far as the few deadlined
-            // pieces and then stalled (contiguousHeadBytes pinned below the READY gate → "3 MB/s for 60s,
-            // never plays"). setSequentialRange makes the file's head the lowest eligible piece, so the
-            // bulk in-order requests actually fill E5's head. Fall back to the global flag if unavailable.
+            // Park the sequential cursor AT THE BULK-START PIECE — the selected file's first piece
+            // normally, but the RESUME piece when resuming mid-file. In a season pack the wanted episode
+            // sits at a big fileOffset (firstPiece is hundreds of pieces in); the torrent-wide
+            // SEQUENTIAL_DOWNLOAD flag aims libtorrent's "lowest piece" cursor at piece 0, so the head
+            // filled only as far as the few deadlined pieces and then stalled. On a RESUME, parking at
+            // firstPiece meant the bulk fill poured into the file HEAD the user is skipping past — over a
+            // minute of wasted download before it redirected. setSequentialRange(streamStartPiece, …)
+            // aims the bulk in-order fill where the user will actually watch; the file header still
+            // downloads via its own TOP-priority deadline band in prioritizeHeadAndTail. Fall back to the
+            // global flag if unavailable.
+            val startP = active.streamStartPiece.coerceIn(active.firstPiece, active.lastPiece)
             val ranged = runCatching {
-                handle.setSequentialRange(active.firstPiece, active.lastPiece)
+                handle.setSequentialRange(startP, active.lastPiece)
             }.isSuccess
             if (!ranged) handle.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
             handle.resume()
         }.onFailure { Log.w(TAG, "set streaming flags failed", it) } }
         prioritizeHeadAndTail(active)
+    }
+
+    /**
+     * Anchor the bulk download at a RESUME position ([fraction] of the file, 0f..1f) instead of the file
+     * head, so a resumed title buffers where the user will actually watch. Called once right after the
+     * torrent is added/selected. A ~0 fraction is a no-op (from-start play keeps the head anchor). The
+     * file header still downloads via its own deadline band in [prioritizeHeadAndTail] — ExoPlayer needs
+     * it to parse the container before it can seek.
+     */
+    fun setStreamStart(infoHash: String, fraction: Float) {
+        if (fraction <= 0.001f) return
+        val active = torrents[infoHash] ?: return
+        val handle = liveHandle(active) ?: return
+        if (active.pieceLength <= 0 || active.fileLength <= 0) return
+        val startByte = (active.fileLength * fraction.coerceIn(0f, 0.98f)).toLong()
+        val piece = ((active.fileOffset + startByte) / active.pieceLength).toInt()
+            .coerceIn(active.firstPiece, active.lastPiece)
+        if (piece == active.streamStartPiece) return
+        active.streamStartPiece = piece
+        // Force advanceReadHead to re-apply from the new anchor on the next read().
+        active.readHeadPiece = -1
+        Log.i(TAG, "setStreamStart $infoHash frac=$fraction piece=$piece (first=${active.firstPiece} last=${active.lastPiece})")
+        applySequentialAndPriority(handle, active)
     }
 
     /**
@@ -922,6 +955,9 @@ class TorrentEngine @Inject constructor(
             // 2 landing before piece 0). A big per-piece step makes piece 0 FAR more overdue than 1,2,3,
             // so the swarm converges on it first, then 1, then 2 — strict in-order head fill.
             handle.clearPieceDeadlines()
+            // (1) FILE-HEADER band at the file start — ExoPlayer must parse the container header (ftyp/moov
+            //     or EBML/Tracks) at offset 0 before it can decode OR seek, so this is fetched even on a
+            //     resume. Small (~HEAD_PRIORITY_BYTES).
             for (i in 0 until headPieces) {
                 val p = active.firstPiece + i
                 if (p in active.firstPiece..active.lastPiece) {
@@ -929,12 +965,28 @@ class TorrentEngine @Inject constructor(
                     handle.setPieceDeadline(p, i * HEAD_DEADLINE_STEP_MS)
                 }
             }
+            // (2) RESUME band — the bytes the user will actually start watching, when resuming past the
+            //     header band. Deadlined right after the header so playback can begin at the resume point
+            //     without first waiting on the wasted file-head fill. Skipped for a from-start play
+            //     (streamStartPiece == firstPiece), where band (1) already covers it.
+            var resumeBase = headPieces * HEAD_DEADLINE_STEP_MS
+            if (active.streamStartPiece > active.firstPiece + headPieces - 1) {
+                for (i in 0 until headPieces) {
+                    val p = active.streamStartPiece + i
+                    if (p in active.firstPiece..active.lastPiece) {
+                        handle.piecePriority(p, Priority.TOP_PRIORITY)
+                        handle.setPieceDeadline(p, resumeBase + i * HEAD_DEADLINE_STEP_MS)
+                    }
+                }
+                resumeBase += headPieces * HEAD_DEADLINE_STEP_MS
+            }
+            // (3) EOF moov/cues band, after the header + resume bands.
             if (tailFrom != null) {
                 var i = 0
                 for (p in active.lastPiece downTo tailFrom) {
                     if (p in active.firstPiece..active.lastPiece) {
                         handle.piecePriority(p, Priority.TOP_PRIORITY)
-                        handle.setPieceDeadline(p, tailBase + i * HEAD_DEADLINE_STEP_MS)
+                        handle.setPieceDeadline(p, maxOf(tailBase, resumeBase) + i * HEAD_DEADLINE_STEP_MS)
                         i++
                     }
                 }
@@ -1065,6 +1117,20 @@ class TorrentEngine @Inject constructor(
         // The first piece may begin before the file (shared with the previous file).
         val headOffsetInFirstPiece = active.fileOffset % active.pieceLength
         return (bytesFromPieceStart - headOffsetInFirstPiece).coerceIn(0L, active.fileLength)
+    }
+
+    /** Contiguous downloaded bytes starting at an arbitrary piece — the readiness signal at the RESUME
+     *  anchor (whether playback can actually START at streamStartPiece). Byte-approximate (whole pieces);
+     *  the readiness gate only needs a ~2 MB threshold, so exactness doesn't matter. */
+    private fun contiguousBytesFrom(active: ActiveTorrent, pieces: PieceIndexBitfield, fromPiece: Int): Long {
+        val pieceCount = pieces.size()
+        if (pieceCount == 0) return 0L
+        var contiguous = 0
+        var p = fromPiece
+        while (p in active.firstPiece..active.lastPiece && p < pieceCount && pieces.getBit(p)) {
+            contiguous++; p++
+        }
+        return (contiguous.toLong() * active.pieceLength).coerceIn(0L, active.fileLength)
     }
 
     /**
@@ -1270,6 +1336,10 @@ class TorrentEngine @Inject constructor(
         // but never report less than libtorrent's own file-aware progress.
         val byHead = if (fileTotal > 0) downloadedFile.toFloat() / fileTotal else 0f
         val progress = maxOf(byHead, st.progress()).coerceIn(0f, 1f)
+        // Contiguous bytes at the RESUME anchor — the "can playback START here" signal. Equals the head
+        // figure for a from-start play (streamStartPiece == firstPiece), so it changes nothing there.
+        val resumeContig = if (active.streamStartPiece > active.firstPiece)
+            contiguousBytesFrom(active, pieces, active.streamStartPiece) else downloadedFile
         // Hash-verifying on-disk data (cached reopen / resume): rate + seeders read 0 here but it is NOT
         // a stall. Guarded — an unexpected enum in some libtorrent4j build must never crash the snapshot.
         val checking = runCatching {
@@ -1287,6 +1357,7 @@ class TorrentEngine @Inject constructor(
             peers = st.numPeers(),
             downloadedBytes = (progress * fileTotal).toLong().coerceAtMost(fileTotal),
             contiguousHeadBytes = downloadedFile,
+            contiguousResumeBytes = resumeContig,
             startupTailProgressBytes = tailProgress,
             totalBytes = fileTotal,
             isFinished = st.isFinished,
@@ -1610,6 +1681,9 @@ data class EngineStatus(
     val peers: Int,
     val downloadedBytes: Long,
     val contiguousHeadBytes: Long,
+    /** Contiguous bytes at the RESUME anchor (streamStartPiece) — "can playback START where the user
+     *  will actually begin". Equals [contiguousHeadBytes] for a from-start play. */
+    val contiguousResumeBytes: Long,
     val startupTailProgressBytes: Long,
     val totalBytes: Long,
     val isFinished: Boolean,

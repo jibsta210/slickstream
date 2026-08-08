@@ -788,7 +788,11 @@ class PlayerViewModel @Inject constructor(
         }
 
         streamJob = viewModelScope.launch {
-            torrentStreamer.start(source).collect { status ->
+            // Where playback will actually START (a resume point, or a Start-over/failover position) as a
+            // fraction of the file, so the engine buffers there first instead of the file head. Matches
+            // what maybeSeekToResume will seek to; 0f for a fresh from-start play.
+            val startFraction = resumeStartFraction()
+            torrentStreamer.start(source, startFraction).collect { status ->
                 handleStatus(status, source)
             }
         }
@@ -1970,6 +1974,21 @@ class PlayerViewModel @Inject constructor(
             "avi" in t -> "video/x-msvideo"
             else -> "video/mp4"
         }
+    }
+
+    /** Fraction of the file (0f..1f) where playback will actually START — the resume point, a Start-over
+     *  position, or a failover's saved position — so the engine buffers THERE first instead of the file
+     *  head. Mirrors [maybeSeekToResume]'s target. 0f for a fresh from-start play (nothing to skip to). */
+    private suspend fun resumeStartFraction(): Float {
+        val saved = runCatching {
+            libraryRepository.getProgress(mediaId, mediaType, currentSeason, currentEpisode)
+        }.getOrNull()
+        val durationMs = saved?.durationMs ?: 0L
+        val posMs = startOverSessionPositionMs
+            ?: saved?.takeIf { !it.isFinished && it.positionMs > 0 }?.positionMs
+            ?: 0L
+        if (posMs <= 0L || durationMs <= 0L) return 0f
+        return (posMs.toFloat() / durationMs).coerceIn(0f, 0.98f)
     }
 
     private fun maybeSeekToResume(player: Player) {
