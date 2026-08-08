@@ -647,6 +647,7 @@ class TorrentStreamerImpl @Inject constructor(
             streamUrl = streamUrl,
             etaSeconds = etaSeconds,
             awaitingStartupTail = awaitingStartupTail,
+            isChecking = snap.isChecking,
         )
     }
 

@@ -121,6 +121,8 @@ data class StreamStats(
     val downloadRateBytes: Int,
     val progress: Float,
     val precaching: Boolean = false,
+    /** Hash-verifying cached/on-disk data (resume), not downloading — rate/seeders read 0 but it's fine. */
+    val isChecking: Boolean = false,
 )
 
 @HiltViewModel
@@ -371,6 +373,7 @@ class PlayerViewModel @Inject constructor(
             downloadRateBytes = it.downloadRateBytes,
             progress = it.progress,
             precaching = prefetchJob?.isActive == true,
+            isChecking = it.isChecking,
         )
     }
 

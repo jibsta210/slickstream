@@ -1270,6 +1270,15 @@ class TorrentEngine @Inject constructor(
         // but never report less than libtorrent's own file-aware progress.
         val byHead = if (fileTotal > 0) downloadedFile.toFloat() / fileTotal else 0f
         val progress = maxOf(byHead, st.progress()).coerceIn(0f, 1f)
+        // Hash-verifying on-disk data (cached reopen / resume): rate + seeders read 0 here but it is NOT
+        // a stall. Guarded — an unexpected enum in some libtorrent4j build must never crash the snapshot.
+        val checking = runCatching {
+            when (st.state()) {
+                org.libtorrent4j.TorrentStatus.State.CHECKING_FILES,
+                org.libtorrent4j.TorrentStatus.State.CHECKING_RESUME_DATA -> true
+                else -> false
+            }
+        }.getOrDefault(false)
         EngineStatus(
             progress = progress,
             downloadRate = st.downloadRate(),
@@ -1282,6 +1291,7 @@ class TorrentEngine @Inject constructor(
             totalBytes = fileTotal,
             isFinished = st.isFinished,
             isPaused = st.flags().and_(TorrentFlags.PAUSED).non_zero(),
+            isChecking = checking,
         )
     }
 
@@ -1604,4 +1614,9 @@ data class EngineStatus(
     val totalBytes: Long,
     val isFinished: Boolean,
     val isPaused: Boolean,
+    /** libtorrent is hash-VERIFYING already-on-disk data (a cached reopen / resume), not downloading.
+     *  During this phase downloadRate and seeders read 0 — NOT a stall — so the UI must label it
+     *  "checking", never "stalled". The bitfield fills as pieces verify, which looks like a head-first
+     *  download but is just the recheck walking the file. */
+    val isChecking: Boolean = false,
 )

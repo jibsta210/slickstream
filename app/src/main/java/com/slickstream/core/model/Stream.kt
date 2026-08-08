@@ -84,6 +84,9 @@ data class StreamStatus(
      *  (e.g. still discovering peers / no download rate yet). Computed by the streamer against the same
      *  readiness gate that flips to READY, so the countdown matches when playback actually starts. */
     val etaSeconds: Int? = null,
+    /** libtorrent is hash-verifying already-on-disk data (cached reopen / resume) — rate + seeders read
+     *  0 but it is NOT a stall. Lets the chunk bar show "checking cached data" instead of a false "stalled". */
+    val isChecking: Boolean = false,
 )
 
 /** Persisted resume point for a movie or a specific episode. */

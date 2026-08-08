@@ -108,18 +108,25 @@ fun PieceBarPanel(
             Text(
                 text = buildString {
                     if (stats != null) {
-                        append("${stats.seeders} seeders")
-                        if (stats.peers > stats.seeders) append(" · ${stats.peers} peers")
-                        append(" · ${formatRate(stats.downloadRateBytes)}")
-                        if (stats.progress >= 0.999f) append(" · ✓ fully downloaded")
-                        else append(" · ${(stats.progress * 100).roundToInt()}% downloaded")
-                        // Once the current file is in, surface the next-episode precache so the user can
-                        // see it warming (instead of the bar just reading a static 100%).
-                        if (stats.precaching) append(" · caching next episode")
+                        // Cached reopen / resume: libtorrent is hash-verifying on-disk data. Rate + seeders
+                        // read 0 here (no network), so DON'T show "0 seeders · 0 KB/s · stalled" — that's the
+                        // false alarm that read as a dead swarm. Show the real activity instead.
+                        if (stats.isChecking) {
+                            append("Checking cached data… ${(stats.progress * 100).roundToInt()}%")
+                        } else {
+                            append("${stats.seeders} seeders")
+                            if (stats.peers > stats.seeders) append(" · ${stats.peers} peers")
+                            append(" · ${formatRate(stats.downloadRateBytes)}")
+                            if (stats.progress >= 0.999f) append(" · ✓ fully downloaded")
+                            else append(" · ${(stats.progress * 100).roundToInt()}% downloaded")
+                            // Once the current file is in, surface the next-episode precache so the user can
+                            // see it warming (instead of the bar just reading a static 100%).
+                            if (stats.precaching) append(" · caching next episode")
+                            health.warning?.let { append(" · "); append(it) }
+                        }
                     } else {
                         append("Downloading…")
                     }
-                    health.warning?.let { append(" · "); append(it) }
                 },
                 color = Color.White.copy(alpha = 0.85f),
                 fontWeight = FontWeight.Medium,
@@ -153,6 +160,11 @@ private class BarHealth(val color: Color, val warning: String?)
  */
 private fun healthOf(map: FloatArray, playheadFraction: Float, stats: StreamStats?): BarHealth {
     if (stats == null || map.isEmpty()) return BarHealth(Brand.Cyan, null)
+    // Verifying cached data (resume) — rate 0 is expected, NOT a stall. Neutral, no warning.
+    if (stats.isChecking) return BarHealth(Brand.Cyan, null)
+    // Haven't started pulling yet (fetching metadata / connecting to the first peer): rate 0 at ~0%
+    // progress is "connecting", not a mid-stream stall. Don't cry "stalled" before we've even begun.
+    if (stats.downloadRateBytes == 0 && stats.progress <= 0.01f) return BarHealth(Brand.Star, "connecting…")
     if (stats.downloadRateBytes == 0 && stats.progress < 0.99f) return BarHealth(Brand.Error, "stalled")
     val ph = (playheadFraction * map.size).toInt().coerceIn(0, map.size - 1)
     var lead = 0
