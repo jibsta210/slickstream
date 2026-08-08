@@ -594,12 +594,18 @@ class PlayerViewModel @Inject constructor(
         // A DIRECT source has no swarm to downshift away from, and latestStatus is null for it (so the
         // near-complete guard below can't protect it) — never downshift a direct stream to a torrent.
         if (_currentSource.value?.isDirect == true) return
-        // NEVER downshift when the file is already (nearly) fully downloaded — the bytes are on disk, so
-        // a stall is a DECODE / transient hiccup, not bandwidth. Switching to a smaller source would
-        // pointlessly restart playback and re-download from scratch (the "Protector: 100% downloaded,
-        // buffers mid-stream, then picks a new stream and starts over" regression). Just keep waiting;
-        // ExoPlayer recovers from local data on its own.
+        // NEVER downshift when the file is already substantially downloaded — the bytes are (mostly) on
+        // disk, so finishing THIS swarm is always faster than abandoning it to restart a fresh torrent
+        // from scratch. Was 0.9, which still switched away from a 74-89%-downloaded file: the enraging
+        // "shows 90% downloaded, buffers, then switches torrent and starts over" report. At 0.5, half a
+        // file from a live swarm always beats a cold restart.
         if ((latestStatus?.progress ?: 0f) >= NEAR_COMPLETE_FRACTION) return
+        // Nor when the swarm is clearly FAST enough to keep up — a stall while pulling multiple MB/s is
+        // piece SCATTER (the swarm has the bytes but out-of-order) or a decode hiccup, NOT starvation, so
+        // a smaller source can't help and just throws the download away. The downshift exists only to
+        // rescue a swarm that genuinely can't sustain the bitrate. This is the primary guard for the
+        // "300 seeders, 5 MB/s, still switched torrents" case.
+        if ((latestStatus?.downloadRateBytes ?: 0) >= HEALTHY_RATE_BYTES) return
         val smaller = findSmallerHealthySource() ?: return
         rebufferWatchdogJob?.cancel()
         _rebuffering.value = null
@@ -1309,7 +1315,12 @@ class PlayerViewModel @Inject constructor(
             )
             .apply {
                 if (lowPower) {
-                    setTargetBufferBytes(24 * 1024 * 1024)
+                    // 40 MB (~20-40 s at 1080p) — deep enough to ride out a scatter gap just ahead of the
+                    // playhead while the ordered read-ahead window refills, without approaching the
+                    // 60-95 MB that OOM'd a 1.5 GB box. Was 24 MB (~6-12 s), which a single missing piece
+                    // past the buffer frontier drained before the swarm filled it — the mid-stream rebuffer.
+                    // Kept < LOW_POWER_READAHEAD_BYTES (48 MB) so the read never outruns the deadlined window.
+                    setTargetBufferBytes(40 * 1024 * 1024)
                     setPrioritizeTimeOverSizeThresholds(false)
                 }
             }
@@ -2472,7 +2483,12 @@ class PlayerViewModel @Inject constructor(
         const val SUSTAINED_REBUFFER_TIMEOUT_MS = 30_000L
         /** At/above this downloaded fraction the bytes are effectively on disk, so a stall is a decode/
          *  transient issue, NOT bandwidth — never downshift/switch sources (it would re-download). */
-        const val NEAR_COMPLETE_FRACTION = 0.9f
+        const val NEAR_COMPLETE_FRACTION = 0.5f
+
+        /** Sustained download rate at/above which a mid-stream stall is treated as piece SCATTER or a
+         *  decode hiccup (the swarm can clearly keep up), so the downshift-to-smaller watchdog stands
+         *  down instead of abandoning a healthy torrent. ~2 MB/s comfortably exceeds any <=1080p bitrate. */
+        const val HEALTHY_RATE_BYTES = 2 * 1024 * 1024
         const val PROGRESS_INTERVAL_MS = 10_000L
         /** Start warming the next episode when this close to the end (~3 min). */
         const val PREFETCH_LEAD_MS = 3 * 60_000L

@@ -1543,15 +1543,22 @@ class TorrentEngine @Inject constructor(
         const val UPLOAD_RATE_LIMIT = 512 * 1024
         const val LOW_POWER_UPLOAD_RATE_LIMIT = 256 * 1024
 
-        /** Sliding look-ahead band kept hot ahead of the player's read position. Bigger = more pieces
-         *  in flight concurrently = better swarm utilisation under SEQUENTIAL_DOWNLOAD (closer to a
-         *  desktop client's throughput), at the cost of more buffered-ahead RAM. Capable devices only. */
-        const val READAHEAD_BYTES = 32 * 1024 * 1024
+        /** Sliding look-ahead band kept hot (TOP-priority, deadlined IN ORDER) ahead of the player's read
+         *  position. This is the SOLE thing that beats libtorrent's out-of-order scatter: only DEADLINED
+         *  pieces are fetched strictly in sequence, so on a big swarm (hundreds of peers each holding
+         *  scattered pieces) whatever falls OUTSIDE this window is grabbed rarest-first and lands all over
+         *  the file — the "solid-teal chunk bar but the piece just past the playhead is missing, so it
+         *  rebuffers at 5 MB/s / 300 seeders" report. A bigger ordered runway keeps the swarm converging on
+         *  the bytes about to play. Must exceed the player's steady-state buffer so the read never outruns
+         *  the deadlined window into un-deadlined (scatter-prone) pieces. Deadlines are just scheduling —
+         *  the RAM cost is the player buffer, not this. Capable devices only. */
+        const val READAHEAD_BYTES = 64 * 1024 * 1024
 
-        /** Look-ahead on Android TV / low-RAM devices. Must be deep enough to keep the player's
-         *  steady-state buffer (now ~24 MB) prioritised AHEAD of the read head, or the read outruns the
-         *  prioritised window into un-deadlined pieces and rebuffers mid-stream on 4K VBR peaks. */
-        const val LOW_POWER_READAHEAD_BYTES = 24 * 1024 * 1024
+        /** Look-ahead on Android TV / low-RAM devices. Must stay comfortably ABOVE the player's steady-
+         *  state buffer (now ~40 MB) so the read head can't outrun the prioritised window into un-deadlined
+         *  pieces and rebuffer mid-stream — the exact scatter-starvation above, which a too-small 24 MB
+         *  window let through on a fast swarm. */
+        const val LOW_POWER_READAHEAD_BYTES = 48 * 1024 * 1024
 
         /** High-uptime public trackers appended to every magnet so cold pickup finds peers fast
          *  instead of waiting on DHT. Curated from the well-known best-uptime lists (udp-first). */
