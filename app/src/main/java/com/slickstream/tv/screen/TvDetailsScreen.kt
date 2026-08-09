@@ -1,6 +1,8 @@
 package com.slickstream.tv.screen
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Subject
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Download
@@ -26,12 +29,24 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -63,8 +78,10 @@ import com.slickstream.core.model.Season
 import com.slickstream.feature.details.DetailsUiState
 import com.slickstream.feature.details.DetailsViewModel
 import com.slickstream.tv.components.TvMediaRow
+import com.slickstream.tv.components.TvSynopsisOverlay
 import com.slickstream.ui.components.RatingBadge
 import com.slickstream.ui.theme.Brand
+import kotlinx.coroutines.launch
 
 /**
  * Android TV details screen. Reuses [DetailsViewModel] (same TMDB-backed data as the phone
@@ -116,6 +133,27 @@ fun TvDetailsScreen(
     }
 }
 
+/**
+ * An open "read the full text" request for [TvSynopsisOverlay] — the hero synopsis or an episode's.
+ *
+ * [restore] (the focus target to hand the remote back to when the reader closes) travels INSIDE the
+ * request on purpose. The obvious alternative — a screen-level `synopsisOpen: Boolean` plus a
+ * `LaunchedEffect(synopsisOpen)` that re-focuses — ALSO fires on first composition (at `false`), where
+ * it races [HeroBlock]'s landing-focus-on-Play loop and makes initial focus non-deterministic (press OK
+ * the instant details opens and you'd get the synopsis instead of playback). Capturing the anchor at
+ * close time removes that race by construction, and it is what lets every episode card own its own
+ * anchor without threading a "which card opened it" key down through [EpisodeList].
+ */
+private data class ReaderRequest(
+    val title: String,
+    val meta: String?,
+    val body: String,
+    val imageUrl: String?,
+    /** The artwork is a 16:9 episode still rather than a 2:3 poster. */
+    val imageWide: Boolean,
+    val restore: FocusRequester,
+)
+
 @Composable
 private fun DetailsContent(
     state: DetailsUiState,
@@ -147,6 +185,32 @@ private fun DetailsContent(
         val shortViewport = maxHeight < 620.dp
         val backdropHeight = (maxHeight * 0.78f).coerceIn(240.dp, 560.dp)
         val heroTopInset = if (shortViewport) 48.dp else (maxHeight * 0.28f).coerceIn(56.dp, 220.dp)
+
+        // Full-synopsis reader state. It lives HERE, not inside HeroBlock / EpisodeCard: nested in a
+        // LazyColumn item it would be clipped to that item and scroll away with the list. Keyed on
+        // item.id so a "More Like This" jump can never leave a stale reader open over a different title.
+        var reader by remember(item.id) { mutableStateOf<ReaderRequest?>(null) }
+        val readerScope = rememberCoroutineScope()
+        // Imperative close rather than an effect keyed on open/closed (see ReaderRequest): capture the
+        // anchor, drop the overlay, then retry the focus request past layout — a single requestFocus()
+        // that lands before the node is ready is silently dropped and the remote is left with NOTHING
+        // focused, which on TV reads as "the remote died".
+        val closeReader: () -> Unit = {
+            val anchor = reader?.restore
+            reader = null
+            if (anchor != null) {
+                readerScope.launch {
+                    repeat(10) {
+                        kotlinx.coroutines.delay(40)
+                        if (runCatching { anchor.requestFocus() }.isSuccess) return@launch
+                    }
+                }
+            }
+        }
+        // The hero's "Read more" pill — the one anchor DetailsContent has to own itself, because the
+        // pill lives inside HeroBlock but the reader that restores focus to it lives out here.
+        val heroReadMoreFocus = remember { FocusRequester() }
+
         // Backdrop fills the top of the screen, fading into the background.
         val context = LocalContext.current
         val backdropRequest = remember(item.backdropUrl, item.posterUrl) {
@@ -222,6 +286,22 @@ private fun DetailsContent(
                     onMarkMovieUnwatched = onMarkMovieUnwatched,
                     onDownloadMovie = onDownloadMovie,
                     onDownloadSeason = onDownloadSeason,
+                    readMoreFocus = heroReadMoreFocus,
+                    onReadMore = {
+                        reader = ReaderRequest(
+                            title = item.title,
+                            meta = listOfNotNull(
+                                item.year,
+                                metaLine(details),
+                                details.genres.take(3).joinToString(" · ") { it.name }
+                                    .takeIf { it.isNotBlank() },
+                            ).joinToString("  ·  ").takeIf { it.isNotBlank() },
+                            body = item.overview,
+                            imageUrl = item.posterUrl,
+                            imageWide = false,
+                            restore = heroReadMoreFocus,
+                        )
+                    },
                 )
             }
 
@@ -253,6 +333,7 @@ private fun DetailsContent(
                                 onMarkEpisodeWatched(ep.seasonNumber, ep.episodeNumber)
                             }
                         },
+                        onShowSynopsis = { request -> reader = request },
                     )
                 }
             }
@@ -270,6 +351,24 @@ private fun DetailsContent(
                     )
                 }
             }
+        }
+
+        // The full-text reader is a SIBLING of the LazyColumn inside this BoxWithConstraints, not a
+        // Dialog: one focus tree, so closing it can hand focus straight back to the pill that opened it
+        // (see TvSynopsisOverlay's KDoc). No enter/exit animation — an exiting overlay would keep its
+        // BackHandler and focusable body alive for the duration while closeReader is already re-focusing
+        // the pill behind it. Sized from the viewport like everything else on this screen.
+        reader?.let { r ->
+            TvSynopsisOverlay(
+                title = r.title,
+                meta = r.meta,
+                body = r.body,
+                imageUrl = r.imageUrl,
+                imageWide = r.imageWide,
+                cardWidth = (maxWidth * 0.72f).coerceIn(520.dp, 820.dp),
+                cardMaxHeight = maxHeight * 0.84f,
+                onClose = closeReader,
+            )
         }
     }
 }
@@ -359,6 +458,9 @@ private fun HeroBlock(
     onMarkMovieUnwatched: () -> Unit,
     onDownloadMovie: () -> Unit,
     onDownloadSeason: () -> Unit,
+    /** Anchor for the "Read more" pill, so closing the reader can put focus back on it. */
+    readMoreFocus: FocusRequester,
+    onReadMore: () -> Unit,
 ) {
     val details = state.details ?: return
     val item = details.item
@@ -432,13 +534,61 @@ private fun HeroBlock(
             )
         }
 
+        // The overview used to be a dead ellipsised Text — 2 lines on a 540dp panel and no way whatsoever
+        // to read the rest ("descriptions cut off after 2 lines"). The GEOMETRY is deliberately unchanged
+        // (same maxLines, same spacing) so the carefully budgeted hero still fits the viewport and the
+        // title can't get pushed off the top again. What's new is (a) the clamped line DISSOLVES instead
+        // of ending in "…", which reads as "there is more" rather than "this is broken", and (b) a
+        // focusable "Read more" pill below it that opens the full-text reader.
+        var overviewOverflows by remember(item.id) { mutableStateOf(false) }
         Text(
             text = item.overview,
             style = MaterialTheme.typography.bodyLarge,
             color = Brand.OnSurface.copy(alpha = 0.92f),
             maxLines = if (compact) 2 else 4,
-            overflow = TextOverflow.Ellipsis,
+            // Clip, not Ellipsis: the fade below IS the overflow affordance, and an ellipsis sitting
+            // inside a fade just looks like a rendering glitch at 10 feet.
+            overflow = TextOverflow.Clip,
+            onTextLayout = { overviewOverflows = it.hasVisualOverflow },
+            modifier = Modifier
+                .fillMaxWidth()
+                // Offscreen compositing is what makes BlendMode.DstIn erase to TRANSPARENT (revealing the
+                // backdrop) instead of to black. It's a single static layer — the fade never animates and
+                // the text never scrolls — so the cost is one composite, not a per-frame one.
+                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                .drawWithContent {
+                    drawContent()
+                    if (overviewOverflows) {
+                        // Fade ONLY the trailing descender strip, never a whole line. maxLines clips to
+                        // WHOLE lines, so there is no partial line to dissolve: a band as tall as a line
+                        // (the original 22dp against a 24sp lineHeight) washed the entire LAST line out to
+                        // ~30% alpha — on the 2-line compact path that made the description LESS readable
+                        // than the ellipsis it replaced. 9dp (~a third of a line) keeps the cap-height-to-
+                        // baseline band near-opaque while still signalling "there's more below".
+                        val fade = minOf(9.dp.toPx(), size.height * 0.18f)
+                        drawRect(
+                            brush = Brush.verticalGradient(
+                                0f to Color.Black,
+                                1f to Color.Transparent,
+                                startY = size.height - fade,
+                                endY = size.height,
+                            ),
+                            blendMode = BlendMode.DstIn,
+                        )
+                    }
+                },
         )
+
+        if (overviewOverflows) {
+            // STRUCTURAL gating, NOT `enabled = overviewOverflows` on the pill: a tv-material3 Surface
+            // applies `.focusable(enabled = true)` unconditionally inside tvClickable, so a *disabled*
+            // Surface still eats a D-pad stop (the same misconception is latent on the unaired-episode
+            // card below). An overview that already fits must add no focus stop on the way to Play at all.
+            ReadMorePill(
+                onClick = onReadMore,
+                modifier = Modifier.focusRequester(readMoreFocus),
+            )
+        }
 
         Spacer(Modifier.height(6.dp))
 
@@ -617,6 +767,74 @@ private fun DetailsActionButton(
     }
 }
 
+/**
+ * "Read more" affordance under the clamped hero overview — opens the full-text reader.
+ *
+ * A PILL rather than making the paragraph itself the button: a ~520dp block of body copy wearing a
+ * violet border and a Surface fill reads as a text INPUT at 10 feet, and it would need an offset hack to
+ * stay optically aligned with the title. The pill costs ~34dp of vertical space, which the hero has.
+ *
+ * It sits ABOVE the Play row, so focusing it can only bringIntoView-scroll the list toward the TOP — it
+ * cannot re-create the "title pushed off the top" bug the hero sizing was tuned to fix. Standard 10-foot
+ * treatment: SurfaceVariant -> Violet, 1.06 focus scale, 3dp white ring drawn in the DRAW phase (state
+ * read inside the lambda) so a D-pad focus change doesn't recompose the whole hero.
+ */
+@Composable
+private fun ReadMorePill(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val focused = interaction.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(50)
+    Surface(
+        onClick = onClick,
+        interactionSource = interaction,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Brand.SurfaceVariant,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Brand.Cyan,
+            focusedContentColor = Color.White,
+        ),
+        // No ClickableSurfaceDefaults border — the ring below is drawn instead, in the draw phase.
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
+        modifier = modifier,
+    ) {
+        Row(
+            modifier = Modifier
+                .drawWithContent {
+                    drawContent()
+                    if (focused.value) {
+                        val stroke = 3.dp.toPx()
+                        drawRoundRect(
+                            color = Color.White,
+                            topLeft = Offset(stroke / 2f, stroke / 2f),
+                            size = Size(size.width - stroke, size.height - stroke),
+                            cornerRadius = CornerRadius(size.height / 2f),
+                            style = Stroke(width = stroke),
+                        )
+                    }
+                }
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.Subject,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "Read more",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
 private fun metaLine(details: com.slickstream.core.model.MediaDetails): String? {
     val runtime = details.runtimeMinutes?.takeIf { it > 0 }?.let { "${it} min" }
     val seasons = details.numberOfSeasons?.takeIf { it > 0 }?.let { "$it season${if (it == 1) "" else "s"}" }
@@ -681,6 +899,7 @@ private fun EpisodeList(
     onDownloadEpisode: (Episode) -> Unit,
     onPlayEpisode: (Episode) -> Unit,
     onToggleWatched: (Episode, watched: Boolean) -> Unit,
+    onShowSynopsis: (ReaderRequest) -> Unit,
 ) {
     when {
         state.isLoadingEpisodes -> Box(
@@ -711,6 +930,7 @@ private fun EpisodeList(
                     onClick = { onPlayEpisode(ep) },
                     onToggleWatched = { watched -> onToggleWatched(ep, watched) },
                     onDownload = { onDownloadEpisode(ep) },
+                    onShowSynopsis = onShowSynopsis,
                 )
             }
         }
@@ -739,6 +959,7 @@ private fun EpisodeCard(
     onClick: () -> Unit,
     onToggleWatched: (watched: Boolean) -> Unit,
     onDownload: () -> Unit,
+    onShowSynopsis: (ReaderRequest) -> Unit,
 ) {
     val shape = RoundedCornerShape(12.dp)
     // Mirror PlaybackProgress.isFinished (>= 0.92f) so a fully-watched episode shows a check.
@@ -897,14 +1118,27 @@ private fun EpisodeCard(
         // D-pad focusable action pills — SEPARATE focus targets placed BELOW the card (a clickable
         // Surface is a single focus target; the D-pad can't descend into nested clickable children, so
         // pills nested inside the card were unreachable on TV). DOWN from the card focuses the row.
-        // Gated on isDownloadable (aired OR unknown date — matches what downloadSeason enqueues):
-        // Mark watched + a per-episode Download with live state.
-        if (episode.isDownloadable()) {
+        // Mark watched + a per-episode Download are gated on isDownloadable (aired OR unknown date —
+        // matches what downloadSeason enqueues); the synopsis pill is NOT, because an UNAIRED episode's
+        // description is exactly the thing you want to read, and it was the one thing you couldn't.
+        val hasSynopsis = episode.overview.isNotBlank()
+        if (episode.isDownloadable() || hasSynopsis) {
             val toggleShape = RoundedCornerShape(50)
+            // THREE pills in a hard-bounded row overflow. The card Column is .width(300.dp), so this Row
+            // has ~296dp: "Mark watched" (~127dp) + "Downloaded" (~116dp) + the icon pill (42dp) + spacing
+            // is already ~301dp at fontScale 1.0, and Android TV's Display > Text size can push labels
+            // 15-30% wider. A Row measures non-weighted children in order and hands the LAST one whatever
+            // is left, so the overflow lands entirely on the synopsis pill — squeezing it into an
+            // invisible-but-still-focusable target (a D-pad stop you can't see). Rather than rely on a few
+            // dp of margin, drop the LONGEST label when all three coexist: the check icon alone is
+            // self-evident, and this leaves ~84dp of slack even at the largest TV font size. The download
+            // label is kept because it carries live state ("45%", "Queued", "Retry").
+            val threeUp = episode.isDownloadable() && hasSynopsis
             Row(
                 modifier = Modifier.padding(start = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (threeUp) 6.dp else 8.dp),
             ) {
+                if (episode.isDownloadable()) {
                 Surface(
                     onClick = { onToggleWatched(isWatched) },
                     shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
@@ -928,16 +1162,23 @@ private fun EpisodeCard(
                     ) {
                         Icon(
                             imageVector = if (isWatched) Icons.Rounded.CheckCircle else Icons.Outlined.CheckCircle,
-                            contentDescription = null,
+                            // Icon-only in the three-pill layout, so it must carry the label itself.
+                            contentDescription = if (threeUp) {
+                                if (isWatched) "Mark as unwatched" else "Mark as watched"
+                            } else null,
                             tint = if (isWatched) Brand.Cyan else Brand.OnSurface,
                             modifier = Modifier.size(18.dp),
                         )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = if (isWatched) "Watched" else "Mark watched",
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                        )
+                        // Label dropped when a third pill shares the row (see threeUp) — the icon carries
+                        // the meaning and this is what buys the row its measure safety.
+                        if (!threeUp) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = if (isWatched) "Watched" else "Mark watched",
+                                style = MaterialTheme.typography.labelMedium,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
 
@@ -989,6 +1230,54 @@ private fun EpisodeCard(
                             },
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
+                        )
+                    }
+                }
+                }
+
+                if (hasSynopsis) {
+                    // ICON-ONLY on purpose. The card Column is .width(300.dp) and this Row's
+                    // padding(start = 4.dp) leaves 296dp, of which "Mark watched" + "Download" already
+                    // eat ~236dp. A third LABELLED pill overflows to ~345dp and gets squeezed into an
+                    // invisible-but-still-focusable target inside the LazyRow — the same trap as the
+                    // five-buttons-in-one-Row comment in the hero. At ~42dp this fits with room spare.
+                    // Its own anchor: the reader restores focus to whichever pill opened it.
+                    val infoFocus = remember { FocusRequester() }
+                    Surface(
+                        onClick = {
+                            onShowSynopsis(
+                                ReaderRequest(
+                                    title = "E${episode.episodeNumber} · ${episode.name}",
+                                    meta = formatAirDate(episode.airDate),
+                                    body = episode.overview,
+                                    imageUrl = episode.stillUrl,
+                                    imageWide = true,
+                                    restore = infoFocus,
+                                ),
+                            )
+                        },
+                        shape = ClickableSurfaceDefaults.shape(shape = toggleShape),
+                        colors = ClickableSurfaceDefaults.colors(
+                            containerColor = Brand.SurfaceVariant,
+                            focusedContainerColor = Brand.Violet,
+                            contentColor = Brand.OnSurface,
+                            focusedContentColor = Color.White,
+                        ),
+                        border = ClickableSurfaceDefaults.border(
+                            focusedBorder = Border(
+                                border = androidx.compose.foundation.BorderStroke(2.dp, Color.White),
+                                shape = toggleShape,
+                            ),
+                        ),
+                        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
+                        modifier = Modifier.focusRequester(infoFocus),
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.Subject,
+                            contentDescription = "Read the full episode synopsis",
+                            modifier = Modifier
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                                .size(18.dp),
                         )
                     }
                 }
