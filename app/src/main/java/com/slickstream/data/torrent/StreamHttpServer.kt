@@ -276,8 +276,17 @@ class StreamHttpServer(
             // Keep the engine's look-ahead band hot at the ACTUAL read position (not a buffer-fill
             // position) so head prioritisation tracks where the player really is.
             engine.advanceReadHead(infoHash, fillStart)
+            // Time the range wait. A read that BLOCKS here is the stream starving on missing bytes; a read
+            // that returns instantly but still leaves the player buffering means the bytes were present and
+            // the bottleneck is elsewhere (disk flush / decode). Only slow waits are logged, so a healthy
+            // stream stays silent instead of spamming the log on every 1 MB chunk.
+            val waitStart = System.currentTimeMillis()
             val ready = runBlocking {
                 engine.ensureRange(infoHash, fillStart, fillEnd, readWaitMs)
+            }
+            val waitedMs = System.currentTimeMillis() - waitStart
+            if (waitedMs >= SLOW_READ_LOG_MS) {
+                Log.w(TAG, "slow range wait ${waitedMs}ms for $fillStart-$fillEnd ready=$ready")
             }
             if (!ready) throw IOException("range $fillStart-$fillEnd not available")
 
@@ -327,6 +336,10 @@ class StreamHttpServer(
 
             /** Per-read wait budget while streaming further into the file. */
             private const val READ_WAIT_TIMEOUT_MS = 75_000L
+
+            /** Log a range wait at/over this long — the read path starving is worth seeing; fast reads
+             *  stay silent so a healthy stream doesn't spam a line per 1 MB chunk. */
+            private const val SLOW_READ_LOG_MS = 400L
 
             /** Max time to wait for libtorrent to flush a hashed-but-uncached piece to disk. */
             private const val FLUSH_WAIT_BUDGET_MS = 30_000L

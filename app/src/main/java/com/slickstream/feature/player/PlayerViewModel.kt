@@ -1417,6 +1417,30 @@ class PlayerViewModel @Inject constructor(
                             )
                             maybeSuggestSmaller(downloadRateBytes = 0)
                         } else if (_rebuffering.value == null) {
+                            // STALL PROBE — the decisive data point for "all chunks downloaded, why does it
+                            // still buffer?". Captures, AT the instant of the stall: how much video ExoPlayer
+                            // actually had buffered, the player's own byte position, whether the piece under
+                            // that position is on disk, and the swarm state. If bufAhead≈0 while
+                            // byteAtHead=true, the bytes were RIGHT THERE and the fault is the read/serve
+                            // path or the decoder — NOT the swarm. Readable in the on-screen Diagnostics.
+                            runCatching {
+                                val posMs = exo.currentPosition.coerceAtLeast(0L)
+                                val bufAheadMs = (exo.bufferedPosition - posMs).coerceAtLeast(0L)
+                                val durMs = exo.duration.takeIf { it > 0L } ?: 0L
+                                val hash = activeInfoHash
+                                val total = hash?.let { torrentStreamer.fileLength(it) } ?: 0L
+                                // Byte offset the player is reading (duration-proportional estimate).
+                                val byteAtHead = if (hash != null && durMs > 0L && total > 0L) {
+                                    val approxByte = (total.toDouble() * (posMs.toDouble() / durMs)).toLong()
+                                    torrentStreamer.isByteAvailable(hash, approxByte)
+                                } else null
+                                diagnostics.breadcrumb(
+                                    "STALL pos=${posMs / 1000}s bufAhead=${bufAheadMs}ms " +
+                                        "pieceOnDisk=$byteAtHead prog=${latestStatus?.progress} " +
+                                        "rate=${latestStatus?.downloadRateBytes} " +
+                                        "seeds=${latestStatus?.seeders} vlc=$usingVlcForSource",
+                                )
+                            }
                             // Mid-playback stall: keep the frozen frame + Playing state, but raise the
                             // small "buffering ~Xs" badge so it never looks permanently frozen. ETA is
                             // refreshed live from the torrent feed in handleStatus.

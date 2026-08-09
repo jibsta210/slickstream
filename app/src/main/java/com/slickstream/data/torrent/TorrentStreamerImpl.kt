@@ -142,12 +142,15 @@ class TorrentStreamerImpl @Inject constructor(
             unmarkAcquiring(requestedHash)
         }
 
-        // Shape the download for streaming: anchor the bulk fill at the RESUME position (not the file
-        // head the user skips past), AND — when concentrating — base the file at IGNORE so the swarm
-        // pours into the head/read-ahead window instead of scattering across the whole file. Offline
-        // downloads pass concentrate=false (they want every piece). Playback can't starve — ensureRange
-        // force-raises whatever each read needs regardless of the base.
-        runCatching { engine.setStreamStart(infoHash, startPositionFraction, concentrate) }
+        // Anchor the bulk fill at the RESUME position (not the file head the user skips past).
+        //
+        // CONCENTRATION (base the file at IGNORE so only a moving window downloads) is DISABLED for now:
+        // it shipped unverified in v1.6.9, and starving everything outside the window is exactly the kind
+        // of change that can CAUSE a mid-stream stall. Playback still buffering with the file on disk is
+        // being diagnosed with the STALL breadcrumb + slow-read log first; concentration only comes back
+        // if the data says scatter (not the read/serve path) is the bottleneck. Param kept so the call
+        // sites and the offline path don't churn.
+        runCatching { engine.setStreamStart(infoHash, startPositionFraction, concentrate = false) }
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
         // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
