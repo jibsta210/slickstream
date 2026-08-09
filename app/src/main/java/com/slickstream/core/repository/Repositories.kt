@@ -143,8 +143,14 @@ interface SourceRepository {
 interface TorrentStreamer {
     /** Begin streaming. [startPositionFraction] (0f..1f) anchors the bulk download at a RESUME position
      *  so playback buffers where the user will actually start, not the file head; 0f = play from start.
+     *  [concentrate] (streaming default) bases the file at IGNORE so the swarm fills a MOVING WINDOW at the
+     *  head/playhead instead of scattering; offline downloads pass false to fetch every piece.
      *  The returned flow stays hot until cancelled. */
-    fun start(source: StreamSource, startPositionFraction: Float = 0f): Flow<StreamStatus>
+    fun start(
+        source: StreamSource,
+        startPositionFraction: Float = 0f,
+        concentrate: Boolean = true,
+    ): Flow<StreamStatus>
     suspend fun pause(infoHash: String)
     suspend fun resume(infoHash: String)
     /** Stop a stream. [removeFiles]=false keeps the partial download in cache. */

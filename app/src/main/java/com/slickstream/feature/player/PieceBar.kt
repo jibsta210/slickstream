@@ -162,19 +162,20 @@ private fun healthOf(map: FloatArray, playheadFraction: Float, stats: StreamStat
     if (stats == null || map.isEmpty()) return BarHealth(Brand.Cyan, null)
     // Verifying cached data (resume) — rate 0 is expected, NOT a stall. Neutral, no warning.
     if (stats.isChecking) return BarHealth(Brand.Cyan, null)
-    // Haven't started pulling yet (fetching metadata / connecting to the first peer): rate 0 at ~0%
-    // progress is "connecting", not a mid-stream stall. Don't cry "stalled" before we've even begun.
-    if (stats.downloadRateBytes == 0 && stats.progress <= 0.01f) return BarHealth(Brand.Star, "connecting…")
-    if (stats.downloadRateBytes == 0 && stats.progress < 0.99f) return BarHealth(Brand.Error, "stalled")
+    // The downloaded LEAD ahead of the playhead is what actually protects playback — judge on it FIRST.
+    // Under the concentrated moving window the download rate legitimately drops to 0 once the window
+    // ahead is full (nothing left to fetch until you watch further), so a big lead with 0 B/s is HEALTHY,
+    // not "stalled". Only a THIN lead makes the rate matter.
     val ph = (playheadFraction * map.size).toInt().coerceIn(0, map.size - 1)
     var lead = 0
     var i = ph
     while (i < map.size && map[i] >= 0.85f) { lead++; i++ }
     val leadFraction = lead.toFloat() / map.size
-    return when {
-        leadFraction < 0.02f -> BarHealth(Brand.Star, "low buffer")
-        else -> BarHealth(Brand.Cyan, null)
-    }
+    if (leadFraction >= 0.04f) return BarHealth(Brand.Cyan, null)          // comfortable lead → fine
+    // Thin lead — now the rate tells us whether we're recovering or stuck.
+    if (stats.downloadRateBytes == 0 && stats.progress <= 0.01f) return BarHealth(Brand.Star, "connecting…")
+    if (stats.downloadRateBytes == 0 && stats.progress < 0.99f) return BarHealth(Brand.Error, "stalled")
+    return BarHealth(Brand.Star, "low buffer")
 }
 
 private fun formatRate(bytesPerSec: Int): String = when {

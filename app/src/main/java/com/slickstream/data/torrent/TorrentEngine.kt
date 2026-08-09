@@ -120,6 +120,11 @@ class TorrentEngine @Inject constructor(
          *  piece under the resume position, so we buffer where the user will actually watch instead of
          *  wasting the startup window downloading the file head they'll skip. Set by [setStreamStart]. */
         @Volatile var streamStartPiece: Int = 0,
+        /** STREAMING concentration: the selected file's base priority is IGNORE, so libtorrent can only
+         *  download the head/resume/read-ahead/moov windows raised to TOP (+ whatever a read forces via
+         *  ensureRange) — a MOVING DOWNLOAD WINDOW that stops the swarm scattering across the whole file.
+         *  False for offline downloads, which want every piece. Set by [setStreamStart]. */
+        @Volatile var concentrate: Boolean = false,
     )
 
     @Synchronized
@@ -889,25 +894,48 @@ class TorrentEngine @Inject constructor(
     }
 
     /**
-     * Anchor the bulk download at a RESUME position ([fraction] of the file, 0f..1f) instead of the file
-     * head, so a resumed title buffers where the user will actually watch. Called once right after the
-     * torrent is added/selected. A ~0 fraction is a no-op (from-start play keeps the head anchor). The
-     * file header still downloads via its own deadline band in [prioritizeHeadAndTail] — ExoPlayer needs
-     * it to parse the container before it can seek.
+     * Set up STREAMING download shaping right after the torrent is added/selected:
+     *  - anchor the bulk download at a RESUME position ([fraction] of the file, 0f..1f) instead of the
+     *    file head, so a resumed title buffers where the user will actually watch;
+     *  - when [concentrate], set the selected file's base priority to IGNORE so libtorrent can only
+     *    download the head/resume/read-ahead/moov windows (raised to TOP) plus whatever a read forces via
+     *    ensureRange — a MOVING DOWNLOAD WINDOW that stops the swarm scattering across the whole file
+     *    while the head is still filling ("96 seeders, 4.6 MB/s, 1% downloaded scattered, still buffering").
+     *
+     * Offline downloads pass concentrate=false — they want every piece, and nothing reads to advance a
+     * window. Playback can never starve under concentration: ensureRange force-raises + deadlines the exact
+     * pieces each read needs, independently of this base.
      */
-    fun setStreamStart(infoHash: String, fraction: Float) {
-        if (fraction <= 0.001f) return
+    fun setStreamStart(infoHash: String, fraction: Float, concentrate: Boolean) {
         val active = torrents[infoHash] ?: return
         val handle = liveHandle(active) ?: return
         if (active.pieceLength <= 0 || active.fileLength <= 0) return
-        val startByte = (active.fileLength * fraction.coerceIn(0f, 0.98f)).toLong()
-        val piece = ((active.fileOffset + startByte) / active.pieceLength).toInt()
-            .coerceIn(active.firstPiece, active.lastPiece)
-        if (piece == active.streamStartPiece) return
-        active.streamStartPiece = piece
-        // Force advanceReadHead to re-apply from the new anchor on the next read().
+
+        if (fraction > 0.001f) {
+            val startByte = (active.fileLength * fraction.coerceIn(0f, 0.98f)).toLong()
+            active.streamStartPiece = ((active.fileOffset + startByte) / active.pieceLength).toInt()
+                .coerceIn(active.firstPiece, active.lastPiece)
+        }
+        // Force advanceReadHead to re-apply from the (possibly new) anchor on the next read().
         active.readHeadPiece = -1
-        Log.i(TAG, "setStreamStart $infoHash frac=$fraction piece=$piece (first=${active.firstPiece} last=${active.lastPiece})")
+
+        if (concentrate && !active.concentrate) {
+            active.concentrate = true
+            // Base the whole selected file at IGNORE in ONE native call; the head/resume/tail bands below
+            // (and the moving read-ahead window + ensureRange during playback) re-raise what's needed.
+            val info = synchronized(nativeLock) { runCatching { handle.torrentFile() }.getOrNull() }
+            val numFiles = runCatching { info?.files()?.numFiles() ?: 0 }.getOrDefault(0)
+            if (info != null && numFiles > 0) {
+                synchronized(nativeLock) {
+                    runCatching { handle.prioritizeFiles(Array(numFiles) { Priority.IGNORE }) }
+                }
+            }
+        }
+        Log.i(
+            TAG,
+            "setStreamStart $infoHash frac=$fraction concentrate=$concentrate startPiece=${active.streamStartPiece} " +
+                "(first=${active.firstPiece} last=${active.lastPiece})",
+        )
         applySequentialAndPriority(handle, active)
     }
 

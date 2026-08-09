@@ -410,7 +410,9 @@ class DownloadManager @Inject constructor(
         // downloaded — releasing workLock so the next queued item (e.g. the rest of a season) can run.
         // A plain collect{ return@collect } would loop forever and jam the queue. A terminal ERROR
         // throws out to the failover loop, which tries the next source.
-        val finalStatus = torrentStreamer.start(source)
+        // concentrate=false: an offline download wants EVERY piece on disk, and nothing reads to advance a
+        // moving window — so it must fetch the whole file, not just a head/playhead window.
+        val finalStatus = torrentStreamer.start(source, startPositionFraction = 0f, concentrate = false)
                 .onEach { status ->
                     if (status.state == StreamState.ERROR) {
                         throw java.io.IOException(status.errorMessage ?: "torrent error")

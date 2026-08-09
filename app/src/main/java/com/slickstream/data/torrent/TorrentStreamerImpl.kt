@@ -71,7 +71,11 @@ class TorrentStreamerImpl @Inject constructor(
      *  current episode can't evict the precache before the user advances. Cleared once it streams. */
     @Volatile private var warmedHash: String? = null
 
-    override fun start(source: StreamSource, startPositionFraction: Float): Flow<StreamStatus> = callbackFlow {
+    override fun start(
+        source: StreamSource,
+        startPositionFraction: Float,
+        concentrate: Boolean,
+    ): Flow<StreamStatus> = callbackFlow {
         sources[source.infoHash] = source
 
         if (!engine.isAvailable()) {
@@ -138,11 +142,12 @@ class TorrentStreamerImpl @Inject constructor(
             unmarkAcquiring(requestedHash)
         }
 
-        // Anchor the bulk download at the RESUME position so we buffer where the user will actually start
-        // watching, not the file head they'll skip past (the "resume near the end but it downloads from
-        // 0% for a minute first" bug). No-op for a from-start play (fraction ~0). The file header still
-        // downloads via its own deadline band — ExoPlayer needs it to parse the container before it seeks.
-        runCatching { engine.setStreamStart(infoHash, startPositionFraction) }
+        // Shape the download for streaming: anchor the bulk fill at the RESUME position (not the file
+        // head the user skips past), AND — when concentrating — base the file at IGNORE so the swarm
+        // pours into the head/read-ahead window instead of scattering across the whole file. Offline
+        // downloads pass concentrate=false (they want every piece). Playback can't starve — ensureRange
+        // force-raises whatever each read needs regardless of the base.
+        runCatching { engine.setStreamStart(infoHash, startPositionFraction, concentrate) }
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
         // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
