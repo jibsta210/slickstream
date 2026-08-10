@@ -94,6 +94,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.slickstream.core.common.formatRate
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.SubtitleTrack
@@ -1003,9 +1004,9 @@ private fun bufferingStats(state: PlayerUiState.Buffering): String = buildString
         if (isNotEmpty()) append("  ·  ")
         append("${state.seeders} seeders")
     }
-    if (state.downloadRateBytes > 0) {
+    if (state.payloadRateBytes > 0) {
         if (isNotEmpty()) append("  ·  ")
-        append(formatRate(state.downloadRateBytes))
+        append(formatRate(state.payloadRateBytes))
     }
     if (isEmpty()) append("Connecting…")
 }
@@ -1144,9 +1145,9 @@ private fun RebufferBadge(state: RebufferState, modifier: Modifier = Modifier) {
                 Text(
                     text = buildString {
                         append(state.etaSeconds?.let { "about ${it}s left" } ?: "waiting ${elapsed}s")
-                        if (state.downloadRateBytes > 0) {
+                        if (state.payloadRateBytes > 0) {
                             append("  ·  ")
-                            append(formatRate(state.downloadRateBytes))
+                            append(formatRate(state.payloadRateBytes))
                         }
                     },
                     color = Brand.Cyan,
@@ -1737,12 +1738,7 @@ private fun QualityChip(quality: String, highlighted: Boolean) {
 
 // --- formatting helpers -----------------------------------------------------
 
-private fun formatRate(bytesPerSec: Int): String {
-    if (bytesPerSec <= 0) return "0 MB/s"
-    val mbps = bytesPerSec / (1024.0 * 1024.0)
-    return if (mbps >= 1.0) String.format("%.1f MB/s", mbps)
-    else String.format("%.0f KB/s", bytesPerSec / 1024.0)
-}
+// formatRate now lives in core.common — see RateFormat.kt for why there was more than one.
 
 private fun formatSize(bytes: Long?): String {
     if (bytes == null || bytes <= 0) return "—"

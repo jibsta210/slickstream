@@ -178,7 +178,7 @@ fun SettingsScreen(
             TextField(
                 value = sourceInput,
                 onValueChange = { sourceInput = it },
-                placeholder = { Text("Paste your Torrentio / debrid URL", color = Brand.OnSurfaceDim) },
+                placeholder = { Text("Real-Debrid API token, or a full addon URL", color = Brand.OnSurfaceDim) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
@@ -194,11 +194,12 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(10.dp))
             SettingsPill("Save source", primary = true) {
-                viewModel.setCustomSourceUrl(sourceInput.trim())
+                // Accepts a bare RD API token as well as a full URL.
+                viewModel.setDebridToken(sourceInput.trim())
                 sourceInput = ""
             }
             Spacer(Modifier.height(6.dp))
-            Hint("Paste a configured streaming-addon URL — e.g. a Real-Debrid–backed Torrentio from torrentio.strem.fun/configure. It's queried first and returns instant direct streams (no torrenting, no waiting). It syncs to your signed-in TVs, so you only paste it once. Keep it private — it contains your account token.")
+            Hint("Paste your Real-Debrid API TOKEN here (from real-debrid.com/apitoken) and it's wired up for you — or paste a full addon URL if you'd rather build it yourself at torrentio.strem.fun/configure.\n\nThis matters more than it sounds: the built-in indexer is the PLAIN public Torrentio, which never talks to Real-Debrid at all. Without this, an RD subscription does nothing for finding sources. With it, anything RD already has cached streams instantly as a direct download — no swarm, no seeders, no waiting for the file index, which is the single biggest cause of a slow start.\n\nQueried first, and it syncs to your signed-in TVs so you only enter it once. Keep it private — it is an account credential.")
         }
 
         SettingsSection("Display") {

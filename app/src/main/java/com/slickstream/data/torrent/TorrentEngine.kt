@@ -4,7 +4,11 @@ import android.content.Context
 import android.util.Log
 import com.slickstream.core.common.DeviceProfile
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
@@ -115,7 +119,30 @@ class TorrentEngine @Inject constructor(
         @Volatile var lastPiece: Int = 0,
         @Volatile var fileOffset: Long = 0L,
         @Volatile var readHeadPiece: Int = -1,
+        /** The read-ahead window currently carrying TOP priority + a deadline. Tracked so a one-piece
+         *  advance only arms the pieces that just ENTERED the window instead of re-issuing the whole
+         *  25-49 piece ladder under nativeLock on every advance. -1 = nothing armed. */
+        @Volatile var armedReadaheadFirst: Int = -1,
+        @Volatile var armedReadaheadLast: Int = -1,
         @Volatile var startupTailArmed: Boolean = false,
+        /** Cached verdict of the top-level mp4 box walk over the contiguous head. Once terminal this is
+         *  never recomputed — the old code re-walked the file from disk on EVERY 500 ms poll tick. */
+        @Volatile var headScan: Mp4BoxScan.HeadScan? = null,
+        /** Where the EOF index actually is, once proven from the file's own box chain. Until it resolves
+         *  (or fails) the blind [TAIL_PRIORITY_BYTES] band stays in force. */
+        @Volatile var moovProbe: MoovProbe = MoovProbe.Idle,
+        /** Transient probe failures (bytes never arrived / short read) before we give up and keep the
+         *  blind band forever. A short read is NOT a structural verdict — libtorrent flips a piece's bit
+         *  on hash-pass BEFORE flushing its write cache, so a legitimate read can briefly come up short. */
+        @Volatile var moovProbeAttempts: Int = 0,
+        /** The piece band currently raised to TOP as "the index", so it can be unwound when the probe
+         *  shrinks it. Without the unwind, pieces armed under the old 8 MB guess keep TOP priority
+         *  forever and go on stealing swarm capacity from the bytes about to play. */
+        @Volatile var armedIndexFirst: Int = -1,
+        @Volatile var armedIndexLast: Int = -1,
+        /** Bumped by [selectFile]. A season pack re-selects a DIFFERENT episode on the SAME object, so a
+         *  probe launched for episode 3 must not commit an extent onto episode 5. */
+        @Volatile var selectionEpoch: Int = 0,
         /** Piece the BULK download should begin at — the file's first piece normally, but on a RESUME the
          *  piece under the resume position, so we buffer where the user will actually watch instead of
          *  wasting the startup window downloading the file head they'll skip. Set by [setStreamStart]. */
@@ -125,7 +152,36 @@ class TorrentEngine @Inject constructor(
          *  ensureRange) — a MOVING DOWNLOAD WINDOW that stops the swarm scattering across the whole file.
          *  False for offline downloads, which want every piece. Set by [setStreamStart]. */
         @Volatile var concentrate: Boolean = false,
-    )
+    ) {
+        /** One probe at a time per torrent. Deliberately NOT a constructor property: this is a data class
+         *  and an AtomicBoolean has no meaningful equals/hashCode/copy semantics. */
+        val moovProbeInFlight = AtomicBoolean(false)
+
+        /** Guards the probe state machine (epoch + scan + verdict + latch) so a re-select and a probe
+         *  commit cannot interleave. Distinct from nativeLock, which serialises NATIVE calls only. */
+        val probeLock = Any()
+    }
+
+    /** Lifecycle of the "where exactly is the moov" probe for one torrent. */
+    private sealed interface MoovProbe {
+        /** Not started, or a transient failure that will be retried on the next tick. */
+        object Idle : MoovProbe
+        /** A probe coroutine is fetching + reading the box header right now. */
+        object Running : MoovProbe
+        /** Proven from the file: require exactly these bytes / pieces, nothing more. */
+        data class Exact(
+            val start: Long,
+            val endExclusive: Long,
+            val firstPiece: Int,
+            val lastPiece: Int,
+        ) : MoovProbe
+        /** TERMINAL: the moov could not be located with confidence. Today's blind 8 MB EOF band, forever. */
+        object Fallback : MoovProbe
+    }
+
+    /** Coroutine host for the moov probe. It must outlive the caller's poll tick (it waits on pieces to
+     *  arrive), and must never take the poll loop down with it if it fails — hence a SupervisorJob on IO. */
+    private val probeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Synchronized
     fun ensureStarted() {
@@ -179,9 +235,14 @@ class TorrentEngine @Inject constructor(
             // Cap the DOWNLOAD on EVERY device. Under sequential streaming the engine pulls the WHOLE
             // file ahead at line rate in the background while you only play at the bitrate — uncapped on
             // a gigabit link that saturates the pipe and bufferbloats every other device in the house
-            // (the "my whole internet tanks while it streams" report). 12 MB/s (~96 Mbps) still fills the
-            // head + moov in ~1s and stays way ahead of even 4K playback, while leaving the bulk of a
-            // gigabit link free. TV stays 8 MB/s (also bounds SHA-1 hashing / eMMC write pressure).
+            // (the "my whole internet tanks while it streams" report). The TV/low-power cap is 12 MiB/s
+            // (~100 Mbps) and everything else 16 MiB/s — both still fill the head + moov in ~1 s and stay
+            // way ahead of even 4K playback while leaving the bulk of a gigabit link free. (The comment
+            // here used to claim 12 and 8; it described neither of the numbers below.)
+            // Worth knowing when reading the DIAG waste line: failed and redundant bytes are charged
+            // against THIS cap — they cross the wire — so at 18% waste ~2 MB/s of a 12 MiB/s budget buys
+            // nothing. The cap is not the binding constraint at the observed 7.7 MB/s, but it becomes one
+            // as soon as duplication climbs.
             setInteger(
                 settings_pack.int_types.download_rate_limit.swigValue(),
                 if (lowPower) 12 * 1024 * 1024 else 16 * 1024 * 1024,
@@ -213,8 +274,13 @@ class TorrentEngine @Inject constructor(
                 settings_pack.int_types.suggest_mode.swigValue(),
                 settings_pack.suggest_mode_t.suggest_read_cache.swigValue(),
             )
-            // Lower so peers aren't encouraged to grab whole LATER pieces they happen to hold instead
-            // of converging on the deadlined head band (part of the block-scatter fix).
+            // 20 is libtorrent's OWN default for this key (settings_pack.cpp), so this line changes
+            // nothing — it is left explicit only so the value is visible next to the rest of the request
+            // posture. It is deliberately NOT lowered despite the old comment here claiming it had been:
+            // the semantics are "a peer that could finish a whole piece within N seconds gets whole-piece
+            // requests", so lowering N pushes peers to block-level picking, which fragments piece
+            // OWNERSHIP across many peers and leaves pieces sitting at 90% waiting on the slowest
+            // contributor. For streaming that is a stall risk, and stalls outrank bandwidth here.
             setInteger(settings_pack.int_types.whole_pieces_threshold.swigValue(), 20)
             // Bounded outstanding-request pipeline. A very deep queue (the old 2500) under a cold head
             // fills with SCATTERED blocks from peers that lack the head before the deadline reorder can
@@ -821,6 +887,28 @@ class TorrentEngine @Inject constructor(
         active.lastPiece = ((active.fileOffset + active.fileLength - 1) / active.pieceLength).toInt()
         // Default the bulk-start anchor to the file head; a resume overrides it via setStreamStart().
         active.streamStartPiece = active.firstPiece
+        // A season pack re-selects a DIFFERENT episode onto this SAME object (fileOffset/firstPiece/
+        // lastPiece all move). Every moov fact we hold is about the OLD file — drop it, or a moov extent
+        // proven for episode 3 gets required on episode 5. The epoch bump also makes an in-flight probe
+        // abandon instead of committing.
+        // ONE monitor shared with probeMoov's commit (and moovLocation's cache write). Without it the
+        // probe's guard was check-then-act across a nativeLock acquisition, so a re-select landing in that
+        // window let episode N's extent commit against episode N+1's byte offsets — a range that is not
+        // the new file's moov at all. tailAvailable would then gate on the wrong pieces: either opening
+        // early (READY with no moov -> ExoPlayer buffers forever) or never (the 4-minute
+        // "index unavailable" error on a healthy swarm).
+        synchronized(active.probeLock) {
+        active.selectionEpoch += 1
+        active.headScan = null
+        active.moovProbe = MoovProbe.Idle
+        active.moovProbeAttempts = 0
+        active.armedIndexFirst = -1
+        active.armedIndexLast = -1
+        // Also release the in-flight latch. A probe still waiting on the PREVIOUS episode holds this
+        // true; without clearing it, compareAndSet below would refuse to launch a probe for the new
+        // selection and that episode would silently keep the blind 8 MB band for its whole life.
+        active.moovProbeInFlight.set(false)
+        }
 
         val relPath = files.filePath(chosen)
         active.filePath = File(torrentSavePath(active.infoHash), relPath).absolutePath
@@ -916,8 +1004,13 @@ class TorrentEngine @Inject constructor(
             active.streamStartPiece = ((active.fileOffset + startByte) / active.pieceLength).toInt()
                 .coerceIn(active.firstPiece, active.lastPiece)
         }
-        // Force advanceReadHead to re-apply from the (possibly new) anchor on the next read().
+        // Force advanceReadHead to re-apply from the (possibly new) anchor on the next read(). Clearing
+        // the armed window with it is what makes that "re-apply" mean the FULL ladder: the incremental
+        // path below trusts these bounds, and after a re-anchor they describe a play position that no
+        // longer exists.
         active.readHeadPiece = -1
+        active.armedReadaheadFirst = -1
+        active.armedReadaheadLast = -1
 
         if (concentrate && !active.concentrate) {
             active.concentrate = true
@@ -967,7 +1060,10 @@ class TorrentEngine @Inject constructor(
         val headPieces = maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, pieceLen))
         // Only ISO-BMFF containers can require an EOF moov before first frame. Other containers fetch an
         // EOF seek map on demand if the player actually asks for it; speculative EOF work starves thin heads.
-        val tailFrom = startupTailFromPiece(active)
+        // At add time indexPieceRange is always the blind band — the probe that can shrink it needs the
+        // mdat length, which needs a head that has not landed yet. applyIndexBand does the swap later.
+        val armIndex = startupTailFromPiece(active) != null
+        val indexBand = if (armIndex) indexPieceRange(active) else null
         // Let the first contiguous head piece win before the EOF band. Giving both deadline zero made a
         // 32 MB head piece and a 32 MB tail piece split a thin swarm in parallel, doubling the time until
         // the UI could show meaningful head progress without reducing total MP4 readiness work.
@@ -983,6 +1079,15 @@ class TorrentEngine @Inject constructor(
             // 2 landing before piece 0). A big per-piece step makes piece 0 FAR more overdue than 1,2,3,
             // so the swarm converges on it first, then 1, then 2 — strict in-order head fill.
             handle.clearPieceDeadlines()
+            // The read-ahead ladder lives in the SAME native deadline table that was just wiped, so the
+            // record of what is armed is now a lie. advanceReadHead arms only the pieces that newly enter
+            // the window (it trusts these bounds), so leaving them set means the window it thinks is
+            // deadlined has NO deadlines at all — and nothing re-arms it, because a forward slide looks
+            // normal. That is a silent mid-stream stall: reachable via resume() -> applySequentialAndPriority
+            // (the poll loop self-heals a prewarm-paused torrent this way at TorrentStreamerImpl's
+            // isPaused check). Forget the record so the next advance re-arms the whole window.
+            active.armedReadaheadFirst = -1
+            active.armedReadaheadLast = -1
             // (1) FILE-HEADER band at the file start — ExoPlayer must parse the container header (ftyp/moov
             //     or EBML/Tracks) at offset 0 before it can decode OR seek, so this is fetched even on a
             //     resume. Small (~HEAD_PRIORITY_BYTES).
@@ -1009,17 +1114,24 @@ class TorrentEngine @Inject constructor(
                 resumeBase += headPieces * HEAD_DEADLINE_STEP_MS
             }
             // (3) EOF moov/cues band, after the header + resume bands.
-            if (tailFrom != null) {
+            if (indexBand != null) {
                 var i = 0
-                for (p in active.lastPiece downTo tailFrom) {
+                for (p in indexBand.last downTo indexBand.first) {
                     if (p in active.firstPiece..active.lastPiece) {
                         handle.piecePriority(p, Priority.TOP_PRIORITY)
                         handle.setPieceDeadline(p, maxOf(tailBase, resumeBase) + i * HEAD_DEADLINE_STEP_MS)
                         i++
                     }
                 }
+                // Record what is armed so applyIndexBand can UNWIND it once the probe proves a smaller
+                // extent — otherwise the surplus pieces keep TOP priority and go on stealing the swarm.
+                active.armedIndexFirst = indexBand.first
+                active.armedIndexLast = indexBand.last
+            } else {
+                active.armedIndexFirst = -1
+                active.armedIndexLast = -1
             }
-            active.startupTailArmed = tailFrom != null
+            active.startupTailArmed = indexBand != null
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
     }
 
@@ -1044,12 +1156,14 @@ class TorrentEngine @Inject constructor(
         val active = torrents[infoHash] ?: return
         if (!active.startupTailArmed || active.pieceLength <= 0) return
         val handle = active.handle?.takeIf { it.isValid } ?: return
-        val tailFrom = tailFromPiece(active)
+        // Whichever band is in force — the proven moov extent once the probe lands, the blind EOF guess
+        // until then. Re-issuing the exact extent is what makes this cheap on a big-piece torrent.
+        val idx = indexPieceRange(active)
         synchronized(nativeLock) {
             if (!active.startupTailArmed) return@synchronized
             runCatching {
                 var i = 0
-                for (p in active.lastPiece downTo tailFrom) {
+                for (p in idx.last downTo idx.first) {
                     if (p in active.firstPiece..active.lastPiece) {
                         handle.piecePriority(p, Priority.TOP_PRIORITY)
                         handle.setPieceDeadline(p, i * TAIL_PROMOTION_DEADLINE_STEP_MS)
@@ -1060,25 +1174,40 @@ class TorrentEngine @Inject constructor(
         }
     }
 
-    /** A faststart MP4 revealed its moov in the head, so its speculative EOF work is no longer useful. */
+    /** A faststart MP4 revealed its moov in the head, so its speculative EOF work is no longer useful.
+     *  Unwinds through [applyIndexBand] so the abandoned pieces drop to the file's real BASE priority —
+     *  IGNORE under concentration, where the old inline DEFAULT (4) left them still downloading and
+     *  stealing head bandwidth from exactly the faststart files this cancel exists to speed up. */
     fun cancelStartupTail(infoHash: String) {
         val active = torrents[infoHash] ?: return
         if (!active.startupTailArmed || active.pieceLength <= 0) return
+        // Faststart mp4: the moov turned out to be in the head, so the speculative EOF band is no longer
+        // urgent. De-URGENT it — clear its deadlines — but do NOT lower its priority.
+        //
+        // The "this only runs before the gate opens" argument that used to justify lowering here is FALSE:
+        // this is called from the poll loop, which keeps running after READY, and its only guard is the
+        // one-shot startupTailArmed. moovInHead can first flip true AFTER playback has begun (the box walk
+        // cannot reach the moov until enough contiguous head exists). So a read can absolutely be in
+        // flight, and lowering a piece that ensureRange raised for a blocked read stops it downloading,
+        // fails the read after its 75 s wait, and fails the source over on a HEALTHY swarm — the same
+        // defect two review rounds already died on, via releaseProbePin and then applyIndexBand.
+        //
+        // Engine-wide rule, now without exception: NOTHING lowers a piece priority. The probe cannot know
+        // what the player is mid-read on, and a stale TOP piece costs at most a few MB of the band we were
+        // fetching anyway, whereas a wrongly-demoted one costs the stream.
         val handle = active.handle?.takeIf { it.isValid } ?: return
+        val idx = indexPieceRange(active)
+        val startupHeadLast = active.firstPiece +
+            maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, active.pieceLength)) - 1
         synchronized(nativeLock) {
-            if (!active.startupTailArmed) return@synchronized
             runCatching {
-                val startupHeadLast = active.firstPiece +
-                    maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, active.pieceLength)) - 1
-                for (p in active.lastPiece downTo tailFromPiece(active)) {
-                    if (p in active.firstPiece..active.lastPiece && p > startupHeadLast) {
-                        handle.resetPieceDeadline(p)
-                        handle.piecePriority(p, Priority.DEFAULT)
-                    }
+                for (p in idx) {
+                    if (p !in active.firstPiece..active.lastPiece || p <= startupHeadLast) continue
+                    handle.resetPieceDeadline(p)
                 }
-                active.startupTailArmed = false
-            }
+            }.onFailure { Log.w(TAG, "cancelStartupTail failed", it) }
         }
+        active.startupTailArmed = false
     }
 
     /** Ceiling of [a]/[b] for positive ints. */
@@ -1105,11 +1234,13 @@ class TorrentEngine @Inject constructor(
         // forward one 1 MB chunk at a time, each chunk racing the head cursor, and stalls for >1 min.
         // set_piece_deadline marks these "time critical" and libtorrent fetches them AHEAD of the
         // sequential cursor, so the whole moov arrives promptly and the moov gate never deadlocks.
-        // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
-        // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
-        // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
-        val tailFrom = tailFromPiece(active)
-        val deadlineLast = if (lastNeeded >= tailFrom) active.lastPiece else lastNeeded
+        // MUST match the band that was actually deadlined — the old "/pieceLength + 1" required one EOF
+        // piece MORE than was ever deadlined, so tailAvailable rarely went true on its own and READY only
+        // fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
+        // The maxOf is load-bearing: with a moov followed by a trailing free/udta the index band ENDS
+        // BEFORE the last piece, and a naive swap would under-deadline a read that lands past the moov.
+        val idx = indexPieceRange(active)
+        val deadlineLast = if (lastNeeded >= idx.first) maxOf(lastNeeded, idx.last) else lastNeeded
 
         // Bump priority + deadlines so libtorrent fetches these next, in order. Best-effort: a
         // concurrent stop() can invalidate the handle mid-loop, making the native call throw.
@@ -1213,21 +1344,23 @@ class TorrentEngine @Inject constructor(
         }
     }
 
-    /** True if the tail pieces (needed for mp4 moov atoms) are present. */
+    /** True if EVERY piece of the index band (the mp4 moov) is present. Unchanged in strictness: the
+     *  band is either the proven moov extent or today's blind EOF guess, and all of it is required. */
     fun tailAvailable(infoHash: String): Boolean = synchronized(nativeLock) {
         val active = torrents[infoHash] ?: return@synchronized false
         val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized false
         if (active.pieceLength <= 0) return@synchronized false
-        // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
-        // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
-        // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
-        val tailFrom = tailFromPiece(active)
+        // MUST match the band prioritizeHeadAndTail/applyIndexBand actually deadlined — the old
+        // "/pieceLength + 1" required one EOF piece MORE than was ever deadlined, so tailAvailable rarely
+        // went true on its own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax
+        // on every stream. indexPieceRange is now the single definition both sides read.
+        val idx = indexPieceRange(active)
         val status = runCatching { handle.status(TorrentHandle.QUERY_PIECES) }.getOrNull()
             ?: return@synchronized false
         val pieces = status.pieces()
         val pieceCount = pieces.size()
         if (pieceCount == 0) return@synchronized false
-        for (p in active.lastPiece downTo tailFrom) {
+        for (p in idx.last downTo idx.first) {
             if (p in active.firstPiece..active.lastPiece) {
                 if (p >= pieceCount || !pieces.getBit(p)) return@synchronized false
             }
@@ -1341,48 +1474,404 @@ class TorrentEngine @Inject constructor(
         torrents[infoHash]?.filePath?.substringAfterLast('.', "")?.lowercase()?.takeIf { it.isNotBlank() }
 
     /**
-     * For an mp4/m4v/mov: is the `moov` index up FRONT (a "faststart"/web-optimized file)? Walks the
-     * top-level boxes in the already-downloaded contiguous head:
-     *  - `true`  = `moov` appears before any media (`mdat`/`moof`) → the index is in the head, so we can
-     *    start WITHOUT the EOF tail (it streams in with the head),
-     *  - `false` = media comes first → the moov is at the END → the tail genuinely IS required,
-     *  - `null`  = not enough head yet to decide (caller stays conservative until it resolves).
-     * Reads the on-disk file directly (offset 0 = file start); only bytes within the contiguous head.
+     * WHERE THE INDEX IS, for an mp4/m4v/mov — the single question that decides whether a fresh torrent
+     * starts in seconds or in minutes.
+     *
+     *  - [MoovLocation.InHead] — `moov` appears before any media box: a "faststart"/web-optimized file.
+     *    The index streams in with the head, so NO EOF work is needed at all.
+     *  - [MoovLocation.AtEofExact] — the box chain resolved AND the box after `mdat` was read and proven
+     *    to be a `moov`: require exactly those bytes. This is the win. A 1.5 MB moov costs ~1.5 MB
+     *    (piece-rounded) instead of the 16-64 MB an 8 MB band costs once rounded up to 8-32 MB pieces.
+     *  - [MoovLocation.AtEofUnknown] — media comes first but the extent could not be proven (or the
+     *    probe is still in flight): the caller keeps TODAY'S EXACT blind [TAIL_PRIORITY_BYTES] band.
+     *  - [MoovLocation.Undecided] — not enough contiguous head to tell yet; stay conservative and ask
+     *    again next tick.
+     *
+     * NON-BLOCKING and cheap. Once a verdict is terminal it is answered from cached state with ZERO
+     * I/O — the previous implementation re-opened and re-walked the file on every 500 ms poll. When the
+     * chain resolves to "media first at a known offset", the actual byte fetch + header read is handed
+     * to a background probe ([probeMoov]) and this returns AtEofUnknown immediately, so the poll loop
+     * is never made to wait on the swarm.
      */
-    fun mp4MoovInHead(infoHash: String, knownHeadBytes: Long? = null): Boolean? {
-        val active = torrents[infoHash] ?: return null
-        val path = active.filePath ?: return null
-        val head = knownHeadBytes ?: contiguousHeadBytes(infoHash)
-        if (head < 16L) return null
-        return runCatching {
-            java.io.RandomAccessFile(path, "r").use { raf ->
-                var pos = 0L
-                val hdr = ByteArray(8)
-                while (pos + 8 <= head && pos < MP4_SCAN_LIMIT) {
-                    raf.seek(pos)
-                    if (raf.read(hdr, 0, 8) < 8) return@use null
-                    val size32 = ((hdr[0].toInt() and 0xFF) shl 24) or ((hdr[1].toInt() and 0xFF) shl 16) or
-                        ((hdr[2].toInt() and 0xFF) shl 8) or (hdr[3].toInt() and 0xFF)
-                    when (String(hdr, 4, 4, Charsets.US_ASCII)) {
-                        "moov" -> return@use true               // index up front → faststart, no tail wait
-                        "mdat", "moof" -> return@use false      // media before index → moov at EOF
-                    }
-                    val boxLen: Long = when {
-                        size32 == 1 -> {                        // 64-bit largesize
-                            if (pos + 16 > head) return@use null
-                            raf.seek(pos + 8); val lb = ByteArray(8)
-                            if (raf.read(lb, 0, 8) < 8) return@use null
-                            var s = 0L; for (b in lb) s = (s shl 8) or (b.toLong() and 0xFF); s
-                        }
-                        size32 == 0 -> return@use false         // box runs to EOF before moov
-                        else -> size32.toLong()
-                    }
-                    if (boxLen < 8L) return@use null
-                    pos += boxLen
+    fun moovLocation(infoHash: String, knownHeadBytes: Long? = null): MoovLocation {
+        val active = torrents[infoHash] ?: return MoovLocation.Undecided
+        val path = active.filePath ?: return MoovLocation.Undecided
+
+        // (a) Terminal probe verdicts answer with no I/O whatsoever.
+        when (val probe = active.moovProbe) {
+            is MoovProbe.Exact -> return MoovLocation.AtEofExact(probe.start, probe.endExclusive)
+            MoovProbe.Fallback -> return MoovLocation.AtEofUnknown
+            else -> Unit
+        }
+
+        // (b) The head walk is also cached — a faststart verdict can never change.
+        // Epoch and cached scan are read as ONE unit: sampling them separately let a re-select land
+        // between them and pair episode N's scan with episode N+1's epoch, which then passed every
+        // downstream guard and probed the new file at the old file's mdat offset.
+        val (walkEpoch, cachedScan) = synchronized(active.probeLock) {
+            active.selectionEpoch to active.headScan
+        }
+        val scan = cachedScan ?: run {
+            val head = knownHeadBytes ?: contiguousHeadBytes(infoHash)
+            if (head < Mp4BoxScan.BOX_HEADER_BYTES) return MoovLocation.Undecided
+            // Reads the on-disk file directly, OUTSIDE nativeLock (no libtorrent call is involved) —
+            // exactly as the old mp4MoovInHead did. Only bytes inside the contiguous head are touched,
+            // so a sparse hole can never be mistaken for a box.
+            val walked = runCatching {
+                java.io.RandomAccessFile(path, "r").use { raf ->
+                    Mp4BoxScan.scanHead({ pos, len -> readExactly(raf, pos, len) }, head, MP4_SCAN_LIMIT)
                 }
-                null
+            }.getOrNull() ?: return MoovLocation.Undecided
+            synchronized(active.probeLock) {
+                // The walk read the file OUTSIDE the lock (it is I/O). If a re-select landed meanwhile,
+                // this result describes the PREVIOUS episode — caching it would pin the new one to the
+                // wrong verdict, and a stale "faststart" verdict would make the gate drop the moov
+                // requirement entirely for a file whose moov is at EOF.
+                if (active.selectionEpoch != walkEpoch) return MoovLocation.Undecided
+                active.headScan = walked
             }
+            walked
+        }
+
+        return when (scan) {
+            Mp4BoxScan.HeadScan.MoovFirst -> MoovLocation.InHead
+            Mp4BoxScan.HeadScan.MediaFirstUnresolved -> {
+                // Fragmented mp4 / largesize mdat / mdat-to-EOF: an EOF index is needed but its extent
+                // is unknowable from the head. Lock in today's blind band and stop re-walking — but only
+                // if this verdict still belongs to the current selection.
+                synchronized(active.probeLock) {
+                    if (active.selectionEpoch == walkEpoch) active.moovProbe = MoovProbe.Fallback
+                }
+                MoovLocation.AtEofUnknown
+            }
+            is Mp4BoxScan.HeadScan.MediaFirst -> {
+                // Only ISO-BMFF ever probes. mkv/webm/avi keep their index at the front and must not
+                // have EOF work armed for them at all.
+                val isMoovContainer = path.substringAfterLast('.', "").lowercase() in MOOV_EXTS
+                if (isMoovContainer) {
+                    // Latch + verdict + epoch captured together, so the probe launched here is
+                    // guaranteed to be describing the selection its offset came from.
+                    synchronized(active.probeLock) {
+                        if (active.selectionEpoch == walkEpoch &&
+                            active.moovProbeInFlight.compareAndSet(false, true)
+                        ) {
+                            active.moovProbe = MoovProbe.Running
+                            probeScope.launch { probeMoov(active, scan.nextBoxOffset, walkEpoch) }
+                        }
+                    }
+                }
+                MoovLocation.AtEofUnknown
+            }
+        }
+    }
+
+    /**
+     * Prove the moov's exact extent, in the background.
+     *
+     * [mdatEnd] is where the box AFTER the media box starts — normally the `moov`, but a `free`/`skip`/
+     * `udta` can sit in between, so the header there is READ and verified rather than assumed. Reading
+     * it requires those bytes to exist, so this deadlines the covering piece(s), waits for them, then
+     * reads. Every failure path lands on the blind [TAIL_PRIORITY_BYTES] band — never on a guess.
+     *
+     * The one honest cost: on a >8 MB moov, [mdatEnd] falls OUTSIDE the last 8 MB, so a probe that then
+     * fails structurally has fetched one piece the old code would not have. Bounded to a single piece,
+     * and that same case is exactly where the old code was silently BROKEN (see [MoovLocation]).
+     */
+    private suspend fun probeMoov(active: ActiveTorrent, mdatEnd: Long, epoch: Int) {
+        // The probe's OWN pin, held on the stack. Deliberately not on ActiveTorrent: that state is shared
+        // with whatever probe replaces this one after a season-pack re-select, and a stale probe unwinding
+        // the LIVE probe's pieces was its own distinct failure (the replacement then waited out its full
+        // timeout on a piece nothing was fetching).
+        var pin: IntRange? = null
+        try {
+            val pieceLen = active.pieceLength
+            val fileLen = active.fileLength
+            val path = active.filePath
+            if (pieceLen <= 0 || fileLen <= 0L || path == null ||
+                mdatEnd < Mp4BoxScan.MIN_INDEX_OFFSET || mdatEnd + MOOV_HEADER_BYTES > fileLen
+            ) {
+                if (stillCurrent(active, epoch)) active.moovProbe = MoovProbe.Fallback
+                return
+            }
+
+            pin = pieceSpanFor(active, mdatEnd, mdatEnd + MOOV_HEADER_BYTES - 1)
+            if (!awaitBytes(active, mdatEnd, mdatEnd + MOOV_HEADER_BYTES - 1, MOOV_PROBE_TIMEOUT_MS, epoch)) {
+                // awaitBytes returns false for a genuine timeout AND for abandonment (torrent removed, or
+                // a season pack re-selected another episode onto this object). Only the former is a
+                // failure worth counting — see probeTransientFailure's guard.
+                probeTransientFailure(active, epoch, "bytes at $mdatEnd never arrived")
+                return
+            }
+            val header = runCatching {
+                java.io.RandomAccessFile(path, "r").use { readExactly(it, mdatEnd, MOOV_HEADER_BYTES) }
+            }.getOrNull()
+            if (header == null) {
+                // NOT a structural verdict: libtorrent flips a piece's have-bit on hash-pass BEFORE
+                // flushing its write cache, so a read can legitimately come up short for a moment.
+                probeTransientFailure(active, epoch, "short read at $mdatEnd")
+                return
+            }
+
+            val range = Mp4BoxScan.moovExtentAt(header, mdatEnd, fileLen)
+            if (range == null) {
+                Log.i(TAG, "moov probe: box at $mdatEnd is not a usable moov — keeping the 8 MB EOF band")
+                if (stillCurrent(active, epoch)) active.moovProbe = MoovProbe.Fallback
+                return
+            }
+
+            // Abandon rather than commit if the torrent was removed/evicted, or if a season pack
+            // re-selected a different episode onto this same object while we were waiting. Checked
+            // INSIDE probeLock below so the check and the write cannot be split by a re-select.
+
+            // Piece rounding AND the commit happen under probeLock, so the offsets used are guaranteed
+            // to belong to the same selection the verdict lands on.
+            val band = synchronized(active.probeLock) {
+                if (!stillCurrent(active, epoch)) return
+                val first = ((active.fileOffset + range.first) / pieceLen).toInt()
+                    .coerceIn(active.firstPiece, active.lastPiece)
+                val last = ((active.fileOffset + range.last) / pieceLen).toInt()
+                    .coerceIn(first, active.lastPiece)
+                active.moovProbe = MoovProbe.Exact(range.first, range.last + 1, first, last)
+                first..last
+            }
+            val first = band.first
+            val last = band.last
+            Log.i(
+                TAG,
+                "moov probe: exact extent ${range.first}..${range.last} " +
+                    "(${range.last - range.first + 1} B) pieces=$first..$last — was the blind " +
+                    "${TAIL_PRIORITY_BYTES / (1024 * 1024)} MB band (pieces ${tailFromPiece(active)}..${active.lastPiece})",
+            )
+            // Queue the exact band where prioritizeHeadAndTail would have put the blind one: BEHIND the
+            // head. Committing at deadline 0 here would outrank the head band the readiness gate is still
+            // waiting on — the probe can (and does) finish before the head is in. Only promoteStartupTail
+            // collapses this to the front, and only once the head has landed and the index is the sole
+            // thing left.
+            applyIndexBand(active, first..last, deadlineBase = indexDeadlineBase(active))
+        } finally {
+            // Ownership, not just verdicts. A probe abandoned for the PREVIOUS selection must not
+            // unpin — or hand over the latch of — the probe that has since replaced it: doing so
+            // unpinned a live probe's piece and let a second probe launch concurrently for the same
+            // epoch, which then timed out on a piece nothing was fetching and burned the attempt budget
+            // until the episode was stuck on the blind band it had never actually failed to probe.
+            if (stillCurrent(active, epoch)) {
+                // Deadlines only — never a priority. See applyIndexBand's add-only rule.
+                releaseProbeDeadlines(active, pin)
+                active.moovProbeInFlight.set(false)
+            }
+        }
+    }
+
+    /**
+     * Un-URGENT the probe's header pin: clears its DEADLINES and nothing else.
+     *
+     * Deliberately never lowers a priority. The probe shares piece state with the player: a piece it
+     * pinned can simultaneously be the piece [ensureRange] raised for a read ExoPlayer is BLOCKED on
+     * (StreamHttpServer waits up to 75 s for it). Demoting it there stopped it downloading, failed the
+     * read, and failed the source over on a perfectly healthy swarm. Nothing else in the engine lowers a
+     * priority for the same reason. The residue is at most one or two pieces left at TOP with no
+     * deadline — far cheaper than a false failover, and the next prioritizeHeadAndTail/applyIndexBand
+     * re-plans them anyway.
+     *
+     * [pin] is the PROBE'S OWN range, passed in rather than read from shared state, so an abandoned
+     * probe can only ever touch pieces it pinned itself.
+     */
+    private fun releaseProbeDeadlines(active: ActiveTorrent, pin: IntRange?) {
+        if (pin == null || active.pieceLength <= 0) return
+        val handle = active.handle?.takeIf { it.isValid } ?: return
+        val keep = indexPieceRange(active)
+        synchronized(nativeLock) {
+            runCatching {
+                for (p in pin) {
+                    if (p !in active.firstPiece..active.lastPiece) continue
+                    if (p in keep) continue          // the committed band owns its own deadlines
+                    handle.resetPieceDeadline(p)
+                }
+            }.onFailure { Log.w(TAG, "releaseProbeDeadlines failed", it) }
+        }
+    }
+
+    /**
+     * Where the EOF index band belongs in the deadline queue at STARTUP: behind the head band, and behind
+     * the resume band too when one is armed. Mirrors prioritizeHeadAndTail's `maxOf(tailBase, resumeBase)`
+     * so the startup arming, the probe's commit and the probe's own header pin cannot drift apart and
+     * start outranking the requirement the gate is actually blocked on. Only promoteStartupTail collapses
+     * the band to the front, and only once the head has landed and the index is all that is left.
+     */
+    /** Piece span covering a file-relative byte range, via the file's TORRENT offset (a file in a
+     *  multi-file torrent does not start on a piece boundary). Null when geometry is not known yet. */
+    private fun pieceSpanFor(active: ActiveTorrent, start: Long, endInclusive: Long): IntRange? {
+        val pieceLen = active.pieceLength
+        if (pieceLen <= 0) return null
+        val first = ((active.fileOffset + start) / pieceLen).toInt()
+        val last = ((active.fileOffset + endInclusive) / pieceLen).toInt()
+        return if (last < first) null else first..last
+    }
+
+    private fun indexDeadlineBase(active: ActiveTorrent): Int {
+        val headPieces = maxOf(1, ceilDiv(HEAD_PRIORITY_BYTES, active.pieceLength))
+        val hasResumeBand = active.streamStartPiece > active.firstPiece + headPieces - 1
+        return (if (hasResumeBand) 2 * headPieces else headPieces) * HEAD_DEADLINE_STEP_MS
+    }
+
+    /** Is this probe still speaking for the CURRENT torrent + file selection? Every write to the probe
+     *  state must pass this: [selectFile] mutates ActiveTorrent in place and resets the probe fields, so
+     *  a probe still in flight for the previous episode would otherwise land its verdict on the new one. */
+    private fun stillCurrent(active: ActiveTorrent, epoch: Int): Boolean =
+        torrents[active.infoHash] === active && active.selectionEpoch == epoch
+
+    /** A retryable probe failure. After [MOOV_PROBE_MAX_ATTEMPTS] we stop trying and keep the blind band
+     *  forever — a probe that keeps failing must not keep re-fetching an EOF piece on every tick. */
+    private fun probeTransientFailure(active: ActiveTorrent, epoch: Int, why: String) {
+        // A stale probe must not spend the NEW selection's attempt budget or overwrite its verdict.
+        // awaitBytes reports abandonment with the same `false` as a timeout, so without this an episode
+        // switch mid-probe left the incoming episode starting life at attempts=1 (and, three switches
+        // in, permanently on the blind band it never actually failed to probe).
+        if (!stillCurrent(active, epoch)) return
+        active.moovProbeAttempts += 1
+        val giveUp = active.moovProbeAttempts >= MOOV_PROBE_MAX_ATTEMPTS
+        active.moovProbe = if (giveUp) MoovProbe.Fallback else MoovProbe.Idle
+        Log.i(TAG, "moov probe attempt ${active.moovProbeAttempts} failed ($why)${if (giveUp) " — falling back" else ""}")
+    }
+
+    /**
+     * Deadline a small byte range and wait for it, for the probe ONLY.
+     *
+     * A trimmed [ensureRange]: deliberately WITHOUT its "extend the deadline set all the way to
+     * lastPiece" rule, because that blind band is precisely what this whole change exists to remove —
+     * routing the probe through it would fetch the same 8-32 MB it is trying to avoid.
+     *
+     * Re-reads the live torrent + handle (and the selection epoch) on every poll, so a concurrent
+     * session.remove() OR a season pack switching episodes ends the wait within one
+     * [RANGE_POLL_INTERVAL_MS] tick instead of spinning to the timeout against a file nobody wants.
+     */
+    private suspend fun awaitBytes(
+        active: ActiveTorrent,
+        start: Long,
+        endInclusive: Long,
+        timeoutMs: Long,
+        epoch: Int,
+    ): Boolean {
+        val pieceLen = active.pieceLength
+        if (pieceLen <= 0) return false
+        val first = ((active.fileOffset + start) / pieceLen).toInt()
+        val last = ((active.fileOffset + endInclusive) / pieceLen).toInt()
+        val handle = active.handle?.takeIf { it.isValid } ?: return false
+
+        // A native call racing session.remove() is a use-after-free SIGSEGV (see nativeLock).
+        synchronized(nativeLock) {
+            runCatching {
+                // Seed BEHIND the startup head band. The probe reads a 16-byte header near EOF; at
+                // deadline 0 it would outrank the head pieces the readiness gate is still waiting on and
+                // slow down the very first frame this whole change exists to speed up.
+                // Seed behind BOTH the head and (on a resume) the playhead band — the gate evaluates
+                // PLAYHEAD before MOOV_INDEX, so a probe that outranks the resume pieces delays the very
+                // requirement being waited on. Shared helper so the three arming sites cannot drift.
+                var deadline = indexDeadlineBase(active)
+                for (p in first..last) {
+                    if (p in active.firstPiece..active.lastPiece) {
+                        handle.piecePriority(p, Priority.TOP_PRIORITY)
+                        handle.setPieceDeadline(p, deadline)
+                        deadline += 30
+                    }
+                }
+            }.onFailure { Log.w(TAG, "awaitBytes prioritise failed", it) }
+        }
+
+        val deadlineAt = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadlineAt) {
+            if (torrents[active.infoHash] !== active || active.selectionEpoch != epoch) return false
+            val live = active.handle?.takeIf { it.isValid } ?: return false
+            if (rangeAvailable(live, active, first, last)) return true
+            delay(RANGE_POLL_INTERVAL_MS)
+        }
+        return false
+    }
+
+    /** Read exactly [len] bytes at [pos], or null (short read / I/O error / bad offset). */
+    private fun readExactly(raf: java.io.RandomAccessFile, pos: Long, len: Int): ByteArray? {
+        if (pos < 0L || len <= 0) return null
+        return runCatching {
+            raf.seek(pos)
+            val buf = ByteArray(len)
+            var off = 0
+            while (off < len) {
+                val n = raf.read(buf, off, len - off)
+                if (n <= 0) return@runCatching null
+                off += n
+            }
+            buf
         }.getOrNull()
+    }
+
+    /**
+     * THE single source of truth for "which pieces are the index the first frame is waiting on".
+     *
+     * Either the proven moov extent, or — for every unproven/ambiguous case — today's blind EOF band,
+     * byte-for-byte. Everything that requires, prioritises, measures or protects the index reads it
+     * from here, so those five things can never drift apart again.
+     */
+    private fun indexPieceRange(active: ActiveTorrent): IntRange {
+        (active.moovProbe as? MoovProbe.Exact)?.let { return it.firstPiece..it.lastPiece }
+        return tailFromPiece(active)..active.lastPiece
+    }
+
+    /** The index requirement in the SAME units [startupTailProgressBytes] credits against — whole
+     *  pieces. Using the raw moov byte size here would let the numerator (whole pieces downloaded)
+     *  exceed the denominator, which is exactly the "100% · Almost ready…" lie the gate exists to
+     *  prevent, papered over by a clamp. */
+    private fun indexRequiredBytes(active: ActiveTorrent): Long =
+        indexPieceRange(active).let { (it.last - it.first + 1).toLong() * active.pieceLength }
+
+    /**
+     * Arm [range] as the index band and unwind whatever band was armed before it.
+     *
+     * The blind 8 MB band is armed at add time; the probe shrinks it later. Without the unwind the
+     * pieces armed under the old guess would keep TOP priority and their deadlines forever, going on
+     * stealing swarm capacity from the bytes about to play — which would cancel out most of the win.
+     *
+     * Dropped pieces go to IGNORE under [ActiveTorrent.concentrate], not DEFAULT: setStreamStart put the
+     * selected file's BASE priority at IGNORE, so "cancelling" to DEFAULT (4) would leave them ABOVE
+     * base and still downloading.
+     *
+     * Deliberately does NOT re-enter prioritizeHeadAndTail — its clearPieceDeadlines() would wipe the
+     * read-ahead window if this ever ran post-READY.
+     */
+    /**
+     * RAISE the pieces of the index band. ADD-ONLY, by design: it never lowers a priority and never
+     * unwinds a previously-armed band.
+     *
+     * That restriction is the whole safety argument for this feature. The probe shares piece state with
+     * the player: a piece it would "tidy up" can simultaneously be the piece [ensureRange] raised for a
+     * read ExoPlayer is BLOCKED on (StreamHttpServer waits up to 75 s). Two review rounds produced the
+     * same failure from two different unwind paths — the tidy-up demoted that piece, its download
+     * stopped, the read timed out and the source failed over ON A HEALTHY SWARM. There is no ordering or
+     * skip-list that makes lowering safe here, because the probe cannot know what the player is mid-read
+     * on. So it does not lower anything, ever.
+     *
+     * The cost of never unwinding is that the blind EOF band stays prioritised after the exact extent is
+     * known: at most the ~8 MB it would have fetched anyway, which is exactly today's behaviour. The WIN
+     * is unaffected, because the win was never "fetch fewer bytes" — it is that the GATE now waits only
+     * for the real moov instead of the whole blind band.
+     */
+    private fun applyIndexBand(active: ActiveTorrent, range: IntRange, deadlineBase: Int) {
+        val handle = active.handle?.takeIf { it.isValid } ?: return
+        if (active.pieceLength <= 0) return
+        synchronized(nativeLock) {
+            runCatching {
+                // Reverse order (last piece first) matches promoteStartupTail, and a non-zero step keeps
+                // the band fetched IN ORDER rather than every piece being equally overdue (which lets
+                // them complete in peer-speed order).
+                var i = 0
+                for (p in range.last downTo range.first) {
+                    if (p in active.firstPiece..active.lastPiece) {
+                        handle.piecePriority(p, Priority.TOP_PRIORITY)
+                        handle.setPieceDeadline(p, deadlineBase + i * TAIL_PROMOTION_DEADLINE_STEP_MS)
+                        i++
+                    }
+                }
+            }.onFailure { Log.w(TAG, "applyIndexBand failed", it) }
+        }
     }
 
     /** Length in bytes of the selected file. */
@@ -1392,15 +1881,20 @@ class TorrentEngine @Inject constructor(
     fun snapshot(infoHash: String): EngineStatus? = synchronized(nativeLock) {
         val active = torrents[infoHash] ?: return@synchronized null
         val handle = active.handle?.takeIf { it.isValid } ?: return@synchronized null
-        val st = handle.status(TorrentHandle.QUERY_PIECES)
+        val st = handle.status(SNAPSHOT_STATUS_FLAGS)
         val pieces = st.pieces()
         val fileTotal = active.fileLength.takeIf { it > 0 } ?: st.total()
         val downloadedFile = contiguousHeadBytes(active, pieces).coerceAtMost(fileTotal)
         val tailProgress = startupTailProgressBytes(handle, active, pieces)
-        // Progress on the selected file (sequential => contiguous head is a good proxy),
-        // but never report less than libtorrent's own file-aware progress.
+        // Progress on the selected file. libtorrent's own ratio is total_wanted_done / total_wanted, and
+        // total_wanted really IS the selected file: selectFile sets every other file to Priority.IGNORE
+        // (plus at most the two boundary pieces this file shares with its neighbours). The contiguous
+        // head walk is kept only as a FLOOR — it is whole-piece AND contiguous, so under piece scatter it
+        // is the smaller of the two and can never be the source of an over-report.
         val byHead = if (fileTotal > 0) downloadedFile.toFloat() / fileTotal else 0f
-        val progress = maxOf(byHead, st.progress()).coerceIn(0f, 1f)
+        val wanted = st.totalWanted()
+        val byWanted = if (wanted > 0L) st.totalWantedDone().toFloat() / wanted else 0f
+        val progress = TransferAccounting.fileProgress(byHead, byWanted, st.isFinished)
         // Contiguous bytes at the RESUME anchor — the "can playback START here" signal. Equals the head
         // figure for a from-start play (streamStartPiece == firstPiece), so it changes nothing there.
         val resumeContig = if (active.streamStartPiece > active.firstPiece)
@@ -1417,13 +1911,46 @@ class TorrentEngine @Inject constructor(
         EngineStatus(
             progress = progress,
             downloadRate = st.downloadRate(),
+            // Bytes that actually became file, per second. downloadRate above is the TOTAL WIRE rate —
+            // BitTorrent protocol overhead + hash-failed bytes + redundant duplicate blocks — which is
+            // why "7.7 MB/s" and "60% after 3 minutes of a 1.9 GB file" could both be true at once.
+            // NOT downloadPayloadRate() raw. libtorrent counts the payload channel at the wire-parsing
+            // layer, when the piece message is decoded — BEFORE it discovers the block was redundant
+            // (add_redundant_bytes) and long before a hash failure is discovered (add_failed_bytes).
+            // Neither subtracts from it, so the "payload" rate still includes bytes that never became
+            // file, which is the exact dishonesty being fixed. Discount it by the share of accounted
+            // traffic that demonstrably went nowhere, so the number the user reads is the rate at which
+            // the file is actually growing. Falls back to the raw value until enough bytes are accounted
+            // to make the ratio meaningful.
+            payloadRate = TransferAccounting.effectiveRate(
+                payloadRate = st.downloadPayloadRate(),
+                payloadBytes = st.totalPayloadDownload(),
+                wastedBytes = st.totalFailedBytes() + st.totalRedundantBytes(),
+            ),
+            payloadBytes = st.totalPayloadDownload(),
+            // Bytes this bounded TV link paid for and threw away: pieces that failed the hash check and
+            // had to be re-fetched, plus the same block arriving from several peers with the losers
+            // discarded (which deadlined "time-critical" pieces cause ON PURPOSE — see ReadaheadSchedule).
+            wastedBytes = st.totalFailedBytes() + st.totalRedundantBytes(),
             uploadRate = st.uploadRate(),
             seeders = st.numSeeds(),
             peers = st.numPeers(),
-            downloadedBytes = (progress * fileTotal).toLong().coerceAtMost(fileTotal),
+            // A real byte count, not the ratio above multiplied back out. With accurate counters this
+            // advances every finished 16 KiB block instead of every whole piece, which un-breaks
+            // DownloadManager's 3-minute no-progress abort: quantized to 32 MB pieces, a healthy swarm
+            // below ~178 KB/s legitimately left this number still for over three minutes and was killed
+            // as a "dead swarm".
+            downloadedBytes = maxOf(st.totalWantedDone(), downloadedFile).coerceAtMost(fileTotal),
             contiguousHeadBytes = downloadedFile,
             contiguousResumeBytes = resumeContig,
             startupTailProgressBytes = tailProgress,
+            // Piece-rounded, and 0 for containers that never wait on an EOF index — so the streamer's
+            // ">0" guard means "this number is a real denominator", not "the field exists". The
+            // pieceLength check is not decorative: a snapshot can land between the handle appearing and
+            // selectFile running, and tailFromPiece divides by it.
+            startupIndexRequiredBytes =
+                if (active.pieceLength > 0 && startupTailFromPiece(active) != null) indexRequiredBytes(active) else 0L,
+            moovExact = active.moovProbe is MoovProbe.Exact,
             totalBytes = fileTotal,
             isFinished = st.isFinished,
             isPaused = st.flags().and_(TorrentFlags.PAUSED).non_zero(),
@@ -1439,15 +1966,15 @@ class TorrentEngine @Inject constructor(
         pieces: PieceIndexBitfield,
     ): Long {
         if (!active.startupTailArmed || startupTailFromPiece(active) == null || pieces.size() == 0) return 0L
-        val tailFrom = tailFromPiece(active)
+        val idx = indexPieceRange(active)
         var bytes = 0L
-        for (piece in tailFrom..active.lastPiece) {
+        for (piece in idx) {
             if (piece < pieces.size() && pieces.getBit(piece)) bytes += active.pieceLength.toLong()
         }
         val partials = runCatching { handle.getDownloadQueue() }.getOrDefault(emptyList())
         for (partial in partials) {
             val piece = partial.pieceIndex()
-            if (piece in tailFrom..active.lastPiece &&
+            if (piece in idx &&
                 piece < pieces.size() && !pieces.getBit(piece)
             ) {
                 bytes += partial.finished().toLong() * TORRENT_BLOCK_BYTES
@@ -1585,10 +2112,10 @@ class TorrentEngine @Inject constructor(
         // (at EOF) on every seek; if a forward-walking read head reset those pieces, a later seek
         // would have to re-fetch the moov against the sequential cursor and stall again. Keep the
         // tail permanently time-critical.
-        // MUST match prioritizeHeadAndTail's deadlined tail count exactly — the old "/pieceLength + 1"
-        // required one EOF piece MORE than was ever deadlined, so tailAvailable rarely went true on its
-        // own and READY only fired via the 15s hard-cap: a fixed 15s "Almost ready" tax on every stream.
-        val tailFrom = tailFromPiece(active)
+        // Once the probe proves the exact extent this pins ONLY the moov's pieces, not the whole last
+        // 8 MB — a real behavioural delta on the seek path, and the correct one: the pieces being kept
+        // hot are now precisely the ones the demuxer re-reads.
+        val idx = indexPieceRange(active)
         synchronized(nativeLock) { runCatching {
             // Move the SEQUENTIAL-download cursor to FOLLOW the read head, so libtorrent's bulk fill
             // proceeds FROM the current play position forward — not from the file front. Without this the
@@ -1601,20 +2128,45 @@ class TorrentEngine @Inject constructor(
                 val oldEnd = minOf(active.lastPiece, prev + readahead - 1)
                 val newEnd = minOf(active.lastPiece, curPiece + readahead - 1)
                 for (p in prev..oldEnd) {
-                    if (p in active.firstPiece..active.lastPiece && p < tailFrom && p !in curPiece..newEnd) {
+                    if (p in active.firstPiece..active.lastPiece && p !in idx && p !in curPiece..newEnd) {
                         handle.resetPieceDeadline(p)
                     }
                 }
             }
-            var deadline = 0
-            for (i in 0 until readahead) {
-                val p = curPiece + i
-                if (p in active.firstPiece..active.lastPiece) {
+            // The window keeps TOP priority and an in-order deadline ladder across its whole length —
+            // that is what beats libtorrent's out-of-order scatter and it is NOT being narrowed. Two
+            // things change, both about telling libtorrent the truth:
+            //
+            //  1. The step is proportional to the piece size (see ReadaheadSchedule.deadlineStepMs), so
+            //     the ladder declares a fill rate the swarm can actually meet. A flat 250 ms step on
+            //     8 MiB pieces demanded 33.6 MB/s — unmeetable by every peer, on every piece, on every
+            //     tick, which is exactly the state in which libtorrent piles extra peers onto the same
+            //     blocks and discards the losers as redundant bytes.
+            //  2. On a plain forward slide only the pieces that just ENTERED the window are armed. The
+            //     rest already hold correct, now-more-overdue absolute deadlines; re-issuing them was
+            //     ~150-210 JNI calls/s under nativeLock that changed nothing.
+            //
+            // The window's first piece still gets deadline 0 whenever it is armed, and ensureRange still
+            // puts deadline 0 on whatever piece a read is genuinely blocked on, so nothing here can make
+            // the first frame or a stall recovery slower.
+            val windowFirst = curPiece.coerceAtLeast(active.firstPiece)
+            val windowLast = minOf(active.lastPiece, curPiece + readahead - 1)
+            val arm = ReadaheadSchedule.armRange(
+                active.armedReadaheadFirst, active.armedReadaheadLast, windowFirst, windowLast,
+            )
+            if (arm != null) {
+                val step = ReadaheadSchedule.deadlineStepMs(active.pieceLength)
+                for (p in arm) {
+                    if (p !in active.firstPiece..active.lastPiece) continue
                     handle.piecePriority(p, Priority.TOP_PRIORITY)
-                    handle.setPieceDeadline(p, deadline)
-                    deadline += READAHEAD_DEADLINE_STEP_MS
+                    // Offset from the window's NOSE, not from the start of `arm`: that keeps the ladder
+                    // monotone in wall-clock across slides, since a piece armed now at the window's far
+                    // end is due later than one armed several ticks ago near its nose.
+                    handle.setPieceDeadline(p, (p - windowFirst) * step)
                 }
             }
+            active.armedReadaheadFirst = windowFirst
+            active.armedReadaheadLast = windowLast
             active.readHeadPiece = curPiece
         }.onFailure { Log.w(TAG, "advanceReadHead failed", it) } }
     }
@@ -1645,6 +2197,26 @@ class TorrentEngine @Inject constructor(
         private const val STORAGE_LAYOUT_VERSION_KEY = "version"
         private const val STORAGE_LAYOUT_VERSION = 2
 
+        /**
+         * Status flags for [snapshot]. QUERY_PIECES gets the bitfield every contiguity walk needs;
+         * QUERY_ACCURATE_DOWNLOAD_COUNTERS is what makes total_wanted_done (and therefore progress)
+         * count the finished 16 KiB BLOCKS of pieces still in flight instead of whole verified pieces
+         * only.
+         *
+         * Without it, this engine's very wide request posture (connections_limit 600/1000,
+         * max_out_request_queue 500/800, TOP_PRIORITY + setPieceDeadline bands) keeps dozens of 8-32 MB
+         * pieces open at once and every one of them is valued at ZERO until it completes: a 2 GB torrent
+         * 30 s in at 3.2 MB/s had ~96 MB on disk spread across ~20 unfinished 32 MB pieces and displayed
+         * "0%". Cost is one download-queue walk, which this snapshot already pays natively for
+         * startupTailProgressBytes — same walk, done once inside libtorrent instead of twice.
+         *
+         * `by lazy` on purpose: `or_` allocates a SWIG-backed object, so it must not run during class
+         * init (before the native library is loaded), and it must not run twice a second forever.
+         */
+        private val SNAPSHOT_STATUS_FLAGS: org.libtorrent4j.swig.status_flags_t by lazy {
+            TorrentHandle.QUERY_PIECES.or_(TorrentHandle.QUERY_ACCURATE_DOWNLOAD_COUNTERS)
+        }
+
         private const val METADATA_TIMEOUT_SECONDS = 60
         private const val METADATA_REANNOUNCE_AFTER_MS = 10_000L
         private const val METADATA_REANNOUNCE_INTERVAL_MS = 15_000L
@@ -1672,14 +2244,27 @@ class TorrentEngine @Inject constructor(
          *  the front of a faststart file, so this resolves almost immediately). */
         const val MP4_SCAN_LIMIT = 64L * 1024 * 1024
 
+        /** How long the moov probe waits for the piece(s) covering the box header after `mdat` before
+         *  calling it a transient failure. This can only ever FAIL a probe — it can never open the gate,
+         *  and a failed probe keeps the LARGER (blind 8 MB) requirement. There is no timer anywhere in
+         *  this file that lets playback start on bytes that are not on disk. */
+        private const val MOOV_PROBE_TIMEOUT_MS = 20_000L
+
+        /** Transient probe failures tolerated before we settle for the blind band permanently. */
+        private const val MOOV_PROBE_MAX_ATTEMPTS = 3
+
+        /** size(4) + type(4) + room for the 64-bit largesize we read but do not yet honour. */
+        private const val MOOV_HEADER_BYTES = 16
+
         /** Per-piece deadline STEP for the head band. Must be large: libtorrent works all time-critical
          *  pieces toward their deadlines concurrently, so near-equal deadlines (~20 ms) complete in
          *  peer-speed order. A multi-second step keeps only the earliest head piece "overdue" so the
          *  swarm converges on it first, then the next — a strict in-order contiguous head fill. */
         const val HEAD_DEADLINE_STEP_MS = 3_000
 
-        /** Keep read-ahead ordered too. A 25ms step made an entire 24–32MB window overdue at once. */
-        const val READAHEAD_DEADLINE_STEP_MS = 250
+        // The read-ahead window's per-piece deadline step now lives in [ReadaheadSchedule] — it has to
+        // scale with the piece size to describe a fill rate the swarm can actually meet, and it is pure
+        // arithmetic worth unit-testing against real piece sizes.
 
         /** Per-piece step used by [promoteStartupTail], once the EOF index is the ONLY thing blocking the
          *  first frame. Much tighter than [HEAD_DEADLINE_STEP_MS] because nothing else is competing for
@@ -1743,10 +2328,49 @@ class TorrentEngine @Inject constructor(
     }
 }
 
+/**
+ * Where an ISO-BMFF file's `moov` index lives, as far as the bytes on disk can PROVE.
+ *
+ * The ordering that matters: [AtEofExact] is the only verdict that shrinks the requirement, and it is
+ * only ever reached by reading the file's own box chain. Everything else keeps the conservative blind
+ * EOF band, so no failure mode here can let playback start on bytes that are not present.
+ */
+sealed interface MoovLocation {
+    /** Not enough contiguous head to decide yet. Stay conservative; ask again next tick. */
+    object Undecided : MoovLocation
+
+    /** Faststart: the index is already in the head, so there is no EOF requirement at all. */
+    object InHead : MoovLocation
+
+    /** The index is at EOF but its extent could not be proven — today's blind 8 MB band applies. */
+    object AtEofUnknown : MoovLocation
+
+    /** The index is at EOF and occupies exactly `[start, endExclusive)`, proven from the box chain. */
+    data class AtEofExact(val start: Long, val endExclusive: Long) : MoovLocation
+
+    /** Legacy tri-state view for callers that only ask "is this faststart?": true / false / unknown. */
+    val inHead: Boolean?
+        get() = when (this) {
+            InHead -> true
+            Undecided -> null
+            else -> false
+        }
+}
+
 /** Flat status snapshot read off a [TorrentHandle]. */
 data class EngineStatus(
     val progress: Float,
+    /** TOTAL WIRE rate: payload + protocol overhead + hash-failed + redundant duplicate blocks. Keep
+     *  using this for LIVENESS and CONTROL (is the swarm talking to us at all, should we fail over) —
+     *  never for a number labelled "downloaded". */
     val downloadRate: Int,
+    /** Bytes per second that actually become file — the honest headline speed. */
+    val payloadRate: Int = 0,
+    /** Cumulative payload received, the denominator half of the waste ratio. */
+    val payloadBytes: Long = 0L,
+    /** Cumulative bytes received and thrown away (hash-failed + redundant). Real bandwidth spent on
+     *  nothing, which on a bounded link is taken straight out of the read-ahead window. */
+    val wastedBytes: Long = 0L,
     val uploadRate: Int,
     val seeders: Int,
     val peers: Int,
@@ -1759,6 +2383,13 @@ data class EngineStatus(
     val totalBytes: Long,
     val isFinished: Boolean,
     val isPaused: Boolean,
+    /** What the EOF index requirement currently COSTS, piece-rounded — the same units
+     *  [startupTailProgressBytes] is counted in, so the startup bar's numerator and denominator finally
+     *  measure the same thing. 0 for containers that never wait on an EOF index. */
+    val startupIndexRequiredBytes: Long = 0L,
+    /** True once the moov's extent has been proven from the file's own box chain (rather than guessed
+     *  as the last 8 MB). Diagnostic + lets the streamer trust [startupIndexRequiredBytes]. */
+    val moovExact: Boolean = false,
     /** libtorrent is hash-VERIFYING already-on-disk data (a cached reopen / resume), not downloading.
      *  During this phase downloadRate and seeders read 0 — NOT a stall — so the UI must label it
      *  "checking", never "stalled". The bitfield fills as pieces verify, which looks like a head-first

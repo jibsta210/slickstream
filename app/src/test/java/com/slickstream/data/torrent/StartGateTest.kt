@@ -295,4 +295,71 @@ class StartGateTest {
             assertTrue(d.fillFraction in 0f..1f)
         }
     }
+
+    // --- a PROVEN moov extent replaces the 8 MB fallback band --------------------------------------
+    //
+    // Once the engine reads the file's own box chain it knows the moov's real extent, and passes that
+    // (piece-rounded) as tailBytes. The gate itself is unchanged and still pure — but everything the
+    // user sees must now be scaled to the real requirement, not the guess.
+
+    /** A from-start MP4 whose index requirement has been PROVEN to be [tailBytes] rather than 8 MB. */
+    private fun mp4Exact(
+        head: Long,
+        tailBytes: Long,
+        tailPresent: Boolean,
+        tailProgress: Long = 0L,
+    ) = StartGate.decide(
+        contiguousHeadBytes = head,
+        contiguousResumeBytes = head,
+        resumeIsHead = true,
+        containerMayNeedMoov = true,
+        moovInHead = false,
+        tailPresent = tailPresent,
+        tailProgressBytes = tailProgress,
+        tailBytes = tailBytes,
+    )
+
+    @Test
+    fun `a proven small moov shrinks what the gate ever asks for`() {
+        // The whole point: a 2 MB moov must not be billed as an 8 MB requirement.
+        val exact = mp4Exact(head = header, tailBytes = 2 * mb, tailPresent = false)
+        val guessed = mp4(head = header, moovInHead = false, tailPresent = false)
+        assertEquals(header + 2 * mb, exact.requiredBytes)
+        assertEquals(header + tail, guessed.requiredBytes)
+        assertTrue(exact.requiredBytes < guessed.requiredBytes)
+        assertFalse(exact.canStart)
+        assertEquals(StartupBlocker.MOOV_INDEX, exact.blocker)
+    }
+
+    @Test
+    fun `a proven moov LARGER than the old guess raises the requirement`() {
+        // The failure the 8 MB guess hid: a 12 MB moov starts OUTSIDE the guessed window, so the gate
+        // passed on bytes that were never fetched and the player stranded on "Almost ready…".
+        val d = mp4Exact(head = header, tailBytes = 12 * mb, tailPresent = false, tailProgress = 8 * mb)
+        assertEquals(header + 12 * mb, d.requiredBytes)
+        assertFalse(d.canStart)
+        assertEquals(4 * mb, d.remainingBytes)
+    }
+
+    @Test
+    fun `progress scales against the proven requirement, not the fallback band`() {
+        // Half of a proven 4 MB moov is half done — under the old 8 MB denominator it read as a quarter,
+        // so the bar crawled and the ETA over-promised on exactly the fast case.
+        val d = mp4Exact(head = header, tailBytes = 4 * mb, tailPresent = false, tailProgress = 2 * mb)
+        assertEquals(2 * mb, d.remainingBytes)
+        assertEquals((header + 2 * mb).toFloat() / (header + 4 * mb), d.fillFraction, 0.001f)
+        assertFalse(d.fillFraction >= 1f)
+    }
+
+    @Test
+    fun `the proven path still reads 100 percent only when the gate is open`() {
+        // The honesty invariant, on the new denominator: tailProgress is counted in WHOLE PIECES, so it
+        // can pay off the requirement while the covering piece — and thus the moov — is still missing.
+        val blocked = mp4Exact(head = header, tailBytes = 3 * mb, tailPresent = false, tailProgress = 3 * mb)
+        assertFalse(blocked.canStart)
+        assertFalse(blocked.fillFraction >= 1f)
+        val open = mp4Exact(head = header, tailBytes = 3 * mb, tailPresent = true, tailProgress = 3 * mb)
+        assertTrue(open.canStart)
+        assertEquals(1f, open.fillFraction, 0f)
+    }
 }

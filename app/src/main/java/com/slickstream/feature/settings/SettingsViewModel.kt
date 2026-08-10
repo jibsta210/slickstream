@@ -81,6 +81,8 @@ class SettingsViewModel @Inject constructor(
 
     fun setMaxCacheSize(size: CacheSize) = viewModelScope.launch { repo.setMaxCacheSize(size) }
     fun setCustomSourceUrl(url: String) = viewModelScope.launch { repo.setCustomSourceUrl(url) }
+    /** Accepts a bare Real-Debrid token OR a full addon URL — see [SettingsRepository.setDebridToken]. */
+    fun setDebridToken(token: String) = viewModelScope.launch { repo.setDebridToken(token) }
     fun setWifiQuality(q: QualityPreference) = viewModelScope.launch { repo.setWifiQuality(q) }
     fun setCellularQuality(q: QualityPreference) = viewModelScope.launch { repo.setCellularQuality(q) }
     fun setDensity(d: UiDensity) = viewModelScope.launch { repo.setDensity(d) }

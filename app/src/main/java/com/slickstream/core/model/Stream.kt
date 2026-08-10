@@ -88,7 +88,17 @@ data class StreamStatus(
     val infoHash: String,
     val state: StreamState,
     val progress: Float,            // 0f..1f of the selected file
+    /** TOTAL WIRE rate. Includes protocol overhead, hash-failed re-fetches and redundant duplicate
+     *  blocks, so it is NOT "bytes downloaded per second" — it is what the link moved. Reserved for
+     *  liveness and failover decisions; never print it under a "downloading at" label. */
     val downloadRateBytes: Int,
+    /** Bytes per second that actually became file — the number to DISPLAY. Falls back to the wire rate
+     *  only while there is no payload at all (metadata fetch). See [com.slickstream.data.torrent.TransferAccounting]. */
+    val payloadRateBytes: Int = 0,
+    /** Cumulative payload received, and cumulative bytes received and discarded (hash-failed +
+     *  redundant). Their ratio is the gap between the speed and the progress, made visible. */
+    val payloadBytes: Long = 0L,
+    val wastedBytes: Long = 0L,
     val uploadRateBytes: Int = 0,
     val seeders: Int,
     val peers: Int,
@@ -111,6 +121,11 @@ data class StreamStatus(
     val startupRequiredBytes: Long = 0L,
     /** Bytes of [startupRequiredBytes] still missing. Drives both the progress bar and [etaSeconds]. */
     val startupRemainingBytes: Long = 0L,
+    /** 0f..1f toward playable, straight from the gate's own [com.slickstream.data.torrent.StartDecision]
+     *  — including its "never 1.0 while a requirement is outstanding" clamp. Carried rather than
+     *  recomputed in the UI: the recomputation dropped the clamp and put "100% · Almost ready…" over a
+     *  gate that was still shut. */
+    val startupFillFraction: Float = 0f,
     /** Best-effort seconds until first frame (head + mp4 moov tail ÷ rate), or null when not estimable
      *  (e.g. still discovering peers / no download rate yet). Computed by the streamer against the same
      *  readiness gate that flips to READY, so the countdown matches when playback actually starts. */

@@ -95,6 +95,7 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import com.slickstream.core.common.formatRate
 import com.slickstream.core.model.Episode
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.StreamSource
@@ -514,7 +515,12 @@ fun TvPlayerScreen(
         // Torrent chunk bar pinned to the bottom edge. Shown during BUFFERING too (over the loading
         // overlay) so you can SEE what's downloading while it starts up — diagnose a stuck head vs a
         // scattered download. While Playing it rides with the transport. Polled ~1/s.
-        if (uiState is PlayerUiState.Playing || uiState is PlayerUiState.Buffering) {
+        // Torrent-backed only: a DIRECT (RD / file-server / offline) source never reaches the streamer,
+        // so streamStats() is null and pieceMap() misses the cache — the panel would render "Downloading…"
+        // over a flat empty track for the whole session. The phone screen has always guarded this
+        // (PlayerScreen.kt); TV was missed.
+        val torrentBacked = currentSource?.isDirect != true
+        if (torrentBacked && (uiState is PlayerUiState.Playing || uiState is PlayerUiState.Buffering)) {
             var pieceMap by remember { mutableStateOf(FloatArray(0)) }
             var playheadFrac by remember { mutableStateOf(0f) }
             var stats by remember { mutableStateOf<com.slickstream.feature.player.StreamStats?>(null) }
@@ -529,9 +535,17 @@ fun TvPlayerScreen(
                 }
             }
             // During buffering the bar is always up (no transport to ride with); while playing it
-            // appears/hides with the controls.
+            // appears/hides with the controls — EXCEPT during a mid-playback stall, where it is forced
+            // up. A rebuffer leaves uiState at Playing and the transport auto-hides after 5 s, so the
+            // moment the user most needs to see whether pieces are landing was the one moment the bar
+            // was guaranteed to be off screen, leaving only the "Buffering… · 5.0 MB/s" badge.
             AnimatedVisibility(
-                visible = uiState is PlayerUiState.Buffering || controlsVisible,
+                visible = com.slickstream.feature.player.shouldShowChunkBar(
+                    torrentBacked = torrentBacked,
+                    starting = uiState is PlayerUiState.Buffering,
+                    stalled = rebuffering != null,
+                    controlsShown = controlsVisible,
+                ),
                 enter = fadeIn(),
                 exit = fadeOut(),
                 modifier = Modifier.align(Alignment.BottomCenter),
@@ -740,9 +754,11 @@ private fun BufferingOverlay(
                     if (isNotEmpty()) append("  ·  ")
                     append("${state.seeders} seeders")
                 }
-                if (state.downloadRateBytes > 0) {
+                if (state.payloadRateBytes > 0) {
                     if (isNotEmpty()) append("  ·  ")
-                    append("${state.downloadRateBytes / 1024} KB/s")
+                    // Shared formatter: this site used to print raw KB/s with no MB rollover, so a
+                    // 7.7 MB/s stream read "7900 KB/s" here and "7.7 MB/s" on the rebuffer badge below.
+                    append(formatRate(state.payloadRateBytes))
                 }
             }
             if (detail.isNotBlank()) {
@@ -1458,10 +1474,9 @@ private fun TvRebufferBadge(state: com.slickstream.feature.player.RebufferState,
                 Text(
                     text = buildString {
                         append(state.etaSeconds?.let { "about ${it}s left" } ?: "waiting ${elapsed}s")
-                        if (state.downloadRateBytes > 0) {
+                        if (state.payloadRateBytes > 0) {
                             append("  ·  ")
-                            val kb = state.downloadRateBytes / 1024
-                            append(if (kb >= 1024) "%.1f MB/s".format(kb / 1024f) else "$kb KB/s")
+                            append(formatRate(state.payloadRateBytes))
                         }
                     },
                     style = MaterialTheme.typography.bodyMedium,
