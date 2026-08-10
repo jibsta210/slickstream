@@ -185,20 +185,50 @@ class SourceRepositoryImpl @Inject constructor(
                         val optionalAuto = base in autoBases && base !in customBases && base !in baseUrls
                         val timeout = if (optionalAuto) AUTO_ADDON_QUERY_TIMEOUT_MS else ADDON_QUERY_TIMEOUT_MS
                         kotlinx.coroutines.withTimeoutOrNull(timeout) {
-                            try {
-                                api.getStreamsAt("${base}stream/$type/$id.json")
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (_: Throwable) {
-                                null
+                            // RETRY TRANSIENT INDEXER FAILURES. Torrentio answers a cold-cache episode by
+                            // scraping upstream trackers, and when that scrape fails it returns 502 — measured
+                            // live: one episode 502'd twelve times running while the NEXT episode 502'd once
+                            // and then served 200 seconds later. A single attempt turned that into "no
+                            // streamable sources" for a title with hundreds of real releases, which is not a
+                            // slow answer but a WRONG one.
+                            // The retry costs nothing on the healthy path (it only runs after a failure) and
+                            // stays inside the existing per-addon timeout, so a dead addon still can't hold up
+                            // the ones that answered. 4xx is a real reply ("this addon has nothing for that
+                            // id") and is NOT retried — hammering it would just burn the budget.
+                            var attempt = 0
+                            var response: com.slickstream.data.source.dto.StreamResponseDto? = null
+                            while (attempt < INDEXER_ATTEMPTS) {
+                                response = try {
+                                    api.getStreamsAt("${base}stream/$type/$id.json")
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (t: Throwable) {
+                                    if (!isTransientIndexerFailure(t)) return@withTimeoutOrNull null
+                                    null
+                                }
+                                if (response != null) break
+                                attempt++
+                                if (attempt < INDEXER_ATTEMPTS) {
+                                    kotlinx.coroutines.delay(INDEXER_RETRY_DELAY_MS * attempt)
+                                }
                             }
+                            response
                         }
                     }
                 }.awaitAll()
             }
             val ok = responses.filterNotNull()
             if (ok.isEmpty()) {
-                return DataResult.Error("Failed to resolve sources for \"${details.item.title}\"")
+                // EVERY addon failed (after retries). Say that, rather than implying the title has no
+                // releases: "no streamable sources" for a show with hundreds of them reads as a broken
+                // app and sends the user hunting for a fault on their side. This is also why the result
+                // is an Error and never an empty Success — an empty Success would be recorded by
+                // resolveAndCache as a genuine "nothing to play" verdict and suppress the title from
+                // browse for 12h on the strength of an indexer outage.
+                return DataResult.Error(
+                    "Couldn't reach the source index for \"${details.item.title}\" — it's not responding " +
+                        "right now. This is the indexer, not your connection. Try again shortly.",
+                )
             }
             // Title-aware language detection needs the title at MAP time so a language name that's part
             // of the title ("The French Dispatch") isn't read as a foreign-audio tag.
@@ -417,6 +447,19 @@ class SourceRepositoryImpl @Inject constructor(
         return firstLine.takeIf { it.isNotBlank() } ?: "Torrentio"
     }
 
+    /**
+     * Worth another attempt? A 5xx or a network/timeout error means the indexer could not ANSWER — the
+     * cold-cache-scrape 502 that makes a well-seeded episode look sourceless. A 4xx is a real answer
+     * ("no such id here"), and retrying it just burns the per-addon budget that the addons which DID
+     * respond are waiting on. Anything unrecognised is treated as transient: the cost of one extra
+     * request is far lower than falsely telling the user a title has no releases.
+     */
+    private fun isTransientIndexerFailure(t: Throwable): Boolean = when (t) {
+        is retrofit2.HttpException -> t.code() >= 500
+        is java.io.IOException -> true               // socket/DNS/TLS/timeout
+        else -> true
+    }
+
     private companion object {
         data class ResolveKey(val type: String, val id: String, val addonFingerprint: String)
         data class SharedResolve(
@@ -430,8 +473,17 @@ class SourceRepositoryImpl @Inject constructor(
 
         const val RESOLVE_CACHE_TTL_NANOS = 30_000_000_000L
         /** Per-addon resolve timeout — a slow/dead auto-discovered addon can't stall the whole resolve. */
-        const val ADDON_QUERY_TIMEOUT_MS = 8_000L
+        /** Raised from 8s to fit the transient-failure retries below; a healthy addon is unaffected
+         *  (it answers on the first attempt and the budget is never touched). */
+        const val ADDON_QUERY_TIMEOUT_MS = 12_000L
         const val AUTO_ADDON_QUERY_TIMEOUT_MS = 2_500L
+
+        /** Attempts per addon before giving up on it — see the transient-502 comment at the call site. */
+        const val INDEXER_ATTEMPTS = 3
+
+        /** Linear backoff between attempts (x1, x2). Short: a cold-cache scrape either recovers quickly
+         *  or is genuinely broken, and the whole resolve is latency-critical. */
+        const val INDEXER_RETRY_DELAY_MS = 400L
         val HEX_INFO_HASH = Regex("(?i)^[a-f0-9]{40}$")
         val BASE32_INFO_HASH = Regex("(?i)^[a-z2-7]{32}$")
         const val BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
