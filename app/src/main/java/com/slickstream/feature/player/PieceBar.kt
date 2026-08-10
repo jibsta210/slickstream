@@ -24,6 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.slickstream.core.model.StartupBlocker
 import com.slickstream.ui.theme.Brand
 import kotlin.math.roundToInt
 
@@ -154,27 +155,69 @@ private fun LegendDot(color: Color, label: String) {
 
 private class BarHealth(val color: Color, val warning: String?)
 
+/** A downloaded run ahead of the playhead worth at least this many seconds of video is comfortable.
+ *  Measured in SECONDS, not in fraction-of-file: the lead that protects playback is time, and a
+ *  fraction-of-file threshold silently scales with the release size — the same 4% is 4 minutes of a
+ *  2 h movie but 400 MB of download, which is why a genuinely healthy head read as "low buffer". */
+private const val HEALTHY_LEAD_SECONDS = 30.0
+
+/** Fallback only, for the window before the media duration is known (nothing has prepared yet). */
+private const val HEALTHY_LEAD_FRACTION = 0.02f
+
 /**
  * Green = a comfortable downloaded lead ahead of the playhead. Amber = the lead is thin (will buffer
  * soon if the rate dips). Red = stalled (0 B/s and not complete).
+ *
+ * While STARTING UP this defers entirely to the engine's readiness gate ([StreamStats.startupBlocker]).
+ * The bar and the gate must never describe the file differently: the reported bug was three or four
+ * solid teal cells at the head — a head the gate had already accepted — sitting under the words "low
+ * buffer", because this function was inferring a verdict from the fill pattern instead of asking.
  */
 private fun healthOf(map: FloatArray, playheadFraction: Float, stats: StreamStats?): BarHealth {
     if (stats == null || map.isEmpty()) return BarHealth(Brand.Cyan, null)
     // Verifying cached data (resume) — rate 0 is expected, NOT a stall. Neutral, no warning.
     if (stats.isChecking) return BarHealth(Brand.Cyan, null)
-    // The downloaded LEAD ahead of the playhead is what actually protects playback — judge on it FIRST.
-    // Under the concentrated moving window the download rate legitimately drops to 0 once the window
-    // ahead is full (nothing left to fetch until you watch further), so a big lead with 0 B/s is HEALTHY,
-    // not "stalled". Only a THIN lead makes the rate matter.
+    // Whole file on disk: nothing left to be short of, whatever the rate reads.
+    if (stats.progress >= 0.999f) return BarHealth(Brand.Cyan, null)
+
+    // STARTUP — the gate owns the verdict, and names the one thing it is missing.
+    when (stats.startupBlocker) {
+        StartupBlocker.MOOV_INDEX ->
+            // The head IS buffered (that is why the bar looks teal). Say what is actually outstanding.
+            return BarHealth(Brand.Star, "fetching MP4 index")
+        StartupBlocker.CONTAINER_HEADER, StartupBlocker.PLAYHEAD -> {
+            if (stats.downloadRateBytes == 0 && stats.progress <= 0.01f) {
+                return BarHealth(Brand.Star, "connecting…")
+            }
+            if (stats.downloadRateBytes == 0) return BarHealth(Brand.Error, "stalled")
+            return BarHealth(
+                Brand.Star,
+                if (stats.startupBlocker == StartupBlocker.PLAYHEAD) "buffering at resume point"
+                else "buffering start",
+            )
+        }
+        StartupBlocker.NONE -> Unit   // gate is open — fall through to the playback lead check
+    }
+
+    // PLAYBACK — the downloaded LEAD ahead of the playhead is what protects the stream, so judge on it
+    // FIRST. Under the concentrated moving window the download rate legitimately drops to 0 once the
+    // window ahead is full (nothing left to fetch until you watch further), so a big lead with 0 B/s is
+    // HEALTHY, not "stalled". Only a THIN lead makes the rate matter.
     val ph = (playheadFraction * map.size).toInt().coerceIn(0, map.size - 1)
     var lead = 0
     var i = ph
     while (i < map.size && map[i] >= 0.85f) { lead++; i++ }
     val leadFraction = lead.toFloat() / map.size
-    if (leadFraction >= 0.04f) return BarHealth(Brand.Cyan, null)          // comfortable lead → fine
+    val comfortable = if (stats.durationMs > 0L) {
+        // A cell is (duration / cells) of video, so the lead converts straight to seconds.
+        leadFraction * (stats.durationMs / 1000.0) >= HEALTHY_LEAD_SECONDS
+    } else {
+        leadFraction >= HEALTHY_LEAD_FRACTION
+    }
+    if (comfortable) return BarHealth(Brand.Cyan, null)
     // Thin lead — now the rate tells us whether we're recovering or stuck.
     if (stats.downloadRateBytes == 0 && stats.progress <= 0.01f) return BarHealth(Brand.Star, "connecting…")
-    if (stats.downloadRateBytes == 0 && stats.progress < 0.99f) return BarHealth(Brand.Error, "stalled")
+    if (stats.downloadRateBytes == 0) return BarHealth(Brand.Error, "stalled")
     return BarHealth(Brand.Star, "low buffer")
 }
 

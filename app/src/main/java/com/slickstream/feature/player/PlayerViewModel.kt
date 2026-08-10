@@ -33,6 +33,7 @@ import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.PlaybackProgress
+import com.slickstream.core.model.StartupBlocker
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.StreamState
 import com.slickstream.core.model.StreamStatus
@@ -123,6 +124,14 @@ data class StreamStats(
     val precaching: Boolean = false,
     /** Hash-verifying cached/on-disk data (resume), not downloading — rate/seeders read 0 but it's fine. */
     val isChecking: Boolean = false,
+    /** What the readiness gate is still waiting for, verbatim from the engine. The chunk bar renders
+     *  its verdict from THIS while starting up instead of guessing from the fill pattern — that guess
+     *  is what produced "solid teal head, yet 'low buffer'". */
+    val startupBlocker: StartupBlocker = StartupBlocker.NONE,
+    /** Media duration, so the chunk bar can express the downloaded lead in SECONDS OF VIDEO rather than
+     *  as a fraction of the file (4% of a 10 GB movie is 400 MB — a nonsense bar for "healthy"). 0 when
+     *  not known yet (pre-prepare), where the bar falls back to the fraction heuristic. */
+    val durationMs: Long = 0L,
 )
 
 @HiltViewModel
@@ -374,6 +383,8 @@ class PlayerViewModel @Inject constructor(
             progress = it.progress,
             precaching = prefetchJob?.isActive == true,
             isChecking = it.isChecking,
+            startupBlocker = it.startupBlocker,
+            durationMs = _currentPlayer.value?.duration?.takeIf { d -> d > 0 } ?: 0L,
         )
     }
 
@@ -1143,10 +1154,15 @@ class PlayerViewModel @Inject constructor(
         // No URL yet — still pre-buffering. Don't clobber a Playing state.
         if (_uiState.value is PlayerUiState.Playing) return
 
-        val label = when (status.state) {
-            StreamState.METADATA -> "Fetching torrent metadata…"
-            StreamState.BUFFERING -> "Buffering…"
-            StreamState.IDLE -> "Connecting to peers…"
+        // Name the actual blocker. A generic "Buffering…" next to a chunk bar with a solid teal head is
+        // what made the wait feel broken — the user could SEE downloaded data and was told nothing about
+        // why it wasn't enough. The gate knows exactly which requirement is outstanding, so say it.
+        val label = when {
+            status.state == StreamState.METADATA -> "Fetching torrent metadata…"
+            status.state == StreamState.IDLE -> "Connecting to peers…"
+            status.startupBlocker == StartupBlocker.MOOV_INDEX ->
+                "Head buffered — fetching this MP4's index…"
+            status.startupBlocker == StartupBlocker.PLAYHEAD -> "Buffering at your resume point…"
             else -> "Buffering…"
         }
         _uiState.value = PlayerUiState.Buffering(
@@ -1198,12 +1214,23 @@ class PlayerViewModel @Inject constructor(
     /**
      * The single progress bar shown while starting up represents "how close are we to PLAYABLE",
      * not "how much of the whole file is downloaded". Streaming only needs a small head to start, so
-     * whole-file progress would crawl near 0% the entire time and feel broken; this fills 0→100% as
-     * the head buffer reaches [PLAYABLE_TARGET_BYTES] and then sits full through the player's own
-     * prepare/buffer, giving one continuous bar from tap to first frame.
+     * whole-file progress would crawl near 0% the entire time and feel broken.
+     *
+     * The denominator is the readiness gate's OWN requirement (header + playhead + the container's real
+     * index need), so the bar reaches 100% exactly when the gate opens. The old head-only denominator
+     * pinned the bar at 100% the moment the first piece landed and then left it sitting there for the
+     * whole moov fetch — a bar claiming "done" over an engine that was still waiting. Falls back to the
+     * head-only figure only before the gate has published a requirement (metadata phase).
      */
-    private fun bufferFillPercent(status: StreamStatus): Int =
-        ((status.contiguousHeadBytes.toFloat() / PLAYABLE_TARGET_BYTES) * 100f).toInt().coerceIn(0, 100)
+    private fun bufferFillPercent(status: StreamStatus): Int {
+        val required = status.startupRequiredBytes
+        if (required <= 0L) {
+            return ((status.contiguousHeadBytes.toFloat() / PLAYABLE_TARGET_BYTES) * 100f)
+                .toInt().coerceIn(0, 100)
+        }
+        val have = (required - status.startupRemainingBytes).coerceAtLeast(0L)
+        return ((have.toFloat() / required) * 100f).toInt().coerceIn(0, 100)
+    }
 
     /**
      * Gentle nudge: if the head-buffer has dragged on past [BUFFERING_NAG_MS] with a low download

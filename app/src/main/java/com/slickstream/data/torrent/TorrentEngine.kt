@@ -1023,6 +1023,43 @@ class TorrentEngine @Inject constructor(
         }.onFailure { Log.w(TAG, "prioritizeHeadAndTail failed", it) } }
     }
 
+    /**
+     * The contiguous head is in and the EOF moov band is now the ONLY thing between the user and a
+     * first frame. Stop waiting for it passively: re-deadline exactly those pieces at the FRONT of the
+     * time-critical queue.
+     *
+     * At startup [prioritizeHeadAndTail] deliberately staggers the EOF band BEHIND the head band
+     * (tailBase = headPieces x [HEAD_DEADLINE_STEP_MS]) so a 32 MB head piece and a 32 MB tail piece
+     * don't split a thin swarm while the head is what the UI is showing progress against. That ordering
+     * is right up until the head lands — after which those stale head deadlines are the only reason the
+     * bytes that ARE blocking playback are still queued second. This re-issues the band from deadline 0
+     * with a tight step, so the swarm converges on the moov immediately.
+     *
+     * Deliberately does NOT touch the head band's priorities or deadlines: the read-ahead the player is
+     * about to need rides on them, and a completed piece's deadline is a no-op anyway. Idempotent and
+     * cheap (one native round-trip over a handful of pieces) — safe to call on every poll while the
+     * moov is missing.
+     */
+    fun promoteStartupTail(infoHash: String) {
+        val active = torrents[infoHash] ?: return
+        if (!active.startupTailArmed || active.pieceLength <= 0) return
+        val handle = active.handle?.takeIf { it.isValid } ?: return
+        val tailFrom = tailFromPiece(active)
+        synchronized(nativeLock) {
+            if (!active.startupTailArmed) return@synchronized
+            runCatching {
+                var i = 0
+                for (p in active.lastPiece downTo tailFrom) {
+                    if (p in active.firstPiece..active.lastPiece) {
+                        handle.piecePriority(p, Priority.TOP_PRIORITY)
+                        handle.setPieceDeadline(p, i * TAIL_PROMOTION_DEADLINE_STEP_MS)
+                        i++
+                    }
+                }
+            }.onFailure { Log.w(TAG, "promoteStartupTail failed", it) }
+        }
+    }
+
     /** A faststart MP4 revealed its moov in the head, so its speculative EOF work is no longer useful. */
     fun cancelStartupTail(infoHash: String) {
         val active = torrents[infoHash] ?: return
@@ -1643,6 +1680,12 @@ class TorrentEngine @Inject constructor(
 
         /** Keep read-ahead ordered too. A 25ms step made an entire 24–32MB window overdue at once. */
         const val READAHEAD_DEADLINE_STEP_MS = 250
+
+        /** Per-piece step used by [promoteStartupTail], once the EOF index is the ONLY thing blocking the
+         *  first frame. Much tighter than [HEAD_DEADLINE_STEP_MS] because nothing else is competing for
+         *  the time-critical slots any more, but still non-zero so the band is fetched IN ORDER rather
+         *  than every piece being equally overdue (which lets them complete in peer-speed order). */
+        const val TAIL_PROMOTION_DEADLINE_STEP_MS = 750
 
         /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
          *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
