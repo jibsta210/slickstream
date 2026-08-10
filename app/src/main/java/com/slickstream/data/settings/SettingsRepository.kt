@@ -240,6 +240,37 @@ class SettingsRepository @Inject constructor(
     suspend fun setDownloadQuality(q: QualityPreference) = dataStore.edit { it[KEY_DL_QUALITY] = q.name }
     suspend fun setDownloadSize(s: StreamSizePreference) = dataStore.edit { it[KEY_DL_SIZE] = s.name }
     suspend fun setHideIndianContent(hide: Boolean) = dataStore.edit { it[KEY_HIDE_INDIAN] = hide }
+    /**
+     * Accept a bare Real-Debrid API token and turn it into a configured Torrentio base.
+     *
+     * WHY THIS EXISTS: Torrentio only consults Real-Debrid when the ADDON URL ITSELF carries the config
+     * ("…/realdebrid=<token>/"). The built-in indexer is the PLAIN public endpoint, which never talks to
+     * RD at all — so a paid RD subscription did precisely nothing for source finding unless the user
+     * happened to paste a full configured URL here by hand. A cached RD release streams instantly as a
+     * direct HTTP file: no swarm, no EOF-index wait, none of the startup cost this app fights.
+     *
+     * Pass-through: anything that already looks like a URL is stored verbatim (so a hand-built or
+     * multi-service config, e.g. premiumize/alldebrid, still works). Only a bare token is wrapped.
+     */
+    suspend fun setDebridToken(token: String) {
+        setCustomSourceUrl(normalizeSourceInput(token))
+    }
+
+    /**
+     * Turn whatever the user pasted into something the resolver can actually query.
+     *
+     * The old heuristic ("contains a slash -> it's a URL, store verbatim") silently accepted three
+     * plausible pastes that then never worked, while the UI still showed a green "✓ Custom source
+     * active": the /configure page's Install button yields a `stremio://…` link, a copied address is
+     * often schemeless (`torrentio.strem.fun/realdebrid=…/`), and people paste `realdebrid=<token>`.
+     * Each is normalised here instead of failing invisibly at request time.
+     */
+    internal fun normalizeSourceInput(raw: String): String = normalizeSourceInputImpl(raw)
+
+    private fun normalizeSourceInputImpl(raw: String): String =
+        normalizeSourceInputForTest(raw)
+
+
     suspend fun setCustomSourceUrl(url: String) = dataStore.edit {
         it[KEY_CUSTOM_SOURCE] = url.trim()
         it.stampSynced()
@@ -309,7 +340,12 @@ class SettingsRepository @Inject constructor(
             (remote["movieBarPercent"] as? Number)?.toInt()?.let { p[KEY_MOVIE_BAR_PCT] = it.coerceIn(PCT_MIN, PCT_MAX) }
             // Only adopt a NON-BLANK remote custom source — a device that never set one must not wipe a
             // URL another device configured (whole-doc LWW would otherwise clobber it). Clearing is local.
-            (remote["customSourceUrl"] as? String)?.let { if (it.isNotBlank()) p[KEY_CUSTOM_SOURCE] = it }
+            // Validated, not trusted. This value now carries a Real-Debrid credential AND decides which
+            // host every source request goes to, so a doc that was ever written by anything other than
+            // this user must not be able to repoint the app at an arbitrary server. Accept https only.
+            (remote["customSourceUrl"] as? String)?.let {
+                if (it.isNotBlank() && it.startsWith("https://", ignoreCase = true)) p[KEY_CUSTOM_SOURCE] = it
+            }
             p[KEY_SYNC_UPDATED] = ts
         }
     }
@@ -319,7 +355,30 @@ class SettingsRepository @Inject constructor(
     private fun String?.toQuality(default: QualityPreference): QualityPreference =
         this?.let { runCatching { QualityPreference.valueOf(it) }.getOrNull() } ?: default
 
-    private companion object {
+    companion object {
+        /** Pure entry point for [normalizeSourceInput] so its paste-handling can be unit-tested without
+         *  a DataStore. Kept beside the implementation so the two cannot drift. */
+        fun normalizeSourceInputForTest(raw: String): String {
+            var t = raw.trim()
+            if (t.isEmpty()) return ""
+            if (t.startsWith("stremio://", ignoreCase = true)) {
+                t = "https://" + t.substring("stremio://".length)
+            }
+            if (t.startsWith("realdebrid=", ignoreCase = true)) t = "https://torrentio.strem.fun/$t/"
+            return when {
+                // UPGRADE http, never pass it through: this URL carries an account credential in its
+                // PATH, so cleartext exposes it to the ISP, the LAN and any transparent proxy — and
+                // usesCleartextTraffic=true in the manifest means the platform would not block it.
+                // It also keeps this normaliser agreeing with applySyncedSettings' https-only gate,
+                // which would otherwise accept the value on the phone and silently refuse it on the TV.
+                t.startsWith("http://", true) -> "https://" + t.substring("http://".length)
+                t.startsWith("https://", true) -> t
+                t.contains('/') || t.contains('.') -> "https://$t"
+                else -> "https://torrentio.strem.fun/realdebrid=" +
+                    java.net.URLEncoder.encode(t, "UTF-8") + "/"
+            }
+        }
+
         val KEY_WIFI = stringPreferencesKey("quality_wifi")
         val KEY_CELL = stringPreferencesKey("quality_cellular")
         val KEY_DENSITY = stringPreferencesKey("ui_density")
@@ -357,4 +416,5 @@ class SettingsRepository @Inject constructor(
         const val PCT_MIN = 80
         const val PCT_MAX = 99
     }
+
 }

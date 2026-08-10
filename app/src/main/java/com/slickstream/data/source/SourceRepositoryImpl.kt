@@ -71,7 +71,14 @@ class SourceRepositoryImpl @Inject constructor(
 
         val customBases = try {
             settingsRepository.current().customSourceUrl
-                .split(",").map { it.trim() }.filter { it.isNotBlank() }.map(::normalizeBase)
+                // NOT a plain comma split. A real Torrentio /configure URL legally CONTAINS commas —
+                // its builder joins providers/qualities/languages with ',' (e.g.
+                // ".../providers=yts,eztv|realdebrid=TOKEN/"). Splitting on every comma shattered exactly
+                // the URLs the help text tells the user to paste, into fragments that all 404, so a
+                // correctly-configured Real-Debrid source silently returned nothing while the UI showed a
+                // green "✓ Custom source active". Only split where a NEW url plainly begins.
+                .split(Regex(",(?=\\s*(?:https?://|stremio://))"))
+                .map { it.trim() }.filter { it.isNotBlank() }.map(::normalizeBase)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Throwable) {

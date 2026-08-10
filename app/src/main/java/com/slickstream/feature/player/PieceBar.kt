@@ -24,6 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.slickstream.core.common.formatRate
 import com.slickstream.core.model.StartupBlocker
 import com.slickstream.ui.theme.Brand
 import kotlin.math.roundToInt
@@ -89,6 +90,31 @@ fun PieceBar(
 const val PIECE_BAR_BUCKETS = 110
 
 /**
+ * When the chunk bar belongs on screen. Pure so the rule can be tested without a composition.
+ *
+ * The bar exists for ONE job: telling a real stall from a false one. Two ways that job was being
+ * failed, both of them "the bar shows nothing":
+ *
+ *  - [stalled] (a MID-PLAYBACK rebuffer) used to be missing from this rule, so the bar rode with the
+ *    transport only. The player's uiState stays Playing through a rebuffer and the transport auto-hides
+ *    after 5 s, so the picture froze, the "Buffering… · 5.0 MB/s" badge came up, and the one surface
+ *    that could show WHERE those megabytes were landing was not drawn at all. That gap only became the
+ *    common case once the exact-moov gate and the mkv preference cut startup to a second or two: the
+ *    wait moved out of the startup overlay (where the bar is forced up) into mid-playback.
+ *
+ *  - [torrentBacked] false is a DIRECT (Real-Debrid / file-server / offline) stream. There is no swarm
+ *    and no piece map behind it, so the panel could only ever render the word "Downloading…" over a
+ *    flat empty track — a bar that reads as "nothing has downloaded" for a stream that is playing fine.
+ *    A diagnostic that reports an empty file for a healthy stream is worse than no diagnostic.
+ */
+fun shouldShowChunkBar(
+    torrentBacked: Boolean,
+    starting: Boolean,
+    stalled: Boolean,
+    controlsShown: Boolean,
+): Boolean = torrentBacked && (starting || stalled || controlsShown)
+
+/**
  * The chunk bar plus a one-line info row: a health dot, live seeders/peers, download speed, and a
  * warning ("low buffer" / "stalled") when the download is at risk of out-running playback.
  */
@@ -117,9 +143,20 @@ fun PieceBarPanel(
                         } else {
                             append("${stats.seeders} seeders")
                             if (stats.peers > stats.seeders) append(" · ${stats.peers} peers")
-                            append(" · ${formatRate(stats.downloadRateBytes)}")
+                            // The PAYLOAD rate — bytes that actually become file. The wire rate that
+                            // used to be printed here also counts protocol overhead, hash-failed
+                            // re-fetches and duplicate blocks the swarm discards, which is why
+                            // "7.7 MB/s" and "60% of 1.9 GB after 3 minutes" could both be true and
+                            // still look like a contradiction. Now speed x time ~= delta-progress,
+                            // to within the waste figure printed below.
+                            append(" · ${formatRate(stats.payloadRateBytes)}")
                             if (stats.progress >= 0.999f) append(" · ✓ fully downloaded")
                             else append(" · ${(stats.progress * 100).roundToInt()}% downloaded")
+                            // Real bandwidth this bounded link paid for and threw away. Shown only when
+                            // it is big enough to matter, because it is not cosmetic: those bytes come
+                            // out of the read-ahead window and are a direct cause of mid-stream
+                            // rebuffering. Better on the diagnostic line than hidden inside the speed.
+                            stats.wastedPercent?.let { append(" · $it% wasted") }
                             // Once the current file is in, surface the next-episode precache so the user can
                             // see it warming (instead of the bar just reading a static 100%).
                             if (stats.precaching) append(" · caching next episode")
@@ -172,6 +209,11 @@ private const val HEALTHY_LEAD_FRACTION = 0.02f
  * The bar and the gate must never describe the file differently: the reported bug was three or four
  * solid teal cells at the head — a head the gate had already accepted — sitting under the words "low
  * buffer", because this function was inferring a verdict from the fill pattern instead of asking.
+ *
+ * Every rate test below reads [StreamStats.downloadRateBytes], the WIRE rate — on purpose, and unlike
+ * the line above the bar, which prints the payload rate. "Stalled" is a claim about the LINK: a swarm
+ * that is moving bytes we end up discarding is being wasteful, not dead, and must not be labelled with
+ * the red dot that means "this source is finished, switch away".
  */
 private fun healthOf(map: FloatArray, playheadFraction: Float, stats: StreamStats?): BarHealth {
     if (stats == null || map.isEmpty()) return BarHealth(Brand.Cyan, null)
@@ -221,8 +263,3 @@ private fun healthOf(map: FloatArray, playheadFraction: Float, stats: StreamStat
     return BarHealth(Brand.Star, "low buffer")
 }
 
-private fun formatRate(bytesPerSec: Int): String = when {
-    bytesPerSec <= 0 -> "0 KB/s"
-    bytesPerSec >= 1024 * 1024 -> "%.1f MB/s".format(bytesPerSec / (1024f * 1024f))
-    else -> "${bytesPerSec / 1024} KB/s"
-}

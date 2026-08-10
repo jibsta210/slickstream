@@ -35,6 +35,7 @@ import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.PlaybackProgress
 import com.slickstream.core.model.StartupBlocker
 import com.slickstream.core.model.StreamSource
+import com.slickstream.data.torrent.TransferAccounting
 import com.slickstream.core.model.StreamState
 import com.slickstream.core.model.StreamStatus
 import com.slickstream.core.repository.CatalogRepository
@@ -79,7 +80,9 @@ sealed interface PlayerUiState {
     data class Buffering(
         val percent: Int,
         val seeders: Int,
-        val downloadRateBytes: Int,
+        /** Bytes-becoming-file per second — the honest speed to print. NOT libtorrent's wire rate,
+         *  which also counts protocol overhead and the duplicate blocks the swarm discards. */
+        val payloadRateBytes: Int,
         val label: String,
         /** Rough seconds until playback can start (head buffer / rate); null when not estimable. */
         val etaSeconds: Int? = null,
@@ -100,7 +103,8 @@ sealed interface PlayerUiState {
 data class RebufferState(
     /** Best-effort seconds until enough is buffered to resume, or null when not estimable. */
     val etaSeconds: Int?,
-    val downloadRateBytes: Int,
+    /** Display speed: bytes becoming file per second (see [PlayerUiState.Buffering]). */
+    val payloadRateBytes: Int,
 )
 
 /** One selectable audio track for the in-player audio picker. [id] is "groupIndex:trackIndex" over the
@@ -119,7 +123,17 @@ data class CaptionPrefs(val size: SubtitleSize, val style: SubtitleStyle)
 data class StreamStats(
     val seeders: Int,
     val peers: Int,
+    /** WIRE rate. Kept because the chunk bar's "stalled" verdict must key on whether the link is moving
+     *  AT ALL: a non-zero wire rate with zero payload means peers are still talking to us, which is not
+     *  a dead swarm and must not be labelled one. */
     val downloadRateBytes: Int,
+    /** ...and the rate it PRINTS: bytes that became file. */
+    val payloadRateBytes: Int = 0,
+    /** Whole-percent of accounted traffic thrown away (hash-failed + redundant duplicate blocks), or
+     *  null when it is too small / too early to be worth saying. This is bandwidth the bounded TV link
+     *  spent on nothing, taken out of the read-ahead window — so it belongs on the diagnostic line
+     *  rather than silently inflating the speed. */
+    val wastedPercent: Int? = null,
     val progress: Float,
     val precaching: Boolean = false,
     /** Hash-verifying cached/on-disk data (resume), not downloading — rate/seeders read 0 but it's fine. */
@@ -380,6 +394,8 @@ class PlayerViewModel @Inject constructor(
             seeders = it.seeders,
             peers = it.peers,
             downloadRateBytes = it.downloadRateBytes,
+            payloadRateBytes = it.payloadRateBytes,
+            wastedPercent = TransferAccounting.wastedPercentToShow(it.payloadBytes, it.wastedBytes),
             progress = it.progress,
             precaching = prefetchJob?.isActive == true,
             isChecking = it.isChecking,
@@ -619,6 +635,10 @@ class PlayerViewModel @Inject constructor(
         // a smaller source can't help and just throws the download away. The downshift exists only to
         // rescue a swarm that genuinely can't sustain the bitrate. This is the primary guard for the
         // "300 seeders, 5 MB/s, still switched torrents" case.
+        // Deliberately the WIRE rate, not the payload rate. Payload is the honest number to PRINT, but
+        // using it here would make this guard release sooner — i.e. make failover MORE aggressive — and
+        // that is a playback-reliability change that must not ride along with a labelling fix. Revisit
+        // only with a measured waste percentage from the DIAG line in front of you.
         if ((latestStatus?.downloadRateBytes ?: 0) >= HEALTHY_RATE_BYTES) return
         val smaller = findSmallerHealthySource() ?: return
         rebufferWatchdogJob?.cancel()
@@ -752,7 +772,7 @@ class PlayerViewModel @Inject constructor(
             // A direct (RD/file-server) source has no swarm — never show a seeder count on its loading
             // screen (it was carrying the underlying torrent's seeders and looking like a torrent).
             seeders = if (source.isDirect) 0 else source.seeders ?: 0,
-            downloadRateBytes = 0,
+            payloadRateBytes = 0,
             label = if (source.isDirect) "Loading…" else "Connecting to peers…",
         )
 
@@ -1042,7 +1062,7 @@ class PlayerViewModel @Inject constructor(
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
             seeders = if (next.isDirect) 0 else next.seeders ?: 0,
-            downloadRateBytes = 0,
+            payloadRateBytes = 0,
             label = "Trying another source…",
         )
         // Persist the LIVE position BEFORE tearing the player down — _player.value still holds the old
@@ -1111,7 +1131,7 @@ class PlayerViewModel @Inject constructor(
         if (_rebuffering.value != null) {
             _rebuffering.value = RebufferState(
                 etaSeconds = etaToResume(status),
-                downloadRateBytes = status.downloadRateBytes,
+                payloadRateBytes = status.payloadRateBytes,
             )
         }
         val url = status.streamUrl
@@ -1131,8 +1151,8 @@ class PlayerViewModel @Inject constructor(
                 // Progress toward PLAYABLE (not toward the whole multi-GB file) so the bar fills to
                 // ~100% exactly as we become ready — instead of sitting near 0% during "Almost ready…".
                 percent = bufferFillPercent(status),
-                seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
-                downloadRateBytes = status.downloadRateBytes,
+                seeders = displaySeeders(status, source),
+                payloadRateBytes = status.payloadRateBytes,
                 label = "Almost ready…",
                 // Prefer the streamer's gate-accurate ETA (head + mp4 moov tail); fall back to the
                 // local head-only estimate only when the streamer can't estimate yet.
@@ -1167,8 +1187,8 @@ class PlayerViewModel @Inject constructor(
         }
         _uiState.value = PlayerUiState.Buffering(
             percent = bufferFillPercent(status),
-            seeders = status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0),
-            downloadRateBytes = status.downloadRateBytes,
+            seeders = displaySeeders(status, source),
+            payloadRateBytes = status.payloadRateBytes,
             label = label,
             etaSeconds = status.etaSeconds ?: etaToPlaying(status),
         )
@@ -1185,9 +1205,12 @@ class PlayerViewModel @Inject constructor(
      */
     private fun etaToPlaying(status: StreamStatus): Int? {
         val needed = (PLAYABLE_TARGET_BYTES - status.contiguousHeadBytes).coerceAtLeast(0L)
+        // Payload rate: `needed` is payload bytes, so dividing by the wire rate (overhead + discarded
+        // duplicates) shortened every countdown by the waste fraction.
+        val rate = status.payloadRateBytes.takeIf { it > 0 } ?: status.downloadRateBytes
         val downloadSecs = when {
             needed == 0L -> 0
-            status.downloadRateBytes > 0 -> (needed / status.downloadRateBytes).toInt()
+            rate > 0 -> (needed / rate).toInt()
             else -> return null
         }
         return (downloadSecs + PREPARE_MARGIN_SECONDS).takeIf { it in 1..900 }
@@ -1201,7 +1224,8 @@ class PlayerViewModel @Inject constructor(
      * honestly signalling "slow connection — this'll be a bit". Null when the rate/size is unknown.
      */
     private fun etaToResume(status: StreamStatus): Int? {
-        val rate = status.downloadRateBytes
+        // Payload rate — the cushion is measured in file bytes, not wire bytes.
+        val rate = status.payloadRateBytes.takeIf { it > 0 } ?: status.downloadRateBytes
         if (rate <= 0) return null
         val durMs = _currentPlayer.value?.duration?.takeIf { it > 0 } ?: return null
         val infoHash = _currentSource.value?.infoHash ?: return null
@@ -1228,9 +1252,27 @@ class PlayerViewModel @Inject constructor(
             return ((status.contiguousHeadBytes.toFloat() / PLAYABLE_TARGET_BYTES) * 100f)
                 .toInt().coerceIn(0, 100)
         }
-        val have = (required - status.startupRemainingBytes).coerceAtLeast(0L)
-        return ((have.toFloat() / required) * 100f).toInt().coerceIn(0, 100)
+        // Straight from the gate's own StartDecision.fillFraction — no second implementation. The copy
+        // that used to live here re-derived (required - remaining) / required and lost that function's
+        // "never 1.0 while a requirement is outstanding" clamp, so it printed "100% · Almost ready…"
+        // over a shut gate: the EOF requirement is a notional 8 MB while the credit is counted in real
+        // finished blocks of 32 MB pieces, so one part-finished piece pays the whole band off.
+        return (status.startupFillFraction * 100f).toInt().coerceIn(0, 100)
     }
+
+    /**
+     * Seeder count to SHOW. libtorrent's numSeeds() is CONNECTED seeds; a source's `seeders` is the
+     * addon's ADVERTISED swarm size. Substituting the second for the first whenever the first is 0 put
+     * "5,000 seeders · 0 KB/s" on screen for a swarm we were connected to nobody in. Keep the advertised
+     * number only for the phase where nothing else can possibly be known (no torrent running yet), and
+     * report the honest live count — including a live 0 — from then on.
+     */
+    private fun displaySeeders(status: StreamStatus, source: StreamSource): Int =
+        if (status.state == StreamState.IDLE || status.state == StreamState.METADATA) {
+            status.seeders.takeIf { it > 0 } ?: (source.seeders ?: 0)
+        } else {
+            status.seeders
+        }
 
     /**
      * Gentle nudge: if the head-buffer has dragged on past [BUFFERING_NAG_MS] with a low download
@@ -1438,7 +1480,7 @@ class PlayerViewModel @Inject constructor(
                             _uiState.value = PlayerUiState.Buffering(
                                 percent = prev?.percent ?: 100,
                                 seeders = prev?.seeders ?: (s?.seeders ?: 0),
-                                downloadRateBytes = prev?.downloadRateBytes ?: 0,
+                                payloadRateBytes = prev?.payloadRateBytes ?: 0,
                                 label = "Almost ready…",
                                 etaSeconds = prev?.etaSeconds,
                             )
@@ -1473,7 +1515,7 @@ class PlayerViewModel @Inject constructor(
                             // refreshed live from the torrent feed in handleStatus.
                             _rebuffering.value = RebufferState(
                                 etaSeconds = latestStatus?.let { etaToResume(it) },
-                                downloadRateBytes = latestStatus?.downloadRateBytes ?: 0,
+                                payloadRateBytes = latestStatus?.payloadRateBytes ?: 0,
                             )
                             armSustainedRebufferWatchdog()  // sustained underrun -> downshift (keeps position)
                         }
@@ -1589,7 +1631,7 @@ class PlayerViewModel @Inject constructor(
                         _uiState.value = PlayerUiState.Buffering(
                             percent = 0,
                             seeders = 0,
-                            downloadRateBytes = 0,
+                            payloadRateBytes = 0,
                             label = "Reconnecting…",
                         )
                         viewModelScope.launch {
@@ -1628,7 +1670,7 @@ class PlayerViewModel @Inject constructor(
                     _uiState.value = PlayerUiState.Buffering(
                         percent = 0,
                         seeders = _currentSource.value?.seeders ?: 0,
-                        downloadRateBytes = 0,
+                        payloadRateBytes = 0,
                         label = "Reconnecting…",
                     )
                     viewModelScope.launch {
@@ -1756,7 +1798,7 @@ class PlayerViewModel @Inject constructor(
                         _uiState.value = PlayerUiState.Buffering(
                             percent = prev?.percent ?: 100,
                             seeders = prev?.seeders ?: (_currentSource.value?.seeders ?: 0),
-                            downloadRateBytes = prev?.downloadRateBytes ?: 0,
+                            payloadRateBytes = prev?.payloadRateBytes ?: 0,
                             label = "Almost ready…",
                             etaSeconds = prev?.etaSeconds,
                         )
@@ -1767,7 +1809,7 @@ class PlayerViewModel @Inject constructor(
                         // Mid-playback stall on the VLC backend — same small badge as the ExoPlayer path.
                         _rebuffering.value = RebufferState(
                             etaSeconds = latestStatus?.let { etaToResume(it) },
-                            downloadRateBytes = latestStatus?.downloadRateBytes ?: 0,
+                            payloadRateBytes = latestStatus?.payloadRateBytes ?: 0,
                         )
                         armSustainedRebufferWatchdog()
                     }
@@ -1820,7 +1862,7 @@ class PlayerViewModel @Inject constructor(
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
             seeders = if (_currentSource.value?.isDirect == true) 0 else _currentSource.value?.seeders ?: 0,
-            downloadRateBytes = 0,
+            payloadRateBytes = 0,
             label = "Switching player…",
         )
         currentMediaUrl = null   // force ensureVlcPlayer to (re)load even if the url matches

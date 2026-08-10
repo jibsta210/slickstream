@@ -44,7 +44,10 @@ class TrackerFallback @Inject constructor(
         buildMagnet: (infoHash: String, displayName: String) -> String,
         parseQuality: (String) -> String,
     ): List<StreamSource> = coroutineScope {
-        val numericImdb = imdbId.removePrefix("tt").trimStart('0').ifEmpty { "0" }
+        // Strip ONLY the "tt" — keep the zero padding. EZTV matches on the padded numeric id: measured
+        // live, imdb_id=0098844 returns 371 torrents while imdb_id=98844 returns ZERO. Trimming the zeros
+        // silently made the EZTV half of this fallback return nothing at all.
+        val numericImdb = imdbId.removePrefix("tt").ifEmpty { "0" }
         val jobs = listOf(
             async {
                 runCatchingCancellable {

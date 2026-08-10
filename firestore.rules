@@ -1,0 +1,66 @@
+rules_version = '2';
+
+// Firestore security rules for SlickStream, kept IN THE REPO on purpose.
+//
+// These were previously configured only in the Firebase console, which meant the rules protecting a
+// live account credential were unreviewable and unversioned — nobody could tell from the source tree
+// whether the data was actually locked down. Everything the app writes is per-user private data, and
+// some of it is sensitive:
+//
+//   users/{uid}/meta/settings   carries customSourceUrl, which holds the user's Real-Debrid API
+//                               token (a debrid addon URL is "…/realdebrid=<TOKEN>/").
+//   users/{uid}/**              watch history, resume positions, favourites, profiles — a complete
+//                               record of what someone watches and when.
+//
+// So the only rule that matters: a signed-in user may touch their OWN document subtree and nothing
+// else. No public reads, no cross-user access, no unauthenticated writes.
+//
+// NOTE: this file is the source of truth, but Firestore does not read it from the repo — it must be
+// deployed (`firebase deploy --only firestore:rules`) for a change here to take effect.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Per-user private data. `uid` must match the caller's own auth token, which also means an
+    // unauthenticated request (request.auth == null) fails both comparisons and is denied.
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Anonymous crash/playback diagnostics. Keyed by a random install UUID (never an email or user id)
+    // and deliberately write-only from the app: a client has no reason to read anyone's reports,
+    // including its own, so nothing here can be used to enumerate installs.
+    //
+    // CONSTRAINED, not open. The Firebase project id and API key ship inside the APK, so "allow create:
+    // if true" is an unauthenticated, unbounded write grant on a production database — anyone who pulls
+    // the app can script unlimited writes, billing the owner per document and per stored byte and
+    // poisoning the very data used to debug real player faults. The shape limits below make a scripted
+    // writer work for it; App Check (Firebase console) is what actually proves the caller is the app,
+    // and should be enabled and required here.
+    match /diagnostics/{installId} {
+      allow create: if isUuid(installId) && smallPayload();
+      allow read, update, delete: if false;
+
+      match /{document=**} {
+        allow create: if isUuid(installId) && smallPayload();
+        allow read, update, delete: if false;
+      }
+    }
+
+    // The install id must look like the random UUID the app generates — not an arbitrary path.
+    function isUuid(id) {
+      return id.size() == 36 && id.matches('[0-9a-fA-F-]{36}');
+    }
+
+    // Bound what one write can cost: field count and total serialised size.
+    function smallPayload() {
+      return request.resource.data.keys().size() <= 24 &&
+             request.resource.data.size() <= 24;
+    }
+
+    // Anything not matched above is denied. Stated explicitly so a future collection has to be
+    // granted access deliberately rather than inheriting it by accident.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

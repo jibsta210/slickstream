@@ -227,6 +227,9 @@ class TorrentStreamerImpl @Inject constructor(
                 // isn't complete (its peers dropped — the "buffers mid-stream, 0 KB/s, never finishes"
                 // case), force a fresh tracker + DHT announce to re-find peers instead of sitting dead
                 // until libtorrent's next scheduled announce (which can be ~30 min away). Rate-limited.
+                // Deliberately the WIRE rate, not the payload rate. A non-zero wire rate with zero
+                // payload means peers ARE talking to us (handshakes, metadata, choked-but-connected) —
+                // forcing a fresh announce there would fire spuriously against a swarm that is fine.
                 val now = System.currentTimeMillis()
                 if (!snap.isFinished && !snap.isPaused && snap.downloadRate == 0) {
                     if (zeroRateSince == 0L) zeroRateSince = now
@@ -335,15 +338,25 @@ class TorrentStreamerImpl @Inject constructor(
                 // ETA to first frame, against the real gate, refreshed each poll.
                 val eta = estimateEta(snap, decision)
 
+                // Refresh the chunk bar's cache on EVERY poll. It used to ride on the DIAG_EVERY log
+                // counter, i.e. once per 2 s, while the TV overlay reads it on its own 1 s tick — so the
+                // bar could sit up to ~3 s behind the "% downloaded" text beside it and look like it
+                // disagreed with it. Cost is one bitfield reduction at 2 Hz.
+                engine.pieceMap(infoHash, PIECE_MAP_CACHE_BUCKETS)
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { pieceMapCache[infoHash] = it }
+
                 if (pollCount++ % DIAG_EVERY == 0) {
-                    engine.pieceMap(infoHash, PIECE_MAP_CACHE_BUCKETS)
-                        .takeIf { it.isNotEmpty() }
-                        ?.let { pieceMapCache[infoHash] = it }
                     Log.d(
                         TAG,
-                        "stream=$infoHash rate=${snap.downloadRate}B/s peers=${snap.peers} " +
-                            "seeds=${snap.seeders} head=$headBytes prog=${snap.progress} " +
-                            "paused=${snap.isPaused} ready=$emittedReady",
+                        // wire vs payload vs waste, so the deadline posture can be tuned against a
+                        // MEASURED discard rate instead of a guess. waste = (failed + redundant) as a
+                        // share of accounted traffic; if it is large, that bandwidth came out of the
+                        // read-ahead window and is a direct cause of mid-stream rebuffering.
+                        "stream=$infoHash wire=${snap.downloadRate}B/s payload=${snap.payloadRate}B/s " +
+                            "waste=${(TransferAccounting.wastedFraction(snap.payloadBytes, snap.wastedBytes) * 100f).toInt()}% " +
+                            "peers=${snap.peers} seeds=${snap.seeders} head=$headBytes " +
+                            "prog=${snap.progress} paused=${snap.isPaused} ready=$emittedReady",
                     )
                 }
 
@@ -708,6 +721,9 @@ class TorrentStreamerImpl @Inject constructor(
             state = state,
             progress = snap.progress,
             downloadRateBytes = snap.downloadRate,
+            payloadRateBytes = TransferAccounting.displayRate(snap.payloadRate, snap.downloadRate),
+            payloadBytes = snap.payloadBytes,
+            wastedBytes = snap.wastedBytes,
             uploadRateBytes = snap.uploadRate,
             seeders = snap.seeders,
             peers = snap.peers,
@@ -722,6 +738,7 @@ class TorrentStreamerImpl @Inject constructor(
             startupBlocker = decision?.blocker ?: StartupBlocker.NONE,
             startupRequiredBytes = decision?.requiredBytes ?: 0L,
             startupRemainingBytes = decision?.remainingBytes ?: 0L,
+            startupFillFraction = decision?.fillFraction ?: 0f,
             isChecking = snap.isChecking,
         )
     }
@@ -736,7 +753,11 @@ class TorrentStreamerImpl @Inject constructor(
      * / fetching metadata).
      */
     private fun estimateEta(snap: EngineStatus, decision: StartDecision): Int? {
-        val rate = snap.downloadRate
+        // PAYLOAD rate, not the wire rate: remainingBytes is a payload requirement, so dividing it by a
+        // wire rate that includes overhead + discarded duplicates made every countdown optimistic by
+        // exactly the waste fraction — "starts in ~12s" that took 20. Only the denominator changes; the
+        // null-when-no-rate rule and the 1..900 clamp below are untouched, so no gate behaviour moves.
+        val rate = TransferAccounting.displayRate(snap.payloadRate, snap.downloadRate)
         if (rate <= 0) return null
         // A closed gate with nothing "remaining" means the byte count has run out of resolution, not
         // that we are done: the EOF requirement is a fixed 8 MB while the credit comes from real blocks
