@@ -275,6 +275,27 @@ class SourceRepositoryImpl @Inject constructor(
             // English preference softly, so an obscure title is never stranded just because its only
             // healthy release is tagged as foreign/original audio.
             if (sources.isNotEmpty()) {
+                // Diagnostic breadcrumb for "RD is available but it keeps playing torrents". Records the
+                // TRANSPORT SPLIT the resolver actually produced — how many rows arrived with a playable
+                // direct URL versus how many were torrents, and how many debrid rows were deliberately
+                // force-converted to torrents because they were an "add to your debrid" ACTION url rather
+                // than a cached file. That distinguishes the three candidate causes without a device
+                // log: (a) the addon returned no cached rows at all (an upstream/debrid problem),
+                // (b) rows arrived direct but the picker skipped them (an app bug), or (c) rows arrived
+                // as uncached actions and were correctly torrented. Counts only — never a URL, never a
+                // title, and never anything carrying the account token.
+                val directCount = sources.count { it.isDirect }
+                // Whether the user's OWN configured addon (the debrid-backed one) answered at all is the
+                // single most useful bit here: if it failed, there are no cached rows to be direct ABOUT,
+                // and the app correctly falls back to torrents — which looks identical, from the sofa, to
+                // the app "ignoring Real-Debrid". customBases are queried first, so they occupy the first
+                // customBases.size slots of the response array.
+                val customOk = responses.take(customBases.size).count { it != null }
+                android.util.Log.i(
+                    "SourceResolve",
+                    "resolved type=$type direct=$directCount torrent=${sources.size - directCount} " +
+                        "addonsOk=${ok.size}/${allBases.size} customOk=$customOk/${customBases.size}",
+                )
                 DataResult.Success(sources)
             } else {
                 // The addons ANSWERED but had nothing usable (Torrentio serves an empty list for an

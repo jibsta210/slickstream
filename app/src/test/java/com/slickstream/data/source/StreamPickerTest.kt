@@ -99,6 +99,51 @@ class StreamPickerTest {
         assertTrue(StreamPicker.isResumeCompatible(safe, list, maxTier = 3, lowPower = false))
     }
 
+    // --- Real-Debrid / direct must always beat a torrent -------------------------------------------
+
+    @Test
+    fun `a direct RD stream is chosen over healthier torrents`() {
+        // The reported regression: "they all say RD available but now choose torrents". A direct source
+        // plays instantly with no swarm, so it must win regardless of how well-seeded the torrents are.
+        val rd = source(hash = "rd", seeders = 0, direct = "https://cdn.real-debrid.com/d/XYZ/Movie.mkv")
+        val fatTorrent = source(hash = "t1", seeders = 900, size = 2000)
+        val healthyTorrent = source(hash = "t2", seeders = 400, size = 900)
+
+        val picked = StreamPicker.pickDirect(
+            listOf(fatTorrent, rd, healthyTorrent), maxTier = 3, lowPower = false,
+        )
+        assertEquals(rd, picked)
+    }
+
+    @Test
+    fun `an RD stream whose name has no container tag is still chosen`() {
+        // The mkv preference added for startup speed must NEVER cost us a direct source: RD rows are
+        // routinely named without a container ("[RD+] Movie.2024.1080p.WEB-DL"), so a container filter
+        // applied to the direct path would silently demote every one of them to a torrent.
+        val rdNoContainer = source(hash = "rd", seeders = 0, direct = "https://cdn.real-debrid.com/d/A/f")
+        val mkvTorrent = source(hash = "t", seeders = 500).copy(frontIndexContainer = true)
+
+        assertEquals(rdNoContainer, StreamPicker.pickDirect(listOf(mkvTorrent, rdNoContainer), 3, false))
+    }
+
+    @Test
+    fun `the mkv preference never removes the only playable candidate`() {
+        // Soft-preference contract: if nothing is an mkv, the pick must fall through, not return null.
+        val mp4a = source(hash = "a", seeders = 100)
+        val mp4b = source(hash = "b", seeders = 300)
+        val picked = StreamPicker.pick(listOf(mp4a, mp4b), 3, StreamSizePreference.BALANCED, false)
+        assertEquals(mp4b, picked)
+    }
+
+    @Test
+    fun `an mkv is preferred only among equally healthy torrents`() {
+        // ...and must not override swarm health: a 5-seed mkv must not beat a 500-seed mp4.
+        val deadMkv = source(hash = "mkv", seeders = 5).copy(frontIndexContainer = true)
+        val healthyMp4 = source(hash = "mp4", seeders = 500)
+        val picked = StreamPicker.pick(listOf(deadMkv, healthyMp4), 3, StreamSizePreference.BALANCED, false)
+        assertEquals(healthyMp4, picked)
+    }
+
     private fun source(
         hash: String,
         seeders: Int,
