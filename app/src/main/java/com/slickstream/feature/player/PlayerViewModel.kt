@@ -2044,7 +2044,30 @@ class PlayerViewModel @Inject constructor(
         val hash = activeInfoHash ?: return
         val url = currentMediaUrl ?: return
         val dur = player.duration.takeIf { it > 0 } ?: return
-        thumbnails.start(url, hash, dur, torrentStreamer.fileLength(hash), torrentStreamer.filePath(hash))
+        val src = _currentSource.value
+        if (src?.isDirect == true) {
+            // DIRECT (Real-Debrid / free addon / offline download): the torrent engine never started for
+            // this source, so fileLength()/filePath() are 0/null — feeding those to the extractor was
+            // exactly why RD scrubbing showed empty film-strip slots. Sample from the URL itself with
+            // the host's own headers plus a real browser UA (a header-less request gets 403/empty from
+            // the same CDNs that forced buildMediaSourceFactory to carry them).
+            val hdrs = src.requestHeaders.toMutableMap().apply {
+                if (keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                    put("User-Agent", DEFAULT_USER_AGENT)
+                }
+            }
+            thumbnails.start(
+                streamUrl = url,
+                hash = hash,
+                durationMs = dur,
+                fileLength = 0L,
+                filePath = null,
+                headers = hdrs,
+                torrentBacked = false,
+            )
+        } else {
+            thumbnails.start(url, hash, dur, torrentStreamer.fileLength(hash), torrentStreamer.filePath(hash))
+        }
     }
 
     private fun startProgressTicker() {
