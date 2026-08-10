@@ -27,6 +27,11 @@ data class StreamSource(
     /** True when the release name marks it a CAM / TS / TELESYNC (a filmed-in-cinema rip — terrible
      *  quality, common for new releases). Surfaced to the user and sorted/picked below real encodes. */
     val isCam: Boolean = false,
+    /** True when the release names a container whose index sits at the FRONT (mkv/webm) rather than at
+     *  EOF (mp4/m4v/mov). Front-index files start on the head alone — no EOF "moov" fetch, which on a
+     *  big-piece torrent is the single largest component of time-to-first-frame. Soft-preferred by the
+     *  picker, never required: an unknown/absent container tag is treated as "not known to be fast". */
+    val frontIndexContainer: Boolean = false,
     /** A DIRECT http/hls URL for a non-torrent source (free streaming addon). When set, the player
      *  bypasses the torrent engine and streams this URL — instant, no P2P ("file-server-first"). */
     val directUrl: String? = null,

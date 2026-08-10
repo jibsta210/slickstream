@@ -39,6 +39,7 @@ class SourceRepositoryImpl @Inject constructor(
     private val addonRegistry: AddonRegistry,
     private val settingsRepository: SettingsRepository,
     private val sourceStatusStore: SourceStatusStore,
+    private val trackerFallback: TrackerFallback,
 ) : SourceRepository {
 
     /** Successful resolves are briefly reusable by details prewarm + player startup. [inFlight] also
@@ -219,6 +220,18 @@ class SourceRepositoryImpl @Inject constructor(
             }
             val ok = responses.filterNotNull()
             if (ok.isEmpty()) {
+                // EVERY addon failed. Before telling the user anything, ask the trackers DIRECTLY —
+                // Torrentio scrapes these same sites, so its outage is no reason for us to have nothing.
+                val parts = id.split(':')
+                trackerFallback.resolve(
+                    parts[0], parts.getOrNull(1)?.toIntOrNull(), parts.getOrNull(2)?.toIntOrNull(),
+                    { h, dn -> buildMagnet(h, dn, emptyList()) }, ::parseQuality,
+                )
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { fallback ->
+                        android.util.Log.i("SourceRepository", "addons all failed; tracker fallback found ${fallback.size} sources")
+                        return DataResult.Success(fallback.sortedByDescending { it.rank })
+                    }
                 // EVERY addon failed (after retries). Say that, rather than implying the title has no
                 // releases: "no streamable sources" for a show with hundreds of them reads as a broken
                 // app and sends the user hunting for a fault on their side. This is also why the result
@@ -254,7 +267,23 @@ class SourceRepositoryImpl @Inject constructor(
             // Keep every viable transport for manual selection and late failover. StreamPicker applies
             // English preference softly, so an obscure title is never stranded just because its only
             // healthy release is tagged as foreign/original audio.
-            DataResult.Success(sources)
+            if (sources.isNotEmpty()) {
+                DataResult.Success(sources)
+            } else {
+                // The addons ANSWERED but had nothing usable (Torrentio serves an empty list for an
+                // episode whose scrape failed just as readily as a 502). Same fallback, same reason.
+                val fallback = trackerFallback.resolve(
+                    idParts[0], expectedSeason, expectedEpisode,
+                    { h, dn -> buildMagnet(h, dn, emptyList()) }, ::parseQuality,
+                )
+                if (fallback.isNotEmpty()) {
+                    android.util.Log.i(
+                        "SourceRepository",
+                        "addons returned nothing; tracker fallback found ${fallback.size} sources",
+                    )
+                }
+                DataResult.Success(if (fallback.isNotEmpty()) fallback.sortedByDescending { it.rank } else sources)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
@@ -339,6 +368,7 @@ class SourceRepositoryImpl @Inject constructor(
             playable = StreamPicker.looksPlayable(haystack),
             // Flag cinema-rips (CAM/TS/TELESYNC) so they're badged in the UI + sunk in the picker.
             isCam = StreamPicker.looksLikeCam(haystack, movieTitle),
+            frontIndexContainer = StreamPicker.looksFrontIndexContainer(haystack),
             // Direct http/hls source -> the player skips the torrent engine and streams this URL.
             directUrl = directUrl,
             // Headers the host requires (Referer/Origin/User-Agent) — only for direct URLs, so torrents

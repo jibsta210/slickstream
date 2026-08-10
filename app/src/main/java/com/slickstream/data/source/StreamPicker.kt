@@ -75,11 +75,22 @@ object StreamPicker {
             (it.seeders ?: 0) >= (bestHealth * PACK_SINGLETON_MIN_HEALTH_FRACTION).toInt().coerceAtLeast(1)
         }
         val packs = healthy.filter { it.isPack }
-        val candidates = when {
+        val shortlist = when {
             comparableSingletons.isNotEmpty() -> comparableSingletons
             packs.isNotEmpty() -> packs
             else -> healthy
         }
+        // PREFER A FRONT-INDEX CONTAINER (mkv/webm) among otherwise-equal candidates. This is the
+        // cheapest possible startup win: an mkv carries its cues in the header, so playback begins on the
+        // contiguous head alone, while an mp4 usually keeps its 'moov' index at EOF and the engine must
+        // first fetch bytes from the far end of the file — piece-rounded, tens of MB on a big-piece
+        // torrent, and the dominant component of time-to-first-frame. Choosing the mkv does not optimise
+        // that wait, it REMOVES it.
+        // Deliberately applied LAST and SOFT, for the same reason the CAM/foreign filters are: it must
+        // never override swarm health or the size preference — it only breaks ties among candidates that
+        // already passed every health gate. Falls straight through when the shortlist has no mkv (and an
+        // untagged release is treated as "not known to be fast", never penalised into oblivion).
+        val candidates = shortlist.filter { it.frontIndexContainer }.ifEmpty { shortlist }
         val picked = when (sizePref) {
             StreamSizePreference.HIGHEST ->
                 candidates.maxWithOrNull(compareBy<StreamSource>({ it.seeders ?: 0 }, { it.sizeBytes ?: 0L }))
@@ -251,6 +262,17 @@ object StreamPicker {
             "pdvd|pre-?dvd(rip)?|dvdcam" +                     // early cammed DVD rips (NOT DVDSCR — often clean)
         ")\\b",
     )
+
+    // Containers whose index lives at the FRONT. mkv/webm carry their cues in the header, so playback can
+    // begin on the contiguous head alone. mp4/m4v/mov routinely put the 'moov' index at EOF, and the
+    // engine must then fetch bytes from the far end of the file BEFORE the first frame — piece-rounded,
+    // that is tens of MB on a big-piece torrent and the dominant startup cost. Preferring the front-index
+    // release when one is comparably healthy removes that wait entirely rather than optimising it.
+    private val FRONT_INDEX_CONTAINER = Regex("(?i)\\b(mkv|matroska|webm)\\b")
+
+    /** True when the release names a front-index container (mkv/webm) — see [FRONT_INDEX_CONTAINER]. */
+    fun looksFrontIndexContainer(sourceText: String): Boolean =
+        FRONT_INDEX_CONTAINER.containsMatchIn(sourceText)
 
     /** True when the release name marks it a CAM/TS/TELESYNC (title-word-aware, like [noForeignTag]). */
     fun looksLikeCam(sourceText: String, movieTitle: String): Boolean =

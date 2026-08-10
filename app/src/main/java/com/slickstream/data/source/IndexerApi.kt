@@ -1,6 +1,8 @@
 package com.slickstream.data.source
 
 import com.slickstream.data.source.dto.AddonCatalogEntry
+import com.slickstream.data.source.dto.EztvResponseDto
+import com.slickstream.data.source.dto.PirateBayRowDto
 import com.slickstream.data.source.dto.StreamResponseDto
 import retrofit2.http.GET
 import retrofit2.http.Url
@@ -30,4 +32,12 @@ interface IndexerApi {
     /** Fetch the community addon catalog (a JSON array) used to auto-discover working streaming addons. */
     @GET
     suspend fun getAddonCatalog(@Url url: String): List<AddonCatalogEntry>
+
+    /** LAST-RESORT FALLBACK: query a public tracker DIRECTLY, bypassing the Stremio addon layer
+     *  entirely, so an addon outage cannot look like "this title has no releases". */
+    @GET
+    suspend fun getPirateBay(@Url url: String): List<PirateBayRowDto>
+
+    @GET
+    suspend fun getEztv(@Url url: String): EztvResponseDto
 }
