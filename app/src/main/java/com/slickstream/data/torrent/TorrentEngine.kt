@@ -873,9 +873,20 @@ class TorrentEngine @Inject constructor(
         }
             ?: run {
                 val names = (0 until minOf(numFiles, 8)).joinToString { files.fileName(it) }
+                // Say which of the two failures this actually is. They are completely different problems
+                // and the old message asserted the wrong one: a season pack of 23 ordinary .avi episodes
+                // whose naming we could not parse was reported as an "archive/RAR release", which sent
+                // the user (and me) looking for a RAR that was never there.
                 error(
-                    "No playable video file in this torrent (archive/RAR release) — " +
-                        "numFiles=$numFiles s=$expectedSeason e=$expectedEpisode pref=$preferredFileIndex files=[$names]",
+                    if (playableVideos.isEmpty()) {
+                        "No playable video file in this torrent (archive/RAR release) — " +
+                            "numFiles=$numFiles s=$expectedSeason e=$expectedEpisode " +
+                            "pref=$preferredFileIndex files=[$names]"
+                    } else {
+                        "Couldn't tell which file is S${expectedSeason}E$expectedEpisode in this " +
+                            "${playableVideos.size}-episode pack — try another source. " +
+                            "numFiles=$numFiles pref=$preferredFileIndex files=[$names]"
+                    },
                 )
             }
 
@@ -933,17 +944,10 @@ class TorrentEngine @Inject constructor(
      *  SxxExx or 1x02; selecting the largest file silently chose a random/long episode. */
     private fun matchingEpisodeFile(files: FileStorage, season: Int?, episode: Int?): Int? {
         if (season == null || episode == null) return null
-        val sxe = Regex("(?i)(?:^|[^a-z0-9])s0*${season}[^a-z0-9]*e0*${episode}(?:[^0-9]|$)")
-        val x = Regex("(?i)(?:^|[^0-9])0*${season}x0*${episode}(?:[^0-9]|$)")
-        val words = Regex(
-            "(?i)(?:^|[^a-z0-9])season[^0-9]*0*${season}.*" +
-                "episode[^0-9]*0*${episode}(?:[^0-9]|$)",
-        )
-        return (0 until files.numFiles()).firstOrNull { index ->
-            val path = files.filePath(index)
-            val name = files.fileName(index)
-            isVideoFile(name) && !isSampleFile(name) &&
-                (sxe.containsMatchIn(path) || x.containsMatchIn(path) || words.containsMatchIn(path))
+        val names = (0 until files.numFiles()).map { files.filePath(it) }
+        return EpisodeFileMatcher.indexOf(names, season, episode) { path ->
+            val name = path.substringAfterLast('/')
+            isVideoFile(name) && !isSampleFile(name)
         }
     }
 
