@@ -54,13 +54,23 @@ fun TvMediaRow(
     val restoreIndex = remember(pendingKey, items) {
         if (pendingKey.isEmpty()) -1 else items.indexOfFirst { tvItemKey(it) == pendingKey }
     }
+    // Fallback target for a restore that cannot land (see below). Item 0 of the row we were left
+    // through is always composed, so it is the one anchor guaranteed to be attachable.
+    val firstAnchor = remember { TvFocusAnchor() }
+
     LaunchedEffect(restoreIndex) {
         // claim() is one-shot for the whole screen: without it, scrolling this row out of the
         // LazyColumn and back would re-run the restore and yank focus off wherever the user had
         // moved to.
         if (restoreIndex < 0 || focusTicket == null || !focusTicket.claim()) return@LaunchedEffect
         state.bringItemIntoComposition(restoreIndex)
-        focusTicket.anchor.requestUntilFocused()
+        if (focusTicket.anchor.requestUntilFocused()) return@LaunchedEffect
+        // NEVER settle with nothing focused. claim() is spent whether or not the restore lands, so
+        // without this a miss (the tile was recycled out, the row reloaded shorter, the list changed
+        // under us) leaves the screen with NO focus at all and the remote feeling dead until the user
+        // guesses a direction. Landing on the row's first tile is wrong-but-recoverable; landing
+        // nowhere is not. Grid screens already fall back this way (TvCategory/TvFavorites).
+        firstAnchor.requestUntilFocused()
     }
 
     Column(
@@ -93,7 +103,13 @@ fun TvMediaRow(
                     onClick = onItemClick,
                     wide = wide,
                     progress = progressFor?.invoke(item),
-                    focusAnchor = if (index == restoreIndex) focusTicket?.anchor else null,
+                    focusAnchor = when {
+                        index == restoreIndex -> focusTicket?.anchor
+                        // Only worn while a restore is actually pending for THIS row, so a row with no
+                        // ticket never carries a stray anchor.
+                        index == 0 && restoreIndex >= 0 -> firstAnchor
+                        else -> null
+                    },
                 )
             }
         }

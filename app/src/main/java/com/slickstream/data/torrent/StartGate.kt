@@ -22,10 +22,29 @@ data class StartDecision(
     /** The head is in and the EOF index is the ONLY thing left: fetch exactly that, don't wait for it. */
     val needsMoovFetch: Boolean get() = blocker == StartupBlocker.MOOV_INDEX
 
-    /** 0f..1f toward playable. Fills to exactly 1.0 as the gate opens — never before. */
+    /**
+     * 0f..1f toward playable. Reads exactly 1.0 IF AND ONLY IF the gate is open — that biconditional is
+     * the whole point of deriving the bar from the gate, and it needs enforcing rather than assuming.
+     *
+     * [remainingBytes] can legitimately hit 0 while the gate is still shut: the EOF requirement is a
+     * fixed 8 MB guess, but the credit against it ([StartGate.decide]'s tailProgressBytes) is counted in
+     * real downloaded blocks of pieces that are routinely 32 MB. So a single part-finished EOF piece can
+     * pay off the whole notional 8 MB while the piece — and therefore the moov — is still incomplete.
+     * Left unclamped, the bar sat at "100%" and the countdown froze at its floor while playback had not
+     * started: the "100% · Almost ready…" that this gate exists to make impossible.
+     */
     val fillFraction: Float
-        get() = if (requiredBytes <= 0L) 1f
-        else ((requiredBytes - remainingBytes).toFloat() / requiredBytes).coerceIn(0f, 1f)
+        get() {
+            if (requiredBytes <= 0L) return if (canStart) 1f else 0f
+            val raw = (requiredBytes - remainingBytes).toFloat() / requiredBytes
+            return raw.coerceIn(0f, if (canStart) 1f else MAX_FILL_WHILE_BLOCKED)
+        }
+
+    private companion object {
+        /** Ceiling for [fillFraction] while a requirement is still outstanding — so "100%" always means
+         *  "playing now", never "nearly, honest". */
+        const val MAX_FILL_WHILE_BLOCKED = 0.99f
+    }
 }
 
 /**

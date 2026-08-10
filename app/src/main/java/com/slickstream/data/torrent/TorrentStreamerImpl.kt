@@ -708,6 +708,12 @@ class TorrentStreamerImpl @Inject constructor(
     private fun estimateEta(snap: EngineStatus, decision: StartDecision): Int? {
         val rate = snap.downloadRate
         if (rate <= 0) return null
+        // A closed gate with nothing "remaining" means the byte count has run out of resolution, not
+        // that we are done: the EOF requirement is a fixed 8 MB while the credit comes from real blocks
+        // of pieces that can be 32 MB, so one part-finished piece pays the whole notional band off.
+        // Publishing a number here froze the countdown at its 4 s floor while playback had not begun.
+        // Say nothing instead — the blocker label ("fetching MP4 index") already tells the honest story.
+        if (!decision.canStart && decision.remainingBytes <= 0L) return null
         return ((decision.remainingBytes / rate) + PREPARE_MARGIN_SECONDS).toInt().takeIf { it in 1..900 }
     }
 

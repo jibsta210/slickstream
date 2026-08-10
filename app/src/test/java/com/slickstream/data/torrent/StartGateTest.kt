@@ -143,10 +143,13 @@ class StartGateTest {
         // startupTailProgressBytes counts whole pieces, which on a 32 MB-piece torrent exceeds the 8 MB
         // band. It must not drive remainingBytes negative or the fill above 100%.
         val d = mp4(head = header, moovInHead = false, tailPresent = false, tailProgress = 64 * mb)
-        assertEquals(0L, d.remainingBytes)
-        assertEquals(1f, d.fillFraction, 0f)
+        assertEquals(0L, d.remainingBytes)                  // credit is clamped: never negative
         assertFalse(d.canStart)                             // bytes credited, but the gate is honest
         assertEquals(StartupBlocker.MOOV_INDEX, d.blocker)
+        // ...and so is the BAR. remainingBytes bottoming out here is a resolution limit (an 8 MB
+        // notional band paid off by blocks of a 32 MB piece), not completion — so the fill must stay
+        // short of 100%. Reporting 1.0 here is precisely the "100% · Almost ready…" that never starts.
+        assertTrue(d.fillFraction < 1f)
     }
 
     @Test
@@ -236,6 +239,38 @@ class StartGateTest {
         val open = mp4(head = 400 * mb, moovInHead = false, tailPresent = true)
         assertEquals(1f, open.fillFraction, 0f)
         assertTrue(open.canStart)
+    }
+
+    @Test
+    fun `a whole-piece tail credit cannot fill the bar to 100 percent while the gate is shut`() {
+        // The EOF requirement is a fixed 8 MB, but the credit is counted in finished blocks of pieces
+        // that are routinely 32 MB — so ONE part-finished EOF piece can pay the whole notional band off
+        // while the moov is still incomplete. Without a clamp the bar read "100%" and the countdown
+        // froze at its floor, with playback not started: the exact "100% · Almost ready…" this gate is
+        // supposed to make impossible.
+        val overCredited = mp4(head = 400 * mb, moovInHead = false, tailPresent = false, tailProgress = tail)
+        assertFalse(overCredited.canStart)
+        assertTrue(overCredited.fillFraction < 1f)
+
+        // Even absurd over-credit (a 32 MB piece against an 8 MB band) must not read complete.
+        val wildlyOver = mp4(head = 400 * mb, moovInHead = false, tailPresent = false, tailProgress = 32 * mb)
+        assertFalse(wildlyOver.canStart)
+        assertTrue(wildlyOver.fillFraction < 1f)
+    }
+
+    @Test
+    fun `fill reads exactly complete if and only if the gate is open`() {
+        val cases = listOf(
+            mkv(head = 0L),
+            mkv(head = header),
+            mp4(head = header, moovInHead = false, tailPresent = false, tailProgress = tail),
+            mp4(head = header, moovInHead = false, tailPresent = true),
+            mp4(head = header, moovInHead = true, tailPresent = false),
+            mp4(head = 0L, moovInHead = null, tailPresent = false, tailProgress = Long.MAX_VALUE),
+        )
+        cases.forEach { d ->
+            assertEquals(d.canStart, d.fillFraction >= 1f)
+        }
     }
 
     @Test
