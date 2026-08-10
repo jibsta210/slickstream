@@ -61,6 +61,23 @@ data class StreamSource(
 
 enum class StreamState { IDLE, METADATA, BUFFERING, READY, PAUSED, ERROR, COMPLETED }
 
+/**
+ * What the startup gate is still waiting for, in the gate's OWN words. The loading overlay and the
+ * chunk bar both render from this, so neither can claim something the engine isn't measuring — the
+ * "solid teal head, yet 'low buffer'" contract violation. See
+ * [com.slickstream.data.torrent.StartGate].
+ */
+enum class StartupBlocker {
+    /** No contiguous container header at the file start yet (still finding peers / first piece). */
+    CONTAINER_HEADER,
+    /** Header is in, but the bytes UNDER the resume position are not (resume anchoring). */
+    PLAYHEAD,
+    /** Head is in; a non-faststart MP4 still needs its EOF `moov` index before the first frame. */
+    MOOV_INDEX,
+    /** Nothing left to wait for — the gate is open. */
+    NONE,
+}
+
 /** Live status emitted by [com.slickstream.core.repository.TorrentStreamer.start]. */
 data class StreamStatus(
     val infoHash: String,
@@ -78,8 +95,17 @@ data class StreamStatus(
     val streamUrl: String?,         // local http URL once playable, else null
     val errorMessage: String? = null,
     /** True after the contiguous head is ready while an MP4/MOV still needs its EOF moov pieces.
-     *  The player defers its head-stall watchdog to the streamer's dedicated bounded tail wait. */
+     *  The player defers its head-stall watchdog to the streamer's dedicated bounded tail wait.
+     *  Derived from [startupBlocker] so there is only ever one source of truth. */
     val awaitingStartupTail: Boolean = false,
+    /** The single requirement the readiness gate is still missing, or [StartupBlocker.NONE] once open. */
+    val startupBlocker: StartupBlocker = StartupBlocker.NONE,
+    /** Total bytes the readiness gate asked for (header + playhead + EOF index, as applicable). The
+     *  DENOMINATOR of the startup progress bar — using it is what stops the bar reading 100% while the
+     *  gate is still waiting on the moov. 0 once playing / not applicable. */
+    val startupRequiredBytes: Long = 0L,
+    /** Bytes of [startupRequiredBytes] still missing. Drives both the progress bar and [etaSeconds]. */
+    val startupRemainingBytes: Long = 0L,
     /** Best-effort seconds until first frame (head + mp4 moov tail ÷ rate), or null when not estimable
      *  (e.g. still discovering peers / no download rate yet). Computed by the streamer against the same
      *  readiness gate that flips to READY, so the countdown matches when playback actually starts. */

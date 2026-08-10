@@ -5,9 +5,11 @@ import android.media.MediaMetadataRetriever
 import android.util.Log
 import com.slickstream.core.repository.TorrentStreamer
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -15,10 +17,30 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
 /**
- * Scrub-bar thumbnails for a torrent stream, sampled only from pieces playback already downloaded.
+ * Scrub-bar film-strip thumbnails. Two sampling strategies, picked by the source kind:
+ *
+ * TORRENT-BACKED ([start] with `torrentBacked = true`) — sampled ONLY from pieces playback has
+ * already downloaded, decoded off the on-disk file. See the two-tier note below.
+ *
+ * DIRECT ([start] with `torrentBacked = false`: Real-Debrid / free-addon HTTP links and offline
+ * `file://` downloads) — there is no piece bitfield to gate on and nothing local to read, so the
+ * retriever is pointed at the URL itself WITH the host's required request headers (Referer/Origin/
+ * User-Agent — without a UA many CDNs, RD included, reject the request, which is why RD scrubbing
+ * showed empty slots while torrents showed frames). Because every remote decode costs range requests
+ * over the network, the direct path is deliberately frugal and defensive:
+ *   - the coarse tier fills eagerly (a cheap whole-timeline baseline);
+ *   - the dense tier is decoded only NEAR the position the user is actually scrubbing, and only once
+ *     they have scrubbed at all, so a viewer who never touches the seek bar pays nothing for it;
+ *   - every open and every decode is bounded by a wall-clock timeout, one decode is in flight at a
+ *     time, and a timed-out retriever is abandoned (released when its orphaned native call returns)
+ *     rather than reused — a missing preview is always better than a wedged decoder or a crash;
+ *   - repeated empty decodes (HLS playlists, audio-only, a host that won't serve ranges) stop the
+ *     sampler for good instead of hammering the host.
  *
  * A torrent downloads sequentially, so only the already-buffered region can be decoded without
  * blocking. To give a useful film-strip scrub experience we sample at two densities:
@@ -54,6 +76,13 @@ class FrameThumbnailExtractor(
     @Volatile private var durationMs: Long = 0L
     @Volatile private var fileLength: Long = 0L
 
+    /** Request headers the direct host demands (Referer/Origin/User-Agent). Empty for torrents. */
+    @Volatile private var headers: Map<String, String> = emptyMap()
+
+    /** True once the UI has asked for at least one thumbnail, i.e. the user really is scrubbing. Gates
+     *  the direct path's dense tier so a straight-through viewing costs zero extra range requests. */
+    @Volatile private var scrubbed: Boolean = false
+
     /** Spacing of the dense tier (≈ one decoded frame per minute). Drives [thumbnailAt]'s grid. */
     @Volatile private var denseIntervalMs: Long = 0L
 
@@ -70,18 +99,38 @@ class FrameThumbnailExtractor(
     val version: StateFlow<Int> = _version
 
     /**
-     * Begin sampling for [streamUrl]. Idempotent for the same URL; switching URL resets everything.
+     * Begin sampling for [streamUrl]. Idempotent for the same URL — the caller re-invokes this on every
+     * READY re-emit (seeks, rebuffers), and a restart would only throw away the frames already decoded
+     * and pay for them again. Switching URL resets everything.
      * Call once playback is up and [durationMs] is known (so the container index/moov is present).
+     *
+     * @param fileLength size of the backing file; required for the torrent path's time→byte mapping,
+     *   ignored (and legitimately 0) for a direct source.
+     * @param headers request headers a direct host requires; ignored for torrents.
+     * @param torrentBacked false for a direct/offline source: no piece-availability gating, decode
+     *   straight from the URL (or the local file behind a `file://` URL).
      */
-    fun start(streamUrl: String, hash: String, durationMs: Long, fileLength: Long, filePath: String? = null) {
-        if (streamUrl == url && job?.isActive == true) return
+    fun start(
+        streamUrl: String,
+        hash: String,
+        durationMs: Long,
+        fileLength: Long,
+        filePath: String? = null,
+        headers: Map<String, String> = emptyMap(),
+        torrentBacked: Boolean = true,
+    ) {
+        if (streamUrl == url) return
         reset()
-        if (durationMs <= 0L || fileLength <= 0L) return
+        if (durationMs <= 0L) return
+        // Only the torrent path maps time→byte to ask the bitfield what's on disk; a direct source has
+        // no such gate, so a missing length must not silently kill its previews (the RD bug).
+        if (torrentBacked && fileLength <= 0L) return
         url = streamUrl
-        this.filePath = filePath
+        this.filePath = if (torrentBacked) filePath else (filePath?.takeIf(::fileExists) ?: localPathOrNull(streamUrl))
         infoHash = hash
         this.durationMs = durationMs
         this.fileLength = fileLength
+        this.headers = headers
 
         // Coarse tier: bounded whole-timeline grid filled opportunistically from available pieces.
         val coarseCount = COARSE_COUNT
@@ -91,7 +140,19 @@ class FrameThumbnailExtractor(
         val denseCount = durationMinutes.coerceIn(coarseCount, MAX_DENSE_COUNT)
         denseIntervalMs = (durationMs / denseCount).coerceAtLeast(1L)
 
-        job = scope.launch { run(streamUrl, hash, coarseCount, denseCount) }
+        job = scope.launch {
+            // Previews are a nicety: a sampler that throws must degrade to "no frames", never take the
+            // player down with it (this job has no CoroutineExceptionHandler, so an escaping throwable
+            // would reach the default handler).
+            try {
+                if (torrentBacked) run(streamUrl, hash, coarseCount, denseCount)
+                else runDirect(streamUrl, coarseCount, denseCount)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "scrub preview sampling stopped: $t")
+            }
+        }
     }
 
     /** Nearest decoded thumbnail to [positionMs], or null if nothing near it is decoded yet. Scans a
@@ -99,6 +160,7 @@ class FrameThumbnailExtractor(
      *  closest frame on the (possibly sparse) grid. */
     fun thumbnailAt(positionMs: Long): Bitmap? {
         lastScrubMs = positionMs
+        scrubbed = true
         val iv = denseIntervalMs
         if (iv <= 0L) return null
         synchronized(lock) {
@@ -210,10 +272,183 @@ class FrameThumbnailExtractor(
         }
     }
 
+    /**
+     * Direct-source sampling (Real-Debrid / free-addon HTTP links, and offline `file://` downloads).
+     *
+     * No piece bitfield exists here, so nothing gates the decodes — instead every step is bounded:
+     * the open and each decode have a wall-clock timeout, exactly one decode is in flight, remote
+     * decodes draw on a fixed budget, and any timeout or a run of empty decodes ends sampling for
+     * this source (empty film-strip slots, never a stuck decoder or a released-under-use retriever).
+     */
+    private suspend fun runDirect(streamUrl: String, coarseCount: Int, denseCount: Int) {
+        val coarseInterval = (durationMs / coarseCount).coerceAtLeast(1L)
+        val coarseTimes = (0 until coarseCount).map { i -> i * coarseInterval + coarseInterval / 2 }
+        val denseTimes = (0 until denseCount).map { i -> i * denseIntervalMs + denseIntervalMs / 2 }
+
+        // An offline download is a plain local file: decode it directly (no headers, no network).
+        val local = filePath
+        val isRemote = local == null
+
+        if (isRemote) {
+            // Don't open a SECOND connection to the host until the user actually scrubs. Some direct
+            // hosts cap concurrent connections per link, and stealing throughput from the stream that
+            // IS playing to prefetch previews nobody asked for is a bad trade. Once they scrub, the
+            // coarse tier fills nearest-first so the strip populates around where they're looking.
+            while (currentCoroutineContext().isActive && !scrubbed) delay(SCRUB_WAIT_POLL_MS)
+            if (!currentCoroutineContext().isActive) return
+        }
+
+        val retriever = openRetrieverBounded(streamUrl, local, headers) ?: run {
+            Log.w(TAG, "no scrub previews: retriever wouldn't open for direct source")
+            return
+        }
+
+        val decodeTimeoutMs = if (isRemote) REMOTE_DECODE_TIMEOUT_MS else LOCAL_DECODE_TIMEOUT_MS
+        // Non-null while a native decode owns [retriever]; the finally must NOT release it under one.
+        var inFlight: Deferred<Bitmap?>? = null
+        try {
+            val done = HashSet<Long>()
+            var emptyDecodes = 0
+            var budget = if (isRemote) REMOTE_DECODE_BUDGET else Int.MAX_VALUE
+            while (currentCoroutineContext().isActive) {
+                // Re-read the scrub anchor every round so the dense tier follows the user.
+                val anchor = lastScrubMs
+                val pending = buildList {
+                    coarseTimes.forEach { if (it !in done) add(it) }
+                    if (scrubbed) {
+                        denseTimes.forEach { if (it !in done && abs(it - anchor) <= DENSE_WINDOW_MS) add(it) }
+                    }
+                }.distinct().sortedBy { abs(it - anchor) }
+
+                if (pending.isEmpty() || budget <= 0) {
+                    // Nothing decodable right now. Keep idling cheaply: a scrub to a fresh part of the
+                    // timeline opens up new dense candidates without restarting the extractor.
+                    delay(IDLE_POLL_MS)
+                    continue
+                }
+
+                var decodedThisRound = 0
+                for (t in pending) {
+                    if (!currentCoroutineContext().isActive) break
+                    if (decodedThisRound >= MAX_DECODES_PER_ROUND || budget <= 0) break
+
+                    val work = scope.async(Dispatchers.IO) { decodeFrame(retriever, t) }
+                    inFlight = work
+                    val bmp = withTimeoutOrNull(decodeTimeoutMs) { work.await() }
+                    if (bmp == null && !work.isCompleted) {
+                        // Host (or decoder) is too slow. The native call still owns the retriever, so it
+                        // can be neither reused nor released here — leave it to the finally, which hands
+                        // it to a completion hook, and stop sampling this source.
+                        Log.w(TAG, "scrub preview decode timed out at ${t}ms — previews off for this source")
+                        return
+                    }
+                    inFlight = null
+                    done += t
+                    decodedThisRound++
+                    budget--
+
+                    if (bmp != null) {
+                        storeFrame(t, bmp)
+                        emptyDecodes = 0
+                    } else if (++emptyDecodes >= MAX_EMPTY_DECODES) {
+                        // HLS playlist, audio-only, or a host that won't serve ranges: nothing will ever
+                        // decode, so stop rather than keep asking.
+                        Log.w(TAG, "scrub previews: $emptyDecodes empty decodes — giving up on this source")
+                        return
+                    }
+
+                    // The user may have scrubbed elsewhere while that decode ran — re-plan around the
+                    // new anchor instead of finishing a now-irrelevant round.
+                    if (abs(lastScrubMs - anchor) > denseIntervalMs) break
+                }
+                // Small gap between rounds so background decodes never monopolise the CPU a weak TV
+                // needs for live video.
+                delay(DIRECT_ROUND_GAP_MS)
+            }
+        } finally {
+            releaseWhenIdle(retriever, inFlight)
+        }
+    }
+
+    /** Open a retriever for a direct source, bounded by [OPEN_TIMEOUT_MS] per attempt. Returns null
+     *  (previews simply don't appear) rather than ever blocking the sampler indefinitely. */
+    private suspend fun openRetrieverBounded(
+        streamUrl: String,
+        path: String?,
+        hdrs: Map<String, String>,
+    ): MediaMetadataRetriever? {
+        // Holds whatever the (possibly abandoned) open produced, so a late success can still be freed.
+        val slot = AtomicReference<MediaMetadataRetriever?>()
+        repeat(OPEN_ATTEMPTS) { attempt ->
+            if (!currentCoroutineContext().isActive) return null
+            slot.set(null)
+            val work = scope.async(Dispatchers.IO) { openRetriever(streamUrl, path, hdrs)?.also(slot::set) }
+            val opened = withTimeoutOrNull(OPEN_TIMEOUT_MS) { work.await() }
+            if (opened != null) return opened
+            if (!work.isCompleted) {
+                // setDataSource is wedged on a hostile/slow host: abandon it and release it if it ever
+                // returns. Retrying would only stack more blocked threads.
+                work.invokeOnCompletion { cause -> if (cause == null) runCatching { slot.get()?.release() } }
+                return null
+            }
+            if (attempt < OPEN_ATTEMPTS - 1) delay(OPEN_RETRY_MS)
+        }
+        return null
+    }
+
+    /** Blocking open. Local path when we have one, otherwise the URL plus the host's headers — a bare
+     *  request (no User-Agent/Referer) is what CDNs and RD reject, leaving every slot empty. */
+    private fun openRetriever(
+        streamUrl: String,
+        path: String?,
+        hdrs: Map<String, String>,
+    ): MediaMetadataRetriever? = runCatching {
+        val candidate = MediaMetadataRetriever()
+        try {
+            if (path != null) candidate.setDataSource(path)
+            else candidate.setDataSource(streamUrl, HashMap(hdrs))
+            candidate
+        } catch (t: Throwable) {
+            runCatching { candidate.release() }
+            throw t
+        }
+    }.getOrElse {
+        Log.w(TAG, "direct thumbnail retriever open failed: ${it.message}")
+        null
+    }
+
+    /** Release [retriever] now if idle, else once [inFlight] finishes normally. Releasing while a
+     *  native decode is running on it is a hard crash; if that decode was itself cancelled we let GC
+     *  reclaim the handle instead (at most one per source, and only after we've already given up). */
+    private fun releaseWhenIdle(retriever: MediaMetadataRetriever, inFlight: Deferred<*>?) {
+        if (inFlight == null || inFlight.isCompleted) {
+            runCatching { retriever.release() }
+            return
+        }
+        inFlight.invokeOnCompletion { cause -> if (cause == null) runCatching { retriever.release() } }
+    }
+
+    /** file:// URL (offline download) or bare path → an existing local path, else null. */
+    private fun localPathOrNull(streamUrl: String): String? {
+        val path = when {
+            streamUrl.startsWith("file://") -> runCatching { java.io.File(java.net.URI(streamUrl)).path }.getOrNull()
+            streamUrl.startsWith("/") -> streamUrl
+            else -> null
+        } ?: return null
+        return path.takeIf(::fileExists)
+    }
+
+    private fun fileExists(path: String): Boolean = runCatching { java.io.File(path).exists() }.getOrDefault(false)
+
     /** Decode the frame centred at [timeMs], store it (capped + evicting) and bump version. Returns
      *  true if a bitmap was actually added. */
     private fun decodeAndStore(retriever: MediaMetadataRetriever, timeMs: Long): Boolean {
         val bmp = decodeFrame(retriever, timeMs) ?: return false
+        return storeFrame(timeMs, bmp)
+    }
+
+    /** Cache an already-decoded frame (capped + evicting) and bump version. */
+    private fun storeFrame(timeMs: Long, bmp: Bitmap): Boolean {
         synchronized(lock) {
             // Don't double-store (another tier may share an identical centre on tiny clips).
             if (frames.containsKey(timeMs)) {
@@ -286,11 +521,14 @@ class FrameThumbnailExtractor(
         job?.cancel()
         job = null
         url = null
+        filePath = null
         infoHash = null
         durationMs = 0L
         fileLength = 0L
+        headers = emptyMap()
         denseIntervalMs = 0L
         lastScrubMs = 0L
+        scrubbed = false
         synchronized(lock) {
             // No recycle(): a failover calls this mid-scrub while the filmstrip may still be drawing
             // one of these bitmaps (see evictIfFullLocked). Dropping the references is enough.
@@ -334,5 +572,39 @@ class FrameThumbnailExtractor(
         const val RETRIEVER_RETRY_MS = 2500L
         /** Bound background decoder CPU so weak TVs keep their cores for live video + piece hashing. */
         const val MAX_DECODES_PER_ROUND = 2
+
+        // --- Direct (Real-Debrid / addon HTTP / offline file) path ---
+
+        /** How far either side of the scrub anchor the dense tier is decoded for a direct source.
+         *  Comfortably wider than the widest film-strip (TV shows ±4 one-minute slots), so the strip is
+         *  fully covered without paying range requests for the rest of the timeline. */
+        const val DENSE_WINDOW_MS = 6 * 60_000L
+
+        /** Wall-clock bound on one remote frame decode (several HTTP range requests). Past this the
+         *  retriever is abandoned and previews stop — a stuck decoder must never accumulate. */
+        const val REMOTE_DECODE_TIMEOUT_MS = 8_000L
+
+        /** Same bound for an offline file: local, so only a pathological decoder can reach it. */
+        const val LOCAL_DECODE_TIMEOUT_MS = 15_000L
+
+        /** Bound on one setDataSource (connect + container probe), and how many times we retry it. */
+        const val OPEN_TIMEOUT_MS = 12_000L
+        const val OPEN_ATTEMPTS = 3
+        const val OPEN_RETRY_MS = 2_000L
+
+        /** Ceiling on remote decodes for one source, so a long scrubbing session can't quietly pull
+         *  hundreds of range requests. ~MAX_FRAMES worth of useful frames, no more. */
+        const val REMOTE_DECODE_BUDGET = 150
+
+        /** Consecutive decodes that returned nothing before we conclude this source can't be sampled
+         *  at all (HLS playlist, audio-only, host refusing ranges) and stop for good. */
+        const val MAX_EMPTY_DECODES = 5
+
+        /** Breather between direct sampling rounds. */
+        const val DIRECT_ROUND_GAP_MS = 150L
+
+        /** How often the remote path checks whether the user has started scrubbing (it stays off the
+         *  network until they do). Short enough that the strip starts filling right away. */
+        const val SCRUB_WAIT_POLL_MS = 400L
     }
 }

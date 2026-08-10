@@ -21,8 +21,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -32,9 +30,17 @@ import androidx.tv.material3.Text
 import com.slickstream.core.model.MediaItem
 import com.slickstream.core.model.MediaType
 import com.slickstream.feature.catalog.CategoryViewModel
+import com.slickstream.tv.components.ConsumeOnResume
+import com.slickstream.tv.components.TvFocusAnchor
 import com.slickstream.tv.components.TvPosterCard
 import com.slickstream.tv.components.TvSearchField
+import com.slickstream.tv.components.bringItemIntoComposition
+import com.slickstream.tv.components.rememberTvFocusTicket
+import com.slickstream.tv.components.tvItemKey
 import com.slickstream.ui.theme.Brand
+
+/** Row identity for the (single-surface) genre grid in the re-entry ticket. */
+private const val GRID = ""
 
 /**
  * Android TV full-screen grid for one genre (Kids, Action, …), reached from the category chips on
@@ -59,17 +65,26 @@ fun TvCategoryScreen(
     BackHandler { onBack() }
 
     // This screen hides the nav rail, so without an explicit target the first D-pad press is
-    // swallowed. Land focus on the first poster as soon as the grid has items.
-    val firstFocus = remember { FocusRequester() }
+    // swallowed. Two different targets, in priority order:
+    //   • Back out of a title's Details -> the tile you opened (matched by key, scrolled into
+    //     composition first, and confirmed by the tile itself). Landing on the first poster instead
+    //     is the "I lost my place" complaint — on a paged genre grid it can be hundreds of tiles up.
+    //   • Fresh arrival from a category chip -> the first poster, as before.
+    val focusTicket = rememberTvFocusTicket()
+    focusTicket.ConsumeOnResume()
+    val firstAnchor = remember { TvFocusAnchor() }
     var didFocus by remember { mutableStateOf(false) }
     LaunchedEffect(state.isEmpty) {
-        if (!state.isEmpty && !didFocus) {
-            didFocus = true
-            repeat(12) {
-                kotlinx.coroutines.delay(40)
-                if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
-            }
+        if (state.isEmpty || didFocus) return@LaunchedEffect
+        didFocus = true
+        val index = visibleItems.indexOfFirst {
+            focusTicket.isReturning && tvItemKey(it) == focusTicket.pendingItem
         }
+        if (index >= 0) {
+            gridState.bringItemIntoComposition(index)
+            if (focusTicket.anchor.requestUntilFocused()) return@LaunchedEffect
+        }
+        firstAnchor.requestUntilFocused()
     }
 
     val shouldPage by remember {
@@ -150,14 +165,21 @@ fun TvCategoryScreen(
                     verticalArrangement = Arrangement.spacedBy(vGap),
                     modifier = Modifier.fillMaxSize(),
                 ) {
-                    itemsIndexed(visibleItems, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
+                    itemsIndexed(visibleItems, key = { _, it -> tvItemKey(it) }) { index, item ->
                         TvPosterCard(
                             item = item,
-                            onClick = onMediaClick,
+                            // Record the tile on the way out so BACK can land straight back on it.
+                            onClick = {
+                                focusTicket.record(GRID, it)
+                                onMediaClick(it)
+                            },
                             fillCell = true,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier),
+                            focusAnchor = when {
+                                tvItemKey(item) == focusTicket.pendingItem -> focusTicket.anchor
+                                index == 0 -> firstAnchor
+                                else -> null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }

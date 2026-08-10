@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import com.slickstream.core.model.StartupBlocker
 import com.slickstream.core.model.StreamSource
 import com.slickstream.core.model.StreamState
 import com.slickstream.core.model.StreamStatus
@@ -151,6 +152,9 @@ class TorrentStreamerImpl @Inject constructor(
         // if the data says scatter (not the read/serve path) is the bottleneck. Param kept so the call
         // sites and the offline path don't churn.
         runCatching { engine.setStreamStart(infoHash, startPositionFraction, concentrate = false) }
+        // Matches setStreamStart's own threshold for "this is a from-start play", so the gate charges the
+        // playhead requirement exactly when the engine actually moved the anchor off the file head.
+        val resumeIsHead = startPositionFraction <= RESUME_ANCHOR_EPSILON
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
         // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
@@ -235,11 +239,6 @@ class TorrentStreamerImpl @Inject constructor(
                 }
 
                 val headBytes = snap.contiguousHeadBytes
-                // Container header at the file start (needed to PARSE the container) AND the RESUME region
-                // (needed to PLAY from where the user actually starts). For a from-start play the two are
-                // the same piece, so resumeReady == headReady and nothing changes; on a resume this also
-                // waits for the bytes under the resume point so READY→seek doesn't instantly rebuffer.
-                val headReady = headBytes >= READY_HEAD_BYTES && snap.contiguousResumeBytes >= READY_HEAD_BYTES
                 // Tail gate is CONTAINER-AWARE: mkv/webm start on head alone; only mp4 waits for the EOF
                 // moov (so prepare() never ranges into an absent atom). mp4 needs the moov ONLY when it's
                 // not faststart (moov already up front in the head).
@@ -255,6 +254,29 @@ class TorrentStreamerImpl @Inject constructor(
                 if (moovInHead == true) engine.cancelStartupTail(infoHash)
                 val needsTail = containerNeedsTail && moovInHead != true
                 val tailReady = !needsTail || engine.tailAvailable(infoHash)
+
+                // ONE decision, made from what is genuinely on disk: contiguous bytes at the file header,
+                // contiguous bytes at the playhead, and the container's real index requirement. No fixed
+                // percentage of the file, no wall-clock escape. Everything the user is shown — the ETA, the
+                // startup progress bar, the chunk bar's verdict — is rendered from THIS, so the UI cannot
+                // disagree with the engine about whether we can start.
+                val decision = StartGate.decide(
+                    contiguousHeadBytes = headBytes,
+                    contiguousResumeBytes = snap.contiguousResumeBytes,
+                    resumeIsHead = resumeIsHead,
+                    containerMayNeedMoov = containerNeedsTail,
+                    moovInHead = moovInHead,
+                    tailPresent = tailReady,
+                    tailProgressBytes = snap.startupTailProgressBytes,
+                )
+                val headReady = decision.blocker != StartupBlocker.CONTAINER_HEADER &&
+                    decision.blocker != StartupBlocker.PLAYHEAD
+
+                // The head is in and the EOF index is now the ONLY thing between the user and a frame:
+                // go GET it instead of polling for it. At startup the band was deliberately queued behind
+                // the head; those deadlines are stale the moment the head lands.
+                if (decision.needsMoovFetch) runCatching { engine.promoteStartupTail(infoHash) }
+
                 if (headReady && needsTail && !tailReady) {
                     // This is a STALL timeout, not a wall-clock cap. Whole-piece availability exposes
                     // no partial progress for a 32 MB EOF piece, but selected-file progress still tells
@@ -278,10 +300,10 @@ class TorrentStreamerImpl @Inject constructor(
                 // Never hand a known-incomplete startup range to the player. On a weak but live swarm,
                 // the old hard cap started HTTP early and the VM failed it before the range wait could
                 // finish. The stall watchdog still advances away from truly dead swarms.
-                val canStart = headReady && tailReady
+                val canStart = decision.canStart
 
-                // ETA to first frame, against the real gate (head + tail-when-needed), refreshed each poll.
-                val eta = estimateEta(snap, headBytes, tailReady)
+                // ETA to first frame, against the real gate, refreshed each poll.
+                val eta = estimateEta(snap, decision)
 
                 if (pollCount++ % DIAG_EVERY == 0) {
                     engine.pieceMap(infoHash, PIECE_MAP_CACHE_BUCKETS)
@@ -333,7 +355,7 @@ class TorrentStreamerImpl @Inject constructor(
                             buildStatus(
                                 source, infoHash, StreamState.BUFFERING,
                                 streamUrl = null, snap = snap, etaSeconds = eta,
-                                awaitingStartupTail = headReady && needsTail && !tailReady,
+                                decision = decision,
                             ),
                         )
                     }
@@ -648,7 +670,7 @@ class TorrentStreamerImpl @Inject constructor(
         streamUrl: String?,
         snap: EngineStatus? = engine.snapshot(infoHash),
         etaSeconds: Int? = null,
-        awaitingStartupTail: Boolean = false,
+        decision: StartDecision? = null,
     ): StreamStatus {
         if (snap == null) return baseStatus(source, state, 0f, streamUrl).copy(infoHash = infoHash)
         return StreamStatus(
@@ -664,28 +686,35 @@ class TorrentStreamerImpl @Inject constructor(
             totalBytes = snap.totalBytes.takeIf { it > 0 } ?: (source.sizeBytes ?: 0L),
             streamUrl = streamUrl,
             etaSeconds = etaSeconds,
-            awaitingStartupTail = awaitingStartupTail,
+            // One source of truth: the watchdog's "don't punish a live moov fetch" hatch and the UI's
+            // "say what we're waiting for" label are the SAME gate verdict, not two parallel guesses.
+            awaitingStartupTail = decision?.needsMoovFetch == true,
+            startupBlocker = decision?.blocker ?: StartupBlocker.NONE,
+            startupRequiredBytes = decision?.requiredBytes ?: 0L,
+            startupRemainingBytes = decision?.remainingBytes ?: 0L,
             isChecking = snap.isChecking,
         )
     }
 
     /**
-     * Seconds until first frame, measured against the SAME gate that flips to READY: the contiguous
-     * head reaching [READY_HEAD_BYTES] PLUS the EOF tail (moov/cues), which the player needs to prepare.
-     * Counting the tail is what makes the countdown match reality — without it the number hit zero on the
-     * head and the player then stalled ~15s reading the tail. Whole-file downloaded bytes (which counts
-     * the head AND the deadline-fetched tail pieces) is the credit, so the number keeps falling as the
-     * tail arrives. Null while there's no download rate yet (still finding peers / fetching metadata).
+     * Seconds until first frame, measured against the SAME gate that flips to READY — literally its
+     * [StartDecision.remainingBytes], so the countdown cannot describe a different finish line from the
+     * one that actually opens the gate. Counting the EOF index is what makes the number match reality:
+     * without it the countdown hit zero on the head and the player then stalled reading the moov.
+     * Partial EOF-band progress is credited (see [StartGate.decide]), so the number keeps falling while
+     * a single 32 MB tail piece downloads. Null while there's no download rate yet (still finding peers
+     * / fetching metadata).
      */
-    private fun estimateEta(snap: EngineStatus, headBytes: Long, tailReady: Boolean): Int? {
+    private fun estimateEta(snap: EngineStatus, decision: StartDecision): Int? {
         val rate = snap.downloadRate
         if (rate <= 0) return null
-        val tailNeeded = if (tailReady) 0L else MOOV_TAIL_BYTES
-        val headRemaining = (READY_HEAD_BYTES - headBytes).coerceAtLeast(0L)
-        // Overall torrent progress includes scattered/preview/tail pieces and previously made this hit
-        // zero while the contiguous head was still absent. Only credit the bytes tied to the real gate.
-        val remaining = headRemaining + tailNeeded
-        return ((remaining / rate) + PREPARE_MARGIN_SECONDS).toInt().takeIf { it in 1..900 }
+        // A closed gate with nothing "remaining" means the byte count has run out of resolution, not
+        // that we are done: the EOF requirement is a fixed 8 MB while the credit comes from real blocks
+        // of pieces that can be 32 MB, so one part-finished piece pays the whole notional band off.
+        // Publishing a number here froze the countdown at its 4 s floor while playback had not begun.
+        // Say nothing instead — the blocker label ("fetching MP4 index") already tells the honest story.
+        if (!decision.canStart && decision.remainingBytes <= 0L) return null
+        return ((decision.remainingBytes / rate) + PREPARE_MARGIN_SECONDS).toInt().takeIf { it in 1..900 }
     }
 
     private fun errorStatus(source: StreamSource, message: String) = StreamStatus(
@@ -710,13 +739,9 @@ class TorrentStreamerImpl @Inject constructor(
         private const val SELECTION_HANDOFF_POLLS = 20
         private const val SELECTION_HANDOFF_POLL_MS = 50L
 
-        /** Contiguous head bytes required before we declare READY (~2 MB — enough to start). */
-        private const val READY_HEAD_BYTES = 2L * 1024L * 1024L
-
-        /** Approx moov/tail bytes an mp4/m4v/mov must also have before its first frame — folded into
-         *  the ETA so the countdown reflects the moov wait, not just the head. Matches the engine's
-         *  TAIL_PRIORITY_BYTES (8 MB). */
-        private const val MOOV_TAIL_BYTES = 8L * 1024L * 1024L
+        /** Below this start fraction the engine leaves the anchor at the file head, so head and playhead
+         *  are the same region. MUST match [TorrentEngine.setStreamStart]'s own `fraction > 0.001f`. */
+        private const val RESUME_ANCHOR_EPSILON = 0.001f
 
         /** Fixed seconds added to the byte ETA for the player's own prepare/first-frame after the
          *  bytes are present (container parse, decoder init, initial buffer fill). */
