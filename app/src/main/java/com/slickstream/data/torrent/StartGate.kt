@@ -73,11 +73,15 @@ object StartGate {
     /** Contiguous bytes required at the file header AND at the playhead (~2 MB — enough to start). */
     const val HEADER_BYTES = 2L * 1024L * 1024L
 
-    /** EOF band an mp4/m4v/mov must also have before its first frame. The moov of a feature-length
-     *  1080p/4K file routinely runs several MB (one stco/stsz/stts table per track), so this must span
-     *  a whole real moov — a 1 MB band left the rest of the atom on un-prioritised EOF pieces, and the
-     *  player then blocked reading an atom sequential download would not reach for minutes.
-     *  Matches [TorrentEngine.TAIL_PRIORITY_BYTES]. */
+    /** FALLBACK EOF band an mp4/m4v/mov must have before its first frame, used whenever the moov's real
+     *  extent cannot be proven. The moov of a feature-length 1080p/4K file routinely runs several MB
+     *  (one stco/stsz/stts table per track), so this must span a whole real moov — a 1 MB band left the
+     *  rest of the atom on un-prioritised EOF pieces, and the player then blocked reading an atom
+     *  sequential download would not reach for minutes. Matches [TorrentEngine.TAIL_PRIORITY_BYTES].
+     *
+     *  When the engine HAS located the moov (see [MoovLocation.AtEofExact]) the caller passes the proven,
+     *  piece-rounded extent as `tailBytes` instead — usually far smaller, occasionally larger, always
+     *  the truth. That is a caller-side substitution only: this function stays pure and unaware. */
     const val MOOV_TAIL_BYTES = 8L * 1024L * 1024L
 
     /**

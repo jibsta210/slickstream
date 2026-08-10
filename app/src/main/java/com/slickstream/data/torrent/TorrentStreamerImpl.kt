@@ -208,6 +208,8 @@ class TorrentStreamerImpl @Inject constructor(
             var lastReannounce = 0L
             var tailWaitSince = 0L
             var lastTailProgressBytes = -1L
+            /** Basis the high-water mark above was measured against; the moov probe can narrow it. */
+            var lastIndexRequiredBytes = -1L
             while (isActive) {
                 val snap = engine.snapshot(infoHash)
                 if (snap == null) {
@@ -250,7 +252,13 @@ class TorrentStreamerImpl @Inject constructor(
                 // caught it because the overall download kept progressing. READY now requires the moov to be
                 // GENUINELY present. The VM's stall watchdog advances only when a swarm stops making
                 // contiguous progress, so a slow-but-live old torrent remains viable.
-                val moovInHead = if (containerNeedsTail) engine.mp4MoovInHead(infoHash, headBytes) else null
+                // WHERE the moov is, not just whether it's up front. When the engine can prove the exact
+                // extent from the file's own box chain, the requirement shrinks from a blind 8 MB EOF
+                // band (16-64 MB once rounded up to 8-32 MB pieces) to the atom itself — and, just as
+                // importantly, GROWS to cover a >8 MB moov that used to start outside the guess, pass the
+                // gate, and strand the player on "Almost ready…" reading bytes nobody prioritised.
+                val moovLoc = if (containerNeedsTail) engine.moovLocation(infoHash, headBytes) else null
+                val moovInHead = moovLoc?.inHead
                 if (moovInHead == true) engine.cancelStartupTail(infoHash)
                 val needsTail = containerNeedsTail && moovInHead != true
                 val tailReady = !needsTail || engine.tailAvailable(infoHash)
@@ -268,6 +276,15 @@ class TorrentStreamerImpl @Inject constructor(
                     moovInHead = moovInHead,
                     tailPresent = tailReady,
                     tailProgressBytes = snap.startupTailProgressBytes,
+                    // On the EXACT path the numerator and denominator are finally the same units — both
+                    // whole-piece counts over the SAME range — so the bar rises linearly and reaches 1.0
+                    // exactly when tailAvailable flips. The fallback path keeps the literal 8 MB so its
+                    // arithmetic (and therefore its ETA and bar) is byte-identical to before.
+                    tailBytes = if (moovLoc is MoovLocation.AtEofExact && snap.startupIndexRequiredBytes > 0L) {
+                        snap.startupIndexRequiredBytes
+                    } else {
+                        StartGate.MOOV_TAIL_BYTES
+                    },
                 )
                 val headReady = decision.blocker != StartupBlocker.CONTAINER_HEADER &&
                     decision.blocker != StartupBlocker.PLAYHEAD
@@ -282,6 +299,19 @@ class TorrentStreamerImpl @Inject constructor(
                     // no partial progress for a 32 MB EOF piece, but selected-file progress still tells
                     // us the swarm is alive; reset while bytes advance so thin old swarms and offline
                     // MP4 downloads are not killed merely for being slow.
+                    // The BASIS can change underneath this high-water mark: when the moov probe commits
+                    // an exact extent the band NARROWS, so the progress measured over it legitimately
+                    // DROPS (a piece that counted in the blind 8 MB band may sit outside the real moov).
+                    // Left alone, `progress > lastProgress` could then never fire again, tailWaitSince
+                    // would freeze at its pre-shrink value, and this stall detector would degenerate into
+                    // a hard 4-minute WALL-CLOCK cap that kills a perfectly healthy stream — the exact
+                    // no-time-escape rule this gate exists to honour. Re-baseline whenever the
+                    // requirement changes so we keep measuring "are bytes still arriving", not "how long".
+                    if (snap.startupIndexRequiredBytes != lastIndexRequiredBytes) {
+                        lastIndexRequiredBytes = snap.startupIndexRequiredBytes
+                        lastTailProgressBytes = -1L
+                        tailWaitSince = now
+                    }
                     if (snap.startupTailProgressBytes > lastTailProgressBytes) {
                         lastTailProgressBytes = snap.startupTailProgressBytes
                         tailWaitSince = now
@@ -458,7 +488,7 @@ class TorrentStreamerImpl @Inject constructor(
                 val headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= PREFETCH_HEAD_BYTES
                 val moovInHead = if (engine.selectedFileExt(infoHash) in MOOV_CONTAINERS) {
-                    engine.mp4MoovInHead(infoHash, headBytes)
+                    engine.moovLocation(infoHash, headBytes).inHead
                 } else null
                 if (moovInHead == true) engine.cancelStartupTail(infoHash)
                 val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS && moovInHead != true
