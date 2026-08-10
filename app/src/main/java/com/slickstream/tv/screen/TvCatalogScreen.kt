@@ -34,7 +34,10 @@ import com.slickstream.core.model.MediaType
 import com.slickstream.feature.catalog.CatalogViewModel
 import com.slickstream.feature.home.HomeUiState
 import com.slickstream.feature.home.MediaRowUi
+import com.slickstream.tv.components.ConsumeOnResume
+import com.slickstream.tv.components.TvFocusTicket
 import com.slickstream.tv.components.TvMediaRow
+import com.slickstream.tv.components.rememberTvFocusTicket
 import com.slickstream.ui.theme.Brand
 
 /**
@@ -56,12 +59,19 @@ fun TvCatalogScreen(
     val genres by viewModel.genres.collectAsStateWithLifecycle()
     val categories = remember(genres, mediaType) { tvCategoryChips(mediaType, genres) }
 
+    // Above the loading/empty branch on purpose — the re-entry ticket has to be read on the very
+    // first composition of this destination, before ConsumeOnResume spends it.
+    val focusTicket = rememberTvFocusTicket()
+    focusTicket.ConsumeOnResume()
+
     when {
         state.isLoading && state.isEmpty -> TvLoading(modifier)
         state.errorMessage != null && state.isEmpty ->
             TvErrorRetry(message = state.errorMessage!!, onRetry = viewModel::retry, modifier = modifier)
         state.isEmpty -> TvCenteredMessage("Nothing to show right now.", modifier)
-        else -> CatalogContent(state, categories, onMediaClick, onPlayClick, onCategoryClick, modifier)
+        else -> CatalogContent(
+            state, categories, onMediaClick, onPlayClick, onCategoryClick, focusTicket, modifier,
+        )
     }
 }
 
@@ -73,6 +83,7 @@ private fun CatalogContent(
     onMediaClick: (MediaItem) -> Unit,
     onPlayClick: (MediaItem) -> Unit,
     onCategoryClick: (Int, String) -> Unit,
+    focusTicket: TvFocusTicket,
     modifier: Modifier = Modifier,
 ) {
     val carouselItems: List<MediaItem> = remember(state.rows, state.featured) {
@@ -105,7 +116,17 @@ private fun CatalogContent(
             }
         }
         itemsIndexed(state.rows, key = { _, row -> row.title }) { _, row: MediaRowUi ->
-            TvMediaRow(title = row.title, items = row.items, onItemClick = onMediaClick)
+            // Record which tile the row is opened through, so BACK out of Details lands right back
+            // on it (see TvFocusTicket). Remembered so the row stays skippable.
+            val onOpen: (MediaItem) -> Unit = remember(row.title, onMediaClick, focusTicket) {
+                { item -> focusTicket.record(row.title, item); onMediaClick(item) }
+            }
+            TvMediaRow(
+                title = row.title,
+                items = row.items,
+                onItemClick = onOpen,
+                focusTicket = focusTicket,
+            )
         }
     }
 }

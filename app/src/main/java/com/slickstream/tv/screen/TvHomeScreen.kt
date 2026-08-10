@@ -56,9 +56,16 @@ import com.slickstream.core.model.WatchHistoryItem
 import com.slickstream.feature.home.HomeUiState
 import com.slickstream.feature.home.HomeViewModel
 import com.slickstream.feature.home.MediaRowUi
+import com.slickstream.tv.components.ConsumeOnResume
+import com.slickstream.tv.components.TvFocusTicket
 import com.slickstream.tv.components.TvMediaRow
+import com.slickstream.tv.components.rememberTvFocusTicket
 import com.slickstream.ui.components.RatingBadge
 import com.slickstream.ui.theme.Brand
+
+/** Row identities for the focus re-entry ticket — must be stable across a Details round trip. */
+private const val ROW_NEW_EPISODES = "New Episodes"
+private const val ROW_CONTINUE = "Continue Watching"
 
 /**
  * Android TV Home / Browse. A cinematic featured [Carousel] across the top (big backdrop with
@@ -76,6 +83,12 @@ fun TvHomeScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
+    // Created HERE, above the loading/empty branch: the ticket must be read on the very first
+    // composition of this destination, before ConsumeOnResume spends it. Created inside HomeContent
+    // it would be lost on any return where the rows are not ready in the first frame.
+    val focusTicket = rememberTvFocusTicket()
+    focusTicket.ConsumeOnResume()
+
     when {
         state.isLoading && state.isEmpty -> TvLoading(modifier)
         state.errorMessage != null && state.isEmpty ->
@@ -86,6 +99,7 @@ fun TvHomeScreen(
             onMediaClick = onMediaClick,
             onPlayClick = onPlayClick,
             onResume = onResume,
+            focusTicket = focusTicket,
             modifier = modifier,
         )
     }
@@ -98,6 +112,7 @@ private fun HomeContent(
     onMediaClick: (MediaItem) -> Unit,
     onPlayClick: (MediaItem) -> Unit,
     onResume: (WatchHistoryItem) -> Unit,
+    focusTicket: TvFocusTicket,
     modifier: Modifier = Modifier,
 ) {
     // Memoize derived collections so they aren't rebuilt (new List/Map allocations) on every
@@ -157,6 +172,18 @@ private fun HomeContent(
         { item -> newEpisodeById[item.mediaType to item.id]?.let(onResume) }
     }
 
+    // Every row records the tile it is opened through, so the trip into Details (or straight into
+    // the player, for the two resume rows) can be undone by BACK. Wrapped here rather than inside
+    // TvMediaRow so the row stays a dumb presenter and the details screen's own "More Like This"
+    // row is untouched. Remembered, like every other callback on this screen, so the rows stay
+    // skippable across recomposition.
+    val onNewEpisodeOpen: (MediaItem) -> Unit = remember(onNewEpisodeClick, focusTicket) {
+        { item -> focusTicket.record(ROW_NEW_EPISODES, item); onNewEpisodeClick(item) }
+    }
+    val onContinueOpen: (MediaItem) -> Unit = remember(onContinueClick, focusTicket) {
+        { item -> focusTicket.record(ROW_CONTINUE, item); onContinueClick(item) }
+    }
+
     // The hero Play button keeps a focus requester so D-pad RIGHT from the nav rail lands on it, but we
     // DON'T auto-focus it on entry any more: on app launch the nav rail owns focus (so it's clear you're
     // in the menu — see TvApp), and grabbing the hero here stole that focus and made a RIGHT press scroll
@@ -183,10 +210,11 @@ private fun HomeContent(
         if (newEpisodeItems.isNotEmpty()) {
             item(key = "new-episodes") {
                 TvMediaRow(
-                    title = "New Episodes",
+                    title = ROW_NEW_EPISODES,
                     items = newEpisodeItems,
-                    onItemClick = onNewEpisodeClick,
+                    onItemClick = onNewEpisodeOpen,
                     wide = true,
+                    focusTicket = focusTicket,
                 )
             }
         }
@@ -194,11 +222,12 @@ private fun HomeContent(
         if (continueItems.isNotEmpty()) {
             item(key = "continue") {
                 TvMediaRow(
-                    title = "Continue Watching",
+                    title = ROW_CONTINUE,
                     items = continueItems,
-                    onItemClick = onContinueClick,
+                    onItemClick = onContinueOpen,
                     wide = true,
                     progressFor = { progressByMediaId[it.mediaType to it.id] },
+                    focusTicket = focusTicket,
                 )
             }
         }
@@ -210,10 +239,14 @@ private fun HomeContent(
             // scrolling instead of composing each row from scratch.
             contentType = { _, _ -> "media-row" },
         ) { _, row: MediaRowUi ->
+            val onOpen: (MediaItem) -> Unit = remember(row.title, onMediaClick, focusTicket) {
+                { item -> focusTicket.record(row.title, item); onMediaClick(item) }
+            }
             TvMediaRow(
                 title = row.title,
                 items = row.items,
-                onItemClick = onMediaClick,
+                onItemClick = onOpen,
+                focusTicket = focusTicket,
             )
         }
     }

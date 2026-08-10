@@ -23,30 +23,41 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Text
 import com.slickstream.core.model.MediaItem
 import com.slickstream.feature.search.SearchViewModel
+import com.slickstream.tv.components.ConsumeOnResume
+import com.slickstream.tv.components.TvFocusTicket
 import com.slickstream.tv.components.TvPosterCard
 import com.slickstream.tv.components.TvSearchBar
+import com.slickstream.tv.components.bringItemIntoComposition
+import com.slickstream.tv.components.rememberTvFocusTicket
+import com.slickstream.tv.components.tvItemKey
 import com.slickstream.ui.theme.Brand
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+
+/**
+ * Where focus belongs on this screen. Modelled as a target rather than a bare [FocusRequester] so
+ * the restore path can do real work (scroll the tile into composition, confirm the landing) before
+ * deciding whether the mic-orb fallback is warranted.
+ */
+private enum class SearchFocus { Grid, Mic }
+
+/** Row identity for the (single-surface) results grid in the re-entry ticket. */
+private const val GRID = ""
 
 /**
  * Android TV Search — VOICE FIRST, with a search console that DOCKS instead of disappearing.
@@ -56,7 +67,7 @@ import kotlinx.coroutines.flow.map
  * gated behind `!hasResults`, which left the user stranded: once results were on screen there was
  * no mic and no way to type, so the only "reset" was switching to another tab and back.
  *
- * Re-entry policy (see `lastOpenedIndex`): coming BACK from a title's details keeps the results and
+ * Re-entry policy (see `focusTicket`): coming BACK from a title's details keeps the results and
  * re-focuses the poster you opened; arriving from the nav rail starts a fresh search. All
  * recognition/search logic is reused from [SearchViewModel].
  */
@@ -67,7 +78,7 @@ fun TvSearchScreen(
     viewModel: SearchViewModel = hiltViewModel(),
 ) {
     // --- Re-entry policy ----------------------------------------------------------------------
-    // Which grid cell was opened last — and, because it is ONLY ever >= 0 when this screen was left
+    // Which grid cell was opened last — and, because it is ONLY ever set when this screen was left
     // through a poster, the ticket that says "this composition is a Back out of Details". Its two
     // exit paths look identical to the composable (it is disposed either way), but they must not
     // behave the same:
@@ -76,12 +87,11 @@ fun TvSearchScreen(
     //     fixing — nobody wants to re-say "the one with the spinning top".
     //   • Nav rail -> Search -> start over. Pressing the menu item is an explicit "I want to search
     //     something new", and landing on last night's grid is the actual complaint.
-    // rememberSaveable, not remember: navigateTopLevel() pops this entry with saveState = true, so
-    // the ViewModelStore (and with it the old query + results) survives while every plain remember
-    // in here is thrown away.
-    var lastOpenedIndex by rememberSaveable { mutableStateOf(-1) }
-    // Captured once per composable instance, BEFORE the ticket is consumed further down.
-    val returnIndex = remember { lastOpenedIndex }
+    // Saveable, not remember: navigateTopLevel() pops this entry with saveState = true, so the
+    // ViewModelStore (and with it the old query + results) survives while every plain remember in
+    // here is thrown away. The ticket records the tile by KEY, not by grid index — see below for
+    // why an index cannot be trusted across this particular round trip.
+    val focusTicket = rememberTvFocusTicket()
 
     // The reset runs in a remember initializer ON PURPOSE — do not "tidy" this into a
     // LaunchedEffect. clear() sets the ViewModel's StateFlow synchronously, so running it here,
@@ -89,7 +99,7 @@ fun TvSearchScreen(
     // the empty state. From a LaunchedEffect the first frame would still paint the previous
     // search's grid (and latch the bar into its docked form off stale data).
     val freshSearch = remember {
-        val fromRail = returnIndex < 0
+        val fromRail = !focusTicket.isReturning
         if (fromRail) viewModel.clear()
         fromRail
     }
@@ -121,10 +131,9 @@ fun TvSearchScreen(
     // NavHost has torn the screen down, and a ticket left set there would make the following tab
     // switch look like a Details return and restore the stale grid. Effects run after composition,
     // so `returnIndex` above has always been captured before this can fire.
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { lastOpenedIndex = -1 }
+    focusTicket.ConsumeOnResume()
 
     val micFocus = remember { FocusRequester() }
-    val gridReturnFocus = remember { FocusRequester() }
     val gridState = rememberLazyGridState()
 
     // --- Focus ----------------------------------------------------------------------------------
@@ -135,27 +144,61 @@ fun TvSearchScreen(
     // Clear button itself) — an inline requestFocus() wins the race and is then undone when the
     // removal is applied.
     var focusTarget by remember {
-        // The results check matters after process death: the saved index comes back but the
+        // The results check matters after process death: the saved key comes back but the
         // ViewModel does not, so without it we would burn 480ms of retries on a cell that will
         // never exist before falling back.
         val returning = !freshSearch && state.results.isNotEmpty()
-        mutableStateOf<FocusRequester?>(if (returning) gridReturnFocus else micFocus)
+        mutableStateOf<SearchFocus?>(if (returning) SearchFocus.Grid else SearchFocus.Mic)
     }
     LaunchedEffect(focusTarget) {
-        val target = focusTarget ?: return@LaunchedEffect
-        // Delay-first retry, the house idiom (TvFavoritesScreen / TvCategoryScreen): the target is
-        // composed in the same frame, so an immediate request throws "not initialized".
-        repeat(12) {
-            kotlinx.coroutines.delay(40)
-            if (runCatching { target.requestFocus() }.isSuccess) {
+        when (focusTarget) {
+            null -> return@LaunchedEffect
+
+            SearchFocus.Grid -> {
+                // THE OFF-BY-ONE FIX, in two parts.
+                //
+                // (1) Find the tile by KEY. The grid's saved scroll position cannot be trusted here:
+                //     TvApp drops the 212dp nav rail the instant we navigate to Details, but this
+                //     screen stays composed for the whole exit transition, so it re-measures WIDER,
+                //     derives MORE columns, and saves a first-visible-item from a layout we never
+                //     come back to.
+                // (2) Scroll to it BY ITEM INDEX before asking for focus. An item index means the
+                //     same tile at any column count, and it guarantees the cell is composed — which
+                //     is the only state in which its focus requester is attached at all. Previously
+                //     the request threw "not initialized" for all 12 retries, we fell back to the
+                //     mic orb, and one DOWN press from the orb entered the grid at its first VISIBLE
+                //     row — always exactly one row above the row the user came from, because
+                //     focus-driven scrolling leaves your row as the LAST visible one.
+                val index = state.results.indexOfFirst { tvItemKey(it) == focusTicket.pendingItem }
+                if (index >= 0) {
+                    gridState.bringItemIntoComposition(index)
+                    // requestUntilFocused is answered by the TILE, not by the requester: a bare
+                    // requestFocus() returns Unit and only throws when no node is attached, so the
+                    // old `runCatching { … }.isSuccess` test could report success while nothing on
+                    // the screen was focused, and then skip the fallback below.
+                    if (focusTicket.anchor.requestUntilFocused()) {
+                        focusTarget = null
+                        return@LaunchedEffect
+                    }
+                }
+                // Only now is the tile genuinely gone (the profile switched and the query re-ran
+                // under new rules). Never settle with nothing focused.
+                focusTarget = SearchFocus.Mic
+            }
+
+            SearchFocus.Mic -> {
+                // Terminal fallback: the orb exists in BOTH bar states, so there is nothing further
+                // to try and nothing for a landing report to change.
+                repeat(12) {
+                    kotlinx.coroutines.delay(40)
+                    if (runCatching { micFocus.requestFocus() }.isSuccess) {
+                        focusTarget = null
+                        return@LaunchedEffect
+                    }
+                }
                 focusTarget = null
-                return@LaunchedEffect
             }
         }
-        // Never settle with nothing focused. The returning poster may not have been composed (the
-        // profile switched and the query re-ran under new rules), but the orb exists in BOTH bar
-        // states, so this fallback always lands.
-        focusTarget = if (target === micFocus) null else micFocus
     }
 
     // --- Docked / hero ---------------------------------------------------------------------------
@@ -184,8 +227,8 @@ fun TvSearchScreen(
         viewModel.acknowledgeVoice()
         viewModel.clear()
         collapsed = false
-        lastOpenedIndex = -1
-        focusTarget = micFocus
+        focusTicket.clear()
+        focusTarget = SearchFocus.Mic
         // The grid state is hoisted to screen scope (so a Details return can restore focus), which
         // means it OUTLIVES the results it was scrolled against. Clearing without rewinding leaves
         // the next search rendering from a stale index — opening mid-list, or pinned near the end if
@@ -304,12 +347,8 @@ fun TvSearchScreen(
                     results = state.results,
                     gridState = gridState,
                     upFocus = micFocus,
-                    returnFocus = gridReturnFocus,
-                    returnIndex = returnIndex,
-                    onOpen = { index, item ->
-                        lastOpenedIndex = index
-                        onMediaClick(item)
-                    },
+                    focusTicket = focusTicket,
+                    onOpen = onMediaClick,
                 )
             }
         }
@@ -321,40 +360,62 @@ private fun ResultsGrid(
     results: List<MediaItem>,
     gridState: LazyGridState,
     upFocus: FocusRequester,
-    returnFocus: FocusRequester,
-    returnIndex: Int,
-    onOpen: (Int, MediaItem) -> Unit,
+    focusTicket: TvFocusTicket,
+    onOpen: (MediaItem) -> Unit,
 ) {
     // Size cards FROM THE VIEWPORT so a whole card (poster + title + year) fits and ~2 rows show —
     // a fixed 150dp minimum overflowed a 960x540dp TV and cut the titles off.
     androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxSize()) {
         val hGap = 16.dp
-        val vGap = 18.dp
-        val textBlock = 46.dp
-        val rowHeight = (maxHeight - vGap) / 2
+        // These numbers pay for the SECOND title line (titleMaxLines = 2 below). A search cell is
+        // only ~95dp wide, so one 14sp line ellipsized after ~13 characters; two 13sp lines is
+        // roughly 2.2x the title before the "…". The reserve has to grow with the text or the
+        // second grid row is what gets sliced instead:
+        //   textBlock = 8dp pad + 2 x 18dp bodySmall line + 16dp year = 60dp, + 4dp slack.
+        // vGap and the bottom inset shrink to pay for it (8dp still clears the bleed of the focused
+        // card's 1.06 scale on the last row), and the row budget now SUBTRACTS the grid's own
+        // content padding, which the old formula quietly ignored. That last part is what keeps the
+        // extra line safe on panels other than the 960x540dp reference: an over-generous rowHeight
+        // asks for wider cards, and a wider card is a TALLER card, which is exactly how two rows
+        // stop fitting. Honest arithmetic flips to one more column instead of overflowing.
+        // On the reference TV (652dp x 433dp of grid) the result is unchanged where it matters:
+        // still 6 columns of 95dp, poster still 143dp — only the text token shrinks.
+        val vGap = 12.dp
+        val textBlock = 64.dp
+        val padTop = 4.dp
+        val padBottom = 8.dp
+        val rowHeight = (maxHeight - vGap - padTop - padBottom) / 2
         val posterHeight = (rowHeight - textBlock).coerceAtLeast(80.dp)
         val targetCardWidth = (posterHeight * (2f / 3f)).coerceIn(90.dp, 165.dp)
         val columns = kotlin.math.ceil(maxWidth / (targetCardWidth + hGap)).toInt().coerceAtLeast(3)
 
         LazyVerticalGrid(
-            // Hoisted so the scroll offset survives a Details round trip and the cell we want to
-            // re-focus is already composed when the retry loop fires.
+            // Hoisted so the scroll offset survives a Details round trip and the restore effect can
+            // scroll the cell we want to re-focus into composition before asking for focus.
             state = gridState,
             columns = GridCells.Fixed(columns),
-            contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+            contentPadding = PaddingValues(top = padTop, bottom = padBottom),
             horizontalArrangement = Arrangement.spacedBy(hGap),
             verticalArrangement = Arrangement.spacedBy(vGap),
             modifier = Modifier.fillMaxSize(),
         ) {
-            itemsIndexed(results, key = { _, it -> "${it.mediaType.name}-${it.id}" }) { index, item ->
+            itemsIndexed(results, key = { _, it -> tvItemKey(it) }) { index, item ->
                 TvPosterCard(
                     item = item,
                     // Records the cell so a Back out of Details lands focus right back on it.
-                    onClick = { onOpen(index, item) },
+                    onClick = {
+                        focusTicket.record(GRID, it)
+                        onOpen(it)
+                    },
                     fillCell = true,
+                    titleMaxLines = 2,
+                    focusAnchor = if (tvItemKey(item) == focusTicket.pendingItem) {
+                        focusTicket.anchor
+                    } else {
+                        null
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .then(if (index == returnIndex) Modifier.focusRequester(returnFocus) else Modifier)
                         // UP out of the TOP ROW lands on the mic orb, deterministically. Geometric
                         // focus search picks whichever bar child is horizontally nearest, so UP from
                         // the middle columns dropped into the text tile instead of the orb — and the

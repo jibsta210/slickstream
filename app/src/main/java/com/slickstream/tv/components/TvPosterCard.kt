@@ -30,6 +30,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -59,6 +60,11 @@ import com.slickstream.ui.theme.Brand
  *
  * @param wide render a landscape (backdrop) tile instead of a portrait poster — used for the
  *   continue-watching row.
+ * @param titleMaxLines how many lines the title may wrap to before ellipsizing. Defaults to 1, so
+ *   every existing caller is unchanged; wrapping callers also get the smaller 13sp token and a
+ *   fixed-height title block (see [CardTitle]).
+ * @param focusAnchor re-entry anchor for "put focus back on THIS tile after Details". Applied to
+ *   the [Surface] — the node that actually takes focus — not to the outer column.
  */
 @Composable
 fun TvPosterCard(
@@ -69,6 +75,8 @@ fun TvPosterCard(
     wide: Boolean = false,
     progress: Float? = null,
     fillCell: Boolean = false,
+    titleMaxLines: Int = 1,
+    focusAnchor: TvFocusAnchor? = null,
 ) {
     val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     // Kept as State (not delegated): the ring reads it in the DRAW phase and the title in its own
@@ -114,11 +122,15 @@ fun TvPosterCard(
             // No focus Glow: a 16dp animated render-node shadow is one of the most expensive
             // single effects on Mali-class TV GPUs, and it ran on every D-pad step. The 3dp violet
             // border + white ring below keep focus unmistakable.
-            modifier = if (fillCell) {
-                Modifier.fillMaxWidth().aspectRatio(if (wide) 16f / 9f else 2f / 3f)
-            } else {
-                Modifier.width(cardWidth).height(cardHeight)
-            },
+            modifier = Modifier
+                .tvFocusAnchor(focusAnchor)
+                .then(
+                    if (fillCell) {
+                        Modifier.fillMaxWidth().aspectRatio(if (wide) 16f / 9f else 2f / 3f)
+                    } else {
+                        Modifier.width(cardWidth).height(cardHeight)
+                    },
+                ),
         ) {
             Box(
                 Modifier
@@ -235,6 +247,7 @@ fun TvPosterCard(
         CardTitle(
             title = item.title,
             focused = focusedState,
+            maxLines = titleMaxLines,
             modifier = Modifier
                 .padding(top = 8.dp)
                 .then(if (fillCell) Modifier.fillMaxWidth() else Modifier.width(cardWidth)),
@@ -250,14 +263,42 @@ fun TvPosterCard(
     }
 }
 
+/**
+ * The tile's title.
+ *
+ * A wrapping title (`maxLines > 1`) drops from `bodyMedium` (14sp/20sp) to `bodySmall`
+ * (13sp/18sp): search cells are only ~95dp wide, so one 14sp line is ~12-14 glyphs before the
+ * ellipsis — the "titles are cut off far too aggressively" complaint. Two 13sp lines is ~2.2x the
+ * characters and still costs less height than two 14sp lines would.
+ *
+ * The block height is RESERVED (lineHeight x maxLines) rather than left to the text, so that in a
+ * grid every cell in a row is the same height and the year line below keeps one shared baseline
+ * whether or not a particular title happens to wrap. Measured through the density from `sp`, so it
+ * stays correct at a non-1.0 font scale.
+ */
 @Composable
-private fun CardTitle(title: String, focused: State<Boolean>, modifier: Modifier = Modifier) {
+private fun CardTitle(
+    title: String,
+    focused: State<Boolean>,
+    maxLines: Int,
+    modifier: Modifier = Modifier,
+) {
+    val style = if (maxLines > 1) {
+        MaterialTheme.typography.bodySmall
+    } else {
+        MaterialTheme.typography.bodyMedium
+    }
+    val density = LocalDensity.current
     Text(
         text = title,
-        style = MaterialTheme.typography.bodyMedium,
+        style = style,
         color = if (focused.value) Brand.OnSurface else Brand.OnSurfaceDim,
-        maxLines = 1,
+        maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
-        modifier = modifier,
+        modifier = if (maxLines > 1) {
+            modifier.height(with(density) { style.lineHeight.toDp() } * maxLines)
+        } else {
+            modifier
+        },
     )
 }
