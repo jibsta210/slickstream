@@ -1214,6 +1214,203 @@ class TorrentEngine @Inject constructor(
         active.startupTailArmed = false
     }
 
+    /**
+     * SEASON-PACK precache: pull the head (and the EOF index band) of ANOTHER file inside a torrent
+     * that is already attached, so advancing to the next episode of the same pack starts on bytes that
+     * are already on disk.
+     *
+     * This exists because a pack is the one case where the next episode is cheapest to warm and the one
+     * case that did NOTHING. StreamPicker lets a healthy pack win the shortlist whenever no comparably
+     * healthy singleton exists, so the next episode resolves to the SAME info-hash that is playing —
+     * and both warm paths correctly refuse it (one ActiveTorrent has one selected file; re-selecting
+     * would mutate the HTTP route under the live player). The result was that pack-sourced series got
+     * no precache at all.
+     *
+     * Two hard constraints, and the reason for each:
+     *
+     *  - NOTHING IS LOWERED. Every write is a raise: the current priority is read first and only
+     *     written when it is strictly lower. This is the engine-wide rule — a probe demoting a piece the
+     *     player was blocked reading caused false source failovers on healthy swarms three times.
+     *  - [Priority.LOW] plus a DELIBERATELY DISTANT deadline ([WARM_BAND_DEADLINE_MS], stepped). LOW
+     *     sits below the playing file's DEFAULT base, so the piece picker only reaches this band once
+     *     the episode on screen has nothing left to fetch — which at 85-95% of runtime is the normal
+     *     state, and the band then lands in a couple of seconds. The distant deadline is what gets the
+     *     band REQUESTED AT ALL: applySequentialAndPriority calls setSequentialRange(startPiece,
+     *     lastPiece OF THE PLAYING FILE), so the next episode's file sits outside the sequential
+     *     cursor's range and would otherwise never be reached. This is exactly the mechanism
+     *     [prefetchByteOffsets] already uses for scrub previews ("relaxed deadlines so previews only
+     *     sip spare swarm capacity"), only further out: 30 s+ against the player's 50 ms-class
+     *     read-ahead deadlines means libtorrent works every piece the frame depends on first.
+     *
+     * Raising these pieces makes them "wanted", so `is_finished` no longer flips while they are
+     * missing. That is deliberate and load-bearing: the streamer PAUSES a finished torrent to stop all
+     * up/down, and a paused torrent would never fetch this band. The streamer's existing
+     * `isPaused && !isFinished -> resume` self-heal covers a torrent that was already paused when this
+     * is called, within one 500 ms poll.
+     *
+     * Idempotent: safe (and intended) to call on a poll, because the caller needs to know when the band
+     * has actually LANDED, not merely when it was armed. Returns null when this torrent/selection has no
+     * such band to warm.
+     */
+    /**
+     * Stand the in-pack warm band DOWN: clear its deadlines, and nothing else.
+     *
+     * Load-bearing, not tidy-up. libtorrent deadlines are ABSOLUTE, so a band that was armed
+     * "now + 30 s" and never landed does not expire — it becomes ever MORE overdue, and this engine's
+     * own scheduling comment explains that more-overdue means MORE urgent. A warm that gives up
+     * (budget expired, episode changed, user left) would therefore leave a band inside the PLAYING
+     * torrent that outranks playback's own head and read-ahead, permanently, for the rest of the
+     * session — the warm actively fighting the picture on screen.
+     *
+     * Deadlines only: resetPieceDeadline lowers no priority, so the engine-wide "nothing demotes a
+     * piece" rule (which three review rounds were spent earning) still holds. The LOW priority left
+     * behind is harmless — it is at or below the file's base, and it is what lets these pieces trickle
+     * in from genuinely spare capacity.
+     */
+    fun clearWarmBand(infoHash: String, pieces: List<Int>) {
+        if (pieces.isEmpty()) return
+        val active = torrents[infoHash] ?: return
+        val handle = active.handle?.takeIf { it.isValid } ?: return
+        synchronized(nativeLock) {
+            runCatching {
+                // Clamp against the TORRENT's piece count, never active.firstPiece..lastPiece. Those are
+                // the PLAYING file's bounds, and warmFileHead refuses to warm the playing file at all —
+                // so the band lies almost entirely OUTSIDE that range. Guarding with it made this whole
+                // function a no-op (clearing none of the warm's deadlines) while admitting the single
+                // shared boundary piece, which is the one piece the warm deliberately did not touch
+                // because it belongs to the playing file's own bands. Net effect of the old guard: strip
+                // a deadline from PLAYBACK and leave every stale warm deadline in place — the exact
+                // inversion of the intent.
+                val total = runCatching { handle.torrentFile()?.numPieces() ?: 0 }.getOrDefault(0)
+                for (p in pieces) {
+                    if (p >= 0 && (total <= 0 || p < total)) handle.resetPieceDeadline(p)
+                }
+            }.onFailure { Log.w(TAG, "clearWarmBand failed for $infoHash", it) }
+        }
+    }
+
+    fun warmFileHead(
+        infoHash: String,
+        preferredFileIndex: Int?,
+        expectedSeason: Int?,
+        expectedEpisode: Int?,
+        headBytes: Long,
+    ): WarmBand? {
+        val active = torrents[infoHash] ?: return null
+        val handle = liveHandle(active) ?: return null
+        val pieceLen = active.pieceLength
+        if (pieceLen <= 0) return null
+        val info = synchronized(nativeLock) { runCatching { handle.torrentFile() }.getOrNull() } ?: return null
+        val files = runCatching { info.files() }.getOrNull() ?: return null
+        val numFiles = runCatching { files.numFiles() }.getOrDefault(0)
+        if (numFiles <= 1) return null   // single-file release: there is no other episode in here
+
+        // Same precedence as selectFile: filename evidence beats a possibly-stale addon file index.
+        val target = matchingEpisodeFile(files, expectedSeason, expectedEpisode)
+            ?: preferredFileIndex?.takeIf {
+                it in 0 until numFiles && isVideoFile(files.fileName(it)) && !isSampleFile(files.fileName(it))
+            }
+            ?: return null
+        // The file the user is watching needs no help, and touching it here could only collide with the
+        // head/read-ahead bands that are already deadlined for it.
+        if (target == active.fileIndex) return null
+
+        val fileOffset = runCatching { files.fileOffset(target) }.getOrDefault(-1L)
+        val fileLength = runCatching { files.fileSize(target) }.getOrDefault(0L)
+        if (fileOffset < 0L || fileLength <= 0L) return null
+
+        val firstPiece = (fileOffset / pieceLen).toInt()
+        val lastPiece = ((fileOffset + fileLength - 1) / pieceLen).toInt()
+        val head = headBytes.coerceIn(1L, fileLength)
+        val headLast = (((fileOffset + head - 1) / pieceLen).toInt()).coerceIn(firstPiece, lastPiece)
+        // The EOF index band. Armed ONLY for a container that can actually keep its index at EOF —
+        // mkv/webm/avi never do, so arming it for them was pure competition with the episode on screen.
+        // BYTE-BOUNDED the way prioritizeHeadAndTail bounds its own bands: on a season pack with 16-32 MB
+        // pieces, "8 MB" of head plus "8 MB" of index rounds up to 32-128 MB of TIME-CRITICAL data inside
+        // the very torrent that is playing — comparable to the entire 64 MB read-ahead window that keeps
+        // playback alive, and structurally impossible to rate-cap because it is the playing torrent.
+        val needsIndex = files.fileName(target).substringAfterLast('.', "").lowercase() in MOOV_EXTS
+        val indexPieces = if (needsIndex) maxOf(1, ceilDiv(TAIL_PRIORITY_BYTES, pieceLen)) else 0
+        val indexFirst = (lastPiece - indexPieces + 1).coerceIn(firstPiece, lastPiece)
+        val headBand = firstPiece..headLast
+        val indexBand = if (needsIndex) indexFirst..lastPiece else IntRange.EMPTY
+
+        val wanted = (headBand + indexBand).distinct().sorted()
+        var raised = 0
+        var missing = 0
+        synchronized(nativeLock) {
+            runCatching {
+                val pieces = runCatching { handle.status(TorrentHandle.QUERY_PIECES).pieces() }.getOrNull()
+                val pieceCount = pieces?.size() ?: 0
+                var i = 0
+                for (p in wanted) {
+                    val have = pieces != null && p < pieceCount && pieces.getBit(p)
+                    if (have) { i++; continue }
+                    missing++
+                    // Read-then-raise. A piece shared with the PLAYING file across a boundary can already
+                    // be TOP with a live deadline; writing LOW over it is exactly the demotion that
+                    // breaks a blocked read, and re-deadlining it 30 s out would be the same defect by
+                    // another route. Touch only pieces that are genuinely below us.
+                    val current = handle.piecePriority(p)
+                    if (current.swig() <= Priority.LOW.swig()) {
+                        if (current.swig() < Priority.LOW.swig()) {
+                            handle.piecePriority(p, Priority.LOW)
+                            raised++
+                        }
+                        // (Re-)issue the relaxed deadline on every poll, not just the first arm:
+                        // applySequentialAndPriority -> prioritizeHeadAndTail calls clearPieceDeadlines(),
+                        // which wipes this band while leaving its LOW priority intact — and a LOW piece
+                        // outside the sequential range with no deadline is never requested at all.
+                        handle.setPieceDeadline(p, WARM_BAND_DEADLINE_MS + i * WARM_BAND_DEADLINE_STEP_MS)
+                    }
+                    i++
+                }
+            }.onFailure { Log.w(TAG, "warmFileHead failed for $infoHash", it) }
+        }
+        if (raised > 0) {
+            // Immediacy only: if the torrent was paused because the playing file finished, the band we
+            // just made "wanted" needs the session running to fetch it. The poll loop's self-heal would
+            // do this within 500 ms anyway; doing it here means the warm starts on THIS tick.
+            synchronized(nativeLock) { runCatching { handle.resume() } }   // idempotent on a running torrent
+            Log.i(
+                TAG,
+                "warmFileHead $infoHash file=$target (playing=${active.fileIndex}) raised=$raised " +
+                    "missing=$missing/${wanted.size} head=[$firstPiece..$headLast] index=[$indexFirst..$lastPiece]",
+            )
+        }
+        return WarmBand(pieces = wanted.size, missing = missing, raised = raised, pieceList = wanted)
+    }
+
+    /** State of an in-pack next-episode warm band: how big it is, how much of it is still missing, and
+     *  how many pieces this call had to raise (0 on a re-poll of an already-armed band). */
+    data class WarmBand(
+        val pieces: Int,
+        val missing: Int,
+        val raised: Int,
+        /** The exact pieces this band armed, so a warm that gives up can stand its own deadlines down
+         *  (see [clearWarmBand]) instead of leaving them to grow ever more overdue inside the torrent
+         *  the user is currently watching. */
+        val pieceList: List<Int> = emptyList(),
+    ) {
+        val ready: Boolean get() = pieces > 0 && missing == 0
+    }
+
+    /**
+     * Per-torrent download cap in bytes/s (0 = unlimited). The next-episode warm runs at 85-95% of the
+     * current episode inside ONE session-wide rate limit (12 MiB/s on TV, 16 otherwise), one connection
+     * budget and 4 unchoke slots — so an uncapped warm can take roughly half the pipe from the episode
+     * being watched, in the exact window where a stall is most annoying. Capping the WARM handle bounds
+     * that harm to a number instead of leaving it to per-peer luck; [TorrentStreamerImpl] clears the cap
+     * again the moment the torrent is started for playback.
+     */
+    fun setDownloadLimit(infoHash: String, bytesPerSecond: Int) {
+        val handle = torrents[infoHash]?.handle?.takeIf { it.isValid } ?: return
+        synchronized(nativeLock) {
+            runCatching { handle.setDownloadLimit(bytesPerSecond) }
+                .onFailure { Log.w(TAG, "setDownloadLimit failed for $infoHash", it) }
+        }
+    }
+
     /** Ceiling of [a]/[b] for positive ints. */
     private fun ceilDiv(a: Int, b: Int): Int = (a + b - 1) / b
 
@@ -2279,6 +2476,14 @@ class TorrentEngine @Inject constructor(
         /** Relaxed deadline (ms) for scrub-preview sample pieces — far behind the 50 ms-class head/moov
          *  deadlines, so previews only sip spare swarm capacity and never delay playback. */
         const val PREVIEW_PREFETCH_DEADLINE_MS = 4000
+
+        /** Deadline base + per-piece step for the in-pack NEXT-EPISODE warm band ([warmFileHead]). Much
+         *  further out than [PREVIEW_PREFETCH_DEADLINE_MS] because this band is ~16 MB rather than a
+         *  couple of sample pieces: it must be requestable (the band lies outside the playing file's
+         *  sequential range) while being the LAST thing libtorrent works on. The step keeps the head
+         *  landing in order, so a partially-fetched band is still a usable contiguous head. */
+        const val WARM_BAND_DEADLINE_MS = 30_000
+        const val WARM_BAND_DEADLINE_STEP_MS = 1_000
 
         /** Seed/upload cap (bytes/s) — keep a streaming client from saturating the home upstream. */
         const val UPLOAD_RATE_LIMIT = 512 * 1024

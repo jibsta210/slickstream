@@ -68,9 +68,40 @@ class TorrentStreamerImpl @Inject constructor(
      *  libtorrent status() calls (and nativeLock waits) off the main/UI thread. */
     private val pieceMapCache = ConcurrentHashMap<String, FloatArray>()
 
-    /** The most recently warmed (next-episode) info-hash. Protected from cache eviction so a long
-     *  current episode can't evict the precache before the user advances. Cleared once it streams. */
-    @Volatile private var warmedHash: String? = null
+    /**
+     * Info-hashes holding PRECACHED next-episode bytes, protected from cache eviction so a long current
+     * episode can't evict the precache before the user advances.
+     *
+     * A SET (bounded, LRU) rather than the single slot this used to be, for two reasons that both lost
+     * real bytes:
+     *  - the Details-screen prewarm calls the same prefetch() on this app-wide singleton, so it
+     *    overwrote the next-episode warm's protection and then ran a budget walk against it;
+     *  - a mid-episode source switch cancels the warm job, and the old code cleared protection on any
+     *    cancellation (completedWarm == false) — dropping the shield on a half-warmed torrent that had
+     *    real bytes on disk. A partial warm is VALUABLE: start() finishes it through StartGate instead
+     *    of re-downloading it.
+     */
+    private val warmedHashes = LinkedHashSet<String>()
+
+    private fun markWarmed(infoHash: String) = synchronized(warmedHashes) {
+        warmedHashes.remove(infoHash)   // re-insert at the tail so this is the most recent
+        warmedHashes.add(infoHash)
+        while (warmedHashes.size > MAX_WARMED_HASHES) {
+            val oldest = warmedHashes.iterator()
+            oldest.next()
+            oldest.remove()
+        }
+    }
+
+    private fun unmarkWarmed(infoHash: String) = synchronized(warmedHashes) { warmedHashes.remove(infoHash) }
+
+    private fun warmedHashSet(): Set<String> = synchronized(warmedHashes) { warmedHashes.toSet() }
+
+    /** The protected set EVERY budget walk must use. Built here rather than trusted from the caller:
+     *  DetailsViewModel calls prefetch() with the default emptySet, which used to leave the PLAYING
+     *  torrent out of the protected set on that walk. */
+    private fun protectedSet(extra: Set<String> = emptySet()): Set<String> =
+        streamingHashes() + acquiringHashes() + warmedHashSet() + extra
 
     override fun start(
         source: StreamSource,
@@ -157,17 +188,26 @@ class TorrentStreamerImpl @Inject constructor(
         val resumeIsHead = startPositionFraction <= RESUME_ANCHOR_EPSILON
 
         // Mark this torrent as actively streaming so a still-running Details prewarm can't pause it.
-        // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm".
-        if (infoHash == warmedHash) warmedHash = null
+        // If we're now streaming the torrent we'd warmed for next-episode, it's no longer "the warm"
+        // (markStreaming already protects it, and the warm slot should go to the NEXT next-episode).
+        val wasWarm = warmedHashSet().contains(infoHash)
+        unmarkWarmed(infoHash)
+        // Release the warm's download cap. prefetch() throttles its handle so a background head-fetch
+        // can't take half the pipe from the episode being watched; leaving that cap in place here would
+        // limit PLAYBACK of this very torrent to the warm rate.
+        runCatching { engine.setDownloadLimit(infoHash, 0) }
+        if (wasWarm) {
+            // The single line that answers "did the precache actually get used?" in a bug report.
+            val warmHead = runCatching { engine.contiguousHeadBytes(infoHash) }.getOrDefault(0L)
+            Log.i(TAG, "warm reused: streaming precached $infoHash with head=${warmHead}B already on disk")
+        }
 
         cache.touch(infoHash)
         // Make room if we're over budget — but protect the active stream(s) AND the warmed next-episode
         // torrent. The warm is PAUSED (not active), so without this it was the first thing evicted while
         // the current episode kept downloading, which is why "precache did nothing" after a long episode.
         scope.launch {
-            runCatching {
-                cache.enforceBudget(streamingHashes() + acquiringHashes() + setOfNotNull(warmedHash))
-            }
+            runCatching { cache.enforceBudget(protectedSet()) }
         }
 
         val server = try {
@@ -445,6 +485,60 @@ class TorrentStreamerImpl @Inject constructor(
         Unit
     }
 
+    override suspend fun warmPackFile(
+        infoHash: String,
+        fileIndex: Int?,
+        season: Int?,
+        episode: Int?,
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!engine.isAvailable()) return@withContext false
+        val hash = infoHash.lowercase()
+        val deadline = System.currentTimeMillis() + WARM_TOTAL_BUDGET_MS
+        var band: TorrentEngine.WarmBand? = null
+        var standDown = true
+        // Re-arm on every poll rather than once: the call is idempotent (it raises only pieces below LOW)
+        // and re-arming is what survives a re-select or an applySequentialAndPriority that ran in between.
+        // Polling is also the only honest way to answer "is the next episode ready" for a pack — the band
+        // is fetched from SPARE capacity, so it lands when the playing file stops needing the swarm.
+        //
+        // try/finally, not a tail call: the stand-down MUST also run when delay() throws
+        // CancellationException (an episode hop, a source switch, the player closing). A band abandoned
+        // mid-poll keeps ABSOLUTE deadlines that stop being refreshed, and libtorrent treats
+        // ever-more-overdue as ever-more-urgent — so the warm would outrank the read-ahead of the very
+        // episode still on screen, for the rest of the session.
+        try {
+            while (currentCoroutineContext().isActive && System.currentTimeMillis() < deadline) {
+                band = runCatching {
+                    engine.warmFileHead(
+                        infoHash = hash,
+                        preferredFileIndex = fileIndex,
+                        expectedSeason = season,
+                        expectedEpisode = episode,
+                        headBytes = PREFETCH_HEAD_BYTES,
+                    )
+                }.getOrNull() ?: break      // nothing warmable here (single-file torrent / unknown episode)
+                if (band.ready) { standDown = false; break }
+                delay(WARM_PACK_POLL_MS)
+            }
+        } finally {
+            if (standDown) {
+                band?.let { runCatching { engine.clearWarmBand(hash, it.pieceList) } }
+            }
+        }
+        val ready = band?.ready == true
+        Log.i(TAG, "warm pack s=$season e=$episode ready=$ready band=${band?.pieces} missing=${band?.missing} on $hash")
+        ready
+    }
+
+    override fun warmHeadReady(infoHash: String): Boolean {
+        val hash = infoHash.lowercase()
+        val head = engine.contiguousHeadBytes(hash)
+        if (head < PREFETCH_HEAD_BYTES) return false
+        val ext = engine.selectedFileExt(hash)
+        val needsTail = ext in MOOV_CONTAINERS && engine.moovLocation(hash, head).inHead != true
+        return !needsTail || engine.tailAvailable(hash)
+    }
+
     override suspend fun prefetch(
         source: StreamSource,
         protectedHashes: Set<String>,
@@ -453,8 +547,15 @@ class TorrentStreamerImpl @Inject constructor(
         if (source.isDirect || source.magnetUri.isBlank()) return@withContext null
         val requestedHash = source.infoHash.lowercase()
         // One ActiveTorrent has one selected file. Re-selecting a different episode from the same pack
-        // while this hash is playing mutates the HTTP route underneath the current player.
+        // while this hash is playing mutates the HTTP route underneath the current player. (The pack
+        // case has its own path — see [warmPackFile].)
         if (isStreaming(requestedHash)) return@withContext null
+        // The WHOLE warm — resolve is the caller's, but metadata AND head fill are ours — is bounded by
+        // one budget. The metadata wait used to sit OUTSIDE it, so a cold magnet could occupy up to
+        // METADATA_TIMEOUT_SECONDS (60 s) + PREFETCH_BUDGET_MS (90 s) = ~150 s of second-torrent traffic.
+        // This is deliberately the same number NextEpisodeWarm.WARM_COST_BUDGET_MS reserves lead for, so
+        // "how long the warm may take" and "how early we start it" cannot drift apart.
+        val warmDeadline = System.currentTimeMillis() + WARM_TOTAL_BUDGET_MS
         markAcquiring(requestedHash)
         // Deliberately NO onStreamStarted()/ensureServer() — warming must not spin up the
         // foreground service or the HTTP bridge. It is a quiet background head-fetch.
@@ -485,39 +586,80 @@ class TorrentStreamerImpl @Inject constructor(
         val infoHash = acquiredHash
         // Publish protection before any budget walk. acquiringRefs remains held for the entire warm,
         // closing the gap where memory pressure could evict the just-created payload mid-prefetch.
-        warmedHash = infoHash
+        markWarmed(infoHash)
 
-        var completedWarm = false
         try {
             cache.touch(infoHash)
-            // Make room if over budget, but never evict the playing torrent OR the one we're warming.
-            runCatching { cache.enforceBudget(protectedHashes + infoHash) }
+            // Make room if over budget. The protected set is built HERE, not taken on trust: this same
+            // method is called by the Details prewarm with the default emptySet, which used to leave the
+            // playing torrent unprotected on the walk.
+            runCatching { cache.enforceBudget(protectedSet(protectedHashes + infoHash)) }
 
             // Buffer a small head AND the moov tail (for non-faststart mp4) so first-frame is INSTANT
             // when the user advances. Re-check the container each tick because metadata may have only
             // just arrived when addMagnet returns.
-            val deadline = System.currentTimeMillis() + PREFETCH_BUDGET_MS
-            while (currentCoroutineContext().isActive && System.currentTimeMillis() < deadline) {
-                val headBytes = engine.contiguousHeadBytes(infoHash)
+            var headBytes = 0L
+            var reached = false
+            var throttled = false
+            while (currentCoroutineContext().isActive && System.currentTimeMillis() < warmDeadline) {
+                // Bound the warm's bandwidth WHENEVER something is playing. Uncapped, the head fill is a
+                // full-tilt sequential download of the NEXT episode running at 85-95% of the CURRENT one,
+                // inside one session-wide 12-16 MiB/s limit, one connection budget and 4 unchoke slots —
+                // so it can take roughly half the pipe from the stream on screen, in the exact window
+                // where a rebuffer is least forgivable. 1.5 MB/s still fills the 8 MB head in ~5 s and a
+                // 32 MB moov piece in ~21 s. Re-evaluated each tick because a Details-screen prewarm
+                // (same method, no playback) should stay uncapped, and playback can start mid-warm.
+                // EXCLUDE OUR OWN HASH. The Details-screen prewarm deliberately warms the SAME release
+                // the player is about to pick, and its job is not cancelled on navigating into the player
+                // — so with a bare isNotEmpty() the warm loop observed "something is streaming" and
+                // clamped the torrent the user had just pressed Play on to 1.5 MB/s. start() clears the
+                // limit once, but this loop re-applied it within one 500 ms poll, and it only came off
+                // when the warm budget expired. Throttle only for OTHER streams.
+                val shouldThrottle = streamingHashes().any { !it.equals(infoHash, ignoreCase = true) }
+                // Once a player owns this hash there is nothing left for the warm to do: start()'s
+                // deadlined head/index bands drive the fill from that point. Leave, clearing the cap.
+                if (isStreaming(infoHash)) {
+                    runCatching { engine.setDownloadLimit(infoHash, 0) }
+                    throttled = false
+                    break
+                }
+                if (shouldThrottle != throttled) {
+                    throttled = shouldThrottle
+                    runCatching {
+                        engine.setDownloadLimit(infoHash, if (shouldThrottle) WARM_RATE_LIMIT_BYTES else 0)
+                    }
+                }
+                headBytes = engine.contiguousHeadBytes(infoHash)
                 val headReady = headBytes >= PREFETCH_HEAD_BYTES
                 val moovInHead = if (engine.selectedFileExt(infoHash) in MOOV_CONTAINERS) {
                     engine.moovLocation(infoHash, headBytes).inHead
                 } else null
                 if (moovInHead == true) engine.cancelStartupTail(infoHash)
                 val needsTail = engine.selectedFileExt(infoHash) in MOOV_CONTAINERS && moovInHead != true
+                // The index is the other half of "starts in about a second": a non-faststart mp4 whose
+                // moov is missing gives ExoPlayer a file it cannot parse, and it sits in STATE_BUFFERING.
+                // Go GET it rather than waiting for the sequential cursor to reach EOF.
+                if (needsTail && headReady) runCatching { engine.promoteStartupTail(infoHash) }
                 val tailReady = !needsTail || engine.tailAvailable(infoHash)
-                if (headReady && tailReady) break
+                if (headReady && tailReady) { reached = true; break }
                 delay(POLL_INTERVAL_MS)
             }
-            completedWarm = true
-            // Keep it protected unless a player claimed it during the warm.
-            val nowStreaming = isStreaming(infoHash)
-            warmedHash = infoHash.takeUnless { nowStreaming }
+            Log.i(
+                TAG,
+                "warm done hash=$infoHash complete=$reached head=${headBytes}B " +
+                    "budgetLeft=${(warmDeadline - System.currentTimeMillis()).coerceAtLeast(0L)}ms",
+            )
             infoHash
         } finally {
+            // Deliberately NO `warmedHash = null` on the not-completed path any more. A warm cancelled by
+            // a mid-episode source switch (startSource used to blanket-cancel prefetchJob) or capped by
+            // the budget still leaves REAL BYTES on disk, and dropping their eviction protection was how
+            // a half-warm became worthless. start() finishes a partial through StartGate; it never
+            // re-downloads it. Protection is released in start() (it is streaming now, hence protected
+            // anyway) or evicted normally once it ages out of the bounded warm set.
             if (!isStreaming(infoHash)) runCatching { engine.pause(infoHash) }
+            runCatching { engine.setDownloadLimit(infoHash, 0) }
             cache.touch(infoHash)
-            if (!completedWarm && warmedHash == infoHash) warmedHash = null
             unmarkAcquiring(requestedHash)
         }
     }
@@ -527,9 +669,7 @@ class TorrentStreamerImpl @Inject constructor(
     override suspend fun clearCache() = withContext(Dispatchers.IO) {
         // Never delete files out from under an active stream — its live handle would keep claiming
         // pieces exist and the HTTP server would serve zeros from a recreated sparse file.
-        cache.clearCache(
-            protectedHashes = streamingHashes() + acquiringHashes() + setOfNotNull(warmedHash),
-        )
+        cache.clearCache(protectedHashes = protectedSet())
     }
 
     override fun onMemoryPressure(maxBytes: Long) {
@@ -538,12 +678,7 @@ class TorrentStreamerImpl @Inject constructor(
         // inline. Uses the SET overload (the single-hash one filtered on engine.isActive(), which
         // excludes every paused-in-session torrent and made pressure eviction a no-op).
         scope.launch {
-            runCatching {
-                cache.enforceBudget(
-                    streamingHashes() + acquiringHashes() + setOfNotNull(warmedHash),
-                    maxBytes = maxBytes,
-                )
-            }
+            runCatching { cache.enforceBudget(protectedSet(), maxBytes = maxBytes) }
         }
     }
 
@@ -815,10 +950,27 @@ class TorrentStreamerImpl @Inject constructor(
          *  while still allowing a 32MB tail piece several minutes on a genuinely slow old swarm. */
         private const val TAIL_STALL_TIMEOUT_MS = 4L * 60_000L
 
-        /** Head bytes to pre-buffer when warming the next episode (~2 MB — cheap, just enough). */
+        /** Head bytes to pre-buffer when warming the next episode. 8 MB comfortably clears StartGate's
+         *  container-header + playhead requirements, so the advance opens the gate on bytes already on
+         *  disk instead of waiting on a swarm. */
         private const val PREFETCH_HEAD_BYTES = 8L * 1024L * 1024L
 
-        /** Hard wall-clock cap on one warm attempt so a dead swarm can't tie up a coroutine. */
-        private const val PREFETCH_BUDGET_MS = 90_000L
+        /** Hard wall-clock cap on ONE warm attempt, covering metadata AND the head/index fill (the
+         *  metadata wait used to be outside it, making the true worst case ~150 s). Deliberately equal
+         *  to NextEpisodeWarm.WARM_COST_BUDGET_MS, which is the lead the player reserves for it. */
+        private const val WARM_TOTAL_BUDGET_MS = 180_000L
+
+        /** Per-torrent download cap applied to a warm (~1.5 MB/s): fills the 8 MB head in ~5 s and a
+         *  32 MB moov piece in ~21 s while leaving the great majority of the session's 12-16 MiB/s to
+         *  the episode actually on screen. */
+        private const val WARM_RATE_LIMIT_BYTES = 1_500_000
+
+        /** How many warmed hashes keep eviction protection at once: the next-episode warm plus one
+         *  Details-screen prewarm, which share this singleton. */
+        private const val MAX_WARMED_HASHES = 2
+
+        /** Poll cadence while waiting for an in-pack warm band to land. Slower than [POLL_INTERVAL_MS]:
+         *  this band is fetched from spare capacity and each poll costs a piece-bitfield read. */
+        private const val WARM_PACK_POLL_MS = 2_000L
     }
 }

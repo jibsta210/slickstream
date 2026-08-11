@@ -158,8 +158,11 @@ fun PieceBarPanel(
                             // rebuffering. Better on the diagnostic line than hidden inside the speed.
                             stats.wastedPercent?.let { append(" · $it% wasted") }
                             // Once the current file is in, surface the next-episode precache so the user can
-                            // see it warming (instead of the bar just reading a static 100%).
-                            if (stats.precaching) append(" · caching next episode")
+                            // see it warming (instead of the bar just reading a static 100%). Two states,
+                            // not one: "is it warming" and "is it warm" are different questions, and the
+                            // second is the one that predicts whether "Up next" starts instantly.
+                            if (stats.nextEpisodeReady) append(" · next episode ready")
+                            else if (stats.precaching) append(" · caching next episode")
                             health.warning?.let { append(" · "); append(it) }
                         }
                     } else {

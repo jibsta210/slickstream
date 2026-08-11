@@ -164,6 +164,30 @@ interface TorrentStreamer {
      */
     suspend fun prefetch(source: StreamSource, protectedHashes: Set<String> = emptySet()): String?
 
+    /**
+     * Did a warm actually put a playable STARTING POINT on disk — the head, plus the EOF index when the
+     * container needs one?
+     *
+     * Asked separately because [prefetch] returns its info-hash as soon as the torrent is ATTACHED, and
+     * it deliberately keeps returning it when the head loop runs out of budget (those partial bytes are
+     * worth protecting). Treating "attached" as "ready" is how a 3-seeder magnet with 1.2 MB of head got
+     * announced to the user as "next episode ready" and then started with a one-entry candidate list and
+     * nothing to fail over to — strictly worse than the "Finding sources…" it replaced. Recomputed from
+     * the engine, so it cannot drift from what the readiness gate will decide.
+     */
+    fun warmHeadReady(infoHash: String): Boolean
+
+    /**
+     * SEASON-PACK precache: warm ANOTHER episode's file inside a torrent that is already attached and
+     * streaming. [prefetch] cannot do this — one ActiveTorrent has one selected file, and re-selecting
+     * would mutate the HTTP route under the live player — so a pack-sourced series got no precache at
+     * all. Raises (never lowers) the target file's head + EOF-index pieces with NO deadline, so the
+     * bytes come from spare capacity and never from the episode on screen.
+     *
+     * Returns true when a band was actually raised.
+     */
+    suspend fun warmPackFile(infoHash: String, fileIndex: Int?, season: Int?, episode: Int?): Boolean
+
     /** Info-hashes currently held in the on-disk cache. */
     fun cachedTorrents(): List<String>
     suspend fun clearCache()

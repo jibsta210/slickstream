@@ -135,7 +135,12 @@ data class StreamStats(
      *  rather than silently inflating the speed. */
     val wastedPercent: Int? = null,
     val progress: Float,
+    /** The next-episode warm is running right now (resolving sources / filling its head + index). */
     val precaching: Boolean = false,
+    /** The next-episode warm FINISHED: its head and container index are on disk, so pressing "Up next"
+     *  starts in about a second. Distinct from [precaching] because "is it warming" and "is it warm"
+     *  are the two different questions a user staring at this line is actually asking. */
+    val nextEpisodeReady: Boolean = false,
     /** Hash-verifying cached/on-disk data (resume), not downloading — rate/seeders read 0 but it's fine. */
     val isChecking: Boolean = false,
     /** What the readiness gate is still waiting for, verbatim from the engine. The chunk bar renders
@@ -368,10 +373,25 @@ class PlayerViewModel @Inject constructor(
     /** Effective quality cap from the last auto-pick — reused by the synchronous smaller-source scan. */
     @Volatile private var currentNetworkMaxTier: Int? = null
 
-    // --- Next-episode prefetch ---
+    // --- Next-episode prefetch (see [NextEpisodeWarm] for the policy) ---
     private var prefetchJob: Job? = null
-    private var prefetchTriggeredForEpisode = false
-    @Volatile private var prefetchedInfoHash: String? = null
+
+    /** The episode we already fired a warm FOR — keyed by (season, episode) rather than a bare boolean.
+     *  The boolean was reset by startSource() on EVERY source start, so a mid-episode failover or manual
+     *  source switch killed an in-flight warm and burned its one-shot slot; and a warm that failed could
+     *  never be retried for the rest of the episode. */
+    private var warmAttemptedFor: Pair<Int, Int>? = null
+
+    /** Backs off a retry after a failed warm (dead magnet / no sources) instead of re-running the whole
+     *  addon fan-out on every 10 s tick. */
+    private var warmRetryAtMs: Long = 0L
+
+    /** The release the warm pinned, keyed to the episode it was warmed for. */
+    @Volatile private var warmed: NextEpisodeWarm.Warmed? = null
+
+    /** What the chunk-bar info line should say about the warm. */
+    private enum class WarmPhase { IDLE, WARMING, READY }
+    @Volatile private var warmPhase: WarmPhase = WarmPhase.IDLE
 
     // --- PiP: current video aspect ratio for PictureInPictureParams (clamped at use site) ---
     private val _videoAspect = MutableStateFlow(16f / 9f)
@@ -397,7 +417,12 @@ class PlayerViewModel @Inject constructor(
             payloadRateBytes = it.payloadRateBytes,
             wastedPercent = TransferAccounting.wastedPercentToShow(it.payloadBytes, it.wastedBytes),
             progress = it.progress,
-            precaching = prefetchJob?.isActive == true,
+            // Report the WARM's own phase, not `prefetchJob.isActive`. The job stays active through the
+            // resolve fan-out and goes inactive the instant the head lands, so the old flag said
+            // "caching next episode" during the part where nothing was downloading yet and said nothing
+            // at all once the precache was actually ready.
+            precaching = warmPhase == WarmPhase.WARMING,
+            nextEpisodeReady = warmPhase == WarmPhase.READY,
             isChecking = it.isChecking,
             startupBlocker = it.startupBlocker,
             durationMs = _currentPlayer.value?.duration?.takeIf { d -> d > 0 } ?: 0L,
@@ -749,8 +774,11 @@ class PlayerViewModel @Inject constructor(
         // through releaseLocalPlayer. The failover path already released it, so this is then a no-op.
         usingVlcForSource = false
         releaseVlcPlayer()
-        prefetchTriggeredForEpisode = false
-        prefetchJob?.cancel()
+        // Deliberately does NOT touch the next-episode warm. This runs on every source start, including
+        // a mid-episode failover or manual source switch at 85-95% — exactly when the warm is in flight.
+        // Blanket-cancelling it there dropped a half-warmed torrent's bytes AND burned its one-shot
+        // slot for the rest of the episode. The warm is keyed to (season, episode) now, so an episode
+        // hop re-arms it naturally and a same-episode source change leaves it alone.
         // Fresh source — re-arm the smaller-stream hint and start its buffering clock.
         suggestedSmallerForSource = false
         _suggestSmaller.value = false
@@ -2264,52 +2292,123 @@ class PlayerViewModel @Inject constructor(
 
     // --- Next-episode prefetch (TV only) ------------------------------------
 
-    /** Warm the next episode when within [PREFETCH_LEAD_MS] / [PREFETCH_PCT] of the end. */
+    /**
+     * Warm the next episode once the playhead reaches [NextEpisodeWarm.warmAtMs] — a point DERIVED from
+     * the user's own "Up next" card threshold, not a constant that could sit after it.
+     *
+     * The bar this has to clear: by the time the card appears, the next episode's head AND container
+     * index must already be on disk. See [NextEpisodeWarm] for the arithmetic and the worked cases.
+     */
     private fun maybeWarmNextEpisode() {
         if (mediaType != MediaType.TV) return
         // Precache the next episode's head even on low-power TV — the user wants instant next-episode
-        // starts. It's a BOUNDED warm (a small head, then the torrent is parked/paused), and start()
-        // self-heals a parked torrent on play, so it never strands the next episode. If a weak TV ever
-        // hitches in the last few minutes of an episode, this gate is where to throttle it.
-        if (prefetchTriggeredForEpisode) return
+        // starts. The warm is bounded in TIME (one budget covering metadata + head) and in BANDWIDTH
+        // (a per-torrent rate cap in the streamer), so it cannot take the pipe from the episode on
+        // screen; see TorrentStreamerImpl.prefetch.
         if (_isCasting.value) return                 // remote playback: a phone-side head buffer is useless
         if (!isOnUnmeteredNetwork()) return
-        val exo = _player.value ?: return
-        val duration = exo.duration
-        val position = exo.currentPosition
-        if (duration <= 0L || position < 0L) return
-
-        val remainingMs = duration - position
-        val pctDone = position.toFloat() / duration
-        if (remainingMs !in 0..PREFETCH_LEAD_MS && pctDone < PREFETCH_PCT) return
-
-        prefetchTriggeredForEpisode = true           // claim the slot before the await
-        prefetchJob?.cancel()
-        prefetchJob = viewModelScope.launch { warmEpisode() }
-    }
-
-    private suspend fun warmEpisode() {
-        val d = details ?: return
         val s = currentSeason ?: return
         val e = currentEpisode ?: return
-        val (nextSeason, nextEpisode) = nextEpisodeCoords(d, s, e) ?: return
+        if (warmAttemptedFor == s to e) return
+        if (android.os.SystemClock.elapsedRealtime() < warmRetryAtMs) return
+        // Read from whichever local backend is actually playing. This used to be `_player.value`, the
+        // EXOPLAYER flow — but ensureVlcPlayer() sets it to null and keeps the player in `vlcPlayer`, so
+        // every source on the libVLC fallback (HEVC/AV1/DTS releases, and every `playable == false`
+        // source, which is routed to VLC from the start) never warmed at all. progressSnapshot already
+        // reads it this way; the warm was simply never updated to match.
+        val p: Player = _player.value ?: vlcPlayer ?: return
+        val duration = p.duration
+        val position = p.currentPosition
+        if (!NextEpisodeWarm.shouldWarmNow(position, duration, endThresholds.value.first)) return
+
+        warmAttemptedFor = s to e                    // claim the slot before the await
+        prefetchJob?.cancel()
+        prefetchJob = viewModelScope.launch { warmEpisode(s, e, duration) }
+    }
+
+    private suspend fun warmEpisode(fromSeason: Int, fromEpisode: Int, durationMs: Long) {
+        val d = details ?: return
+        val (nextSeason, nextEpisode) = nextEpisodeCoords(d, fromSeason, fromEpisode) ?: return
+        val upNextPct = endThresholds.value.first
+        warmPhase = WarmPhase.WARMING
+        diagnostics.breadcrumb(
+            "warmStart lead=${NextEpisodeWarm.leadMs(durationMs, upNextPct) / 1000}s card=${(upNextPct * 100).toInt()}%",
+        )
 
         val sources = when (val r = sourceRepository.resolve(d, nextSeason, nextEpisode)) {
             is DataResult.Success -> r.data
-            is DataResult.Error -> return
+            is DataResult.Error -> return failWarm("resolve")
         }
-        if (sources.isEmpty()) return
+        if (sources.isEmpty()) return failWarm("no_sources")
         val best = pickPreferred(sources, networkQualityPreference())
 
+        // A DIRECT (Real-Debrid / file-server) source needs no warm — it plays in about a second — and
+        // must NOT be pinned: its identity is syntheticHash(directUrl), a SHA-1 of a URL that RD
+        // re-mints on every resolve. The old code recorded that ghost hash as the warm target AND wrote
+        // it into the target episode's progress row, permanently poisoning that row's resume hash.
+        if (best.isDirect) {
+            warmPhase = WarmPhase.READY
+            diagnostics.breadcrumb("warmSkip reason=direct")
+            return
+        }
+
+        // Publish the PIN FIRST — before the same-pack check and before the blocking head-fill — so the
+        // hop always starts the release the warm chose, even when there are no bytes to pre-fetch.
+        // Without this the pack case published nothing and the hop re-ranked from a fresh resolve,
+        // landing on a cold stranger instead of the pack that is already attached and paused in session.
+        warmed = NextEpisodeWarm.Warmed(nextSeason, nextEpisode, best)
+
         val playing = activeInfoHash
-        if (best.infoHash == playing) return
-        // Publish the warm target NOW — BEFORE the blocking head-fill in prefetch() — so an early
-        // next-episode hop can reuse this torrent mid-warm. With the in-session keep (engine stop change),
-        // even a half-warmed torrent is paused-in-session, so startSource() re-attaches + resumes it.
-        prefetchedInfoHash = best.infoHash
-        if (best.isDirect) return   // direct http/hls plays instantly — nothing to pre-warm
-        if (best.infoHash in torrentStreamer.cachedTorrents()) return
-        torrentStreamer.prefetch(best, setOfNotNull(playing))
+        if (best.infoHash.equals(playing, ignoreCase = true)) {
+            // SEASON PACK: the next episode is a different FILE inside the torrent already streaming.
+            // prefetch() legitimately refuses this (one ActiveTorrent has one selected file), so warm it
+            // in place — raise-only, no deadlines, spare capacity only.
+            val raised = torrentStreamer.warmPackFile(
+                infoHash = playing!!,
+                fileIndex = best.fileIndex,
+                season = best.expectedSeason ?: nextSeason,
+                episode = best.expectedEpisode ?: nextEpisode,
+            )
+            warmPhase = if (raised) WarmPhase.READY else WarmPhase.IDLE
+            if (raised) warmed = warmed?.copy(headReady = true)
+            diagnostics.breadcrumb("warmPack raised=$raised")
+            return
+        }
+
+        // NOTE: there is deliberately no `infoHash in cachedTorrents()` fast-path here any more.
+        // cachedTorrents() means "has any on-disk footprint" — hasData() accepts a bare
+        // .meta/<hash>.torrent or the empty per-hash directory torrentSavePath() mkdirs at add time — so
+        // any earlier add of this hash (a cancelled Details prewarm, a source that was tried and failed
+        // over) marked it "cached" with ZERO payload bytes and skipped the warm entirely while still
+        // publishing the pin. prefetch() is idempotent and cheap on an already-warm hash: it re-attaches
+        // rather than re-adding, and its head loop breaks on the first poll.
+        val hash = torrentStreamer.prefetch(best, setOfNotNull(playing))
+        if (hash == null) {
+            // The magnet is dead (metadata timed out / unparseable). Drop the pin so the hop re-ranks
+            // instead of confidently starting a torrent that does not exist, and allow a retry — the
+            // next-best source may be fine.
+            warmed = null
+            return failWarm("prefetch")
+        }
+        // ASK, don't assume. prefetch() returns its hash as soon as the torrent is attached and keeps
+        // returning it when the head loop exhausts its budget, because those partial bytes are still
+        // worth protecting. Inferring readiness from a non-null return announced "next episode ready"
+        // for a 3-seeder magnet with ~1 MB of head, and then let fastStart launch it with a one-entry
+        // source list and nothing to fail over to. The pin is still published either way — the release
+        // choice is good and the bytes are real — but only a genuine head+index earns the fast path.
+        val ready = torrentStreamer.warmHeadReady(hash)
+        warmPhase = if (ready) WarmPhase.READY else WarmPhase.WARMING
+        warmed = warmed?.copy(headReady = ready)
+        diagnostics.breadcrumb("warmReady=$ready src=${best.diagTag()}")
+    }
+
+    /** A warm that produced nothing: release the one-shot slot behind a backoff so the next tick can try
+     *  again (the old code burned the slot for the whole episode on the first failure). */
+    private fun failWarm(reason: String) {
+        warmPhase = WarmPhase.IDLE
+        warmAttemptedFor = null
+        warmRetryAtMs = android.os.SystemClock.elapsedRealtime() + WARM_RETRY_BACKOFF_MS
+        diagnostics.breadcrumb("warmFail reason=$reason")
     }
 
     /** Next-episode coordinates: same-season next, else episode 1 of the next real season. */
@@ -2421,7 +2520,14 @@ class PlayerViewModel @Inject constructor(
             val fromSeason = currentSeason
             val fromEpisode = currentEpisode
             val outgoingInfoHash = activeInfoHash
-            val targetInfoHash = prefetchedInfoHash
+            // The warm we can actually redeem for THIS target: keyed to (season, episode) because
+            // playEpisode is also the episode-list and previous-episode path. A season pack carries the
+            // same btih for every episode, so an unkeyed hash lookup used to "match" a warm computed for
+            // a different episode and start a release picked for it.
+            val warm = warmed?.takeIf { it.season == season && it.episode == episode }
+            // Only a real torrent hash may land in the progress row. A direct source's hash is a SHA-1 of
+            // a per-request RD URL, and storing it poisons the row's resume hash forever.
+            val targetInfoHash = warm?.source?.takeUnless { it.isDirect }?.infoHash
             // Snapshot BEFORE suppressing saves; persist it synchronously with the target row below.
             // This replaces the old fire-and-forget save that could land after episode 2 had started.
             val outgoingSnapshot = if (outgoingCompleted) null else progressSnapshot()?.second
@@ -2446,13 +2552,14 @@ class PlayerViewModel @Inject constructor(
             rebufferWatchdogJob?.cancel()
             _rebuffering.value = null
             stopActiveStream(removeFiles = false)
-            // Capture the next-episode torrent we PRE-WARMED before clearing it, so the source pick below
-            // can reuse it (its head + moov are already buffered) instead of re-ranking from scratch and
-            // possibly landing on a different, cold release — which is why "precache next episode" looked
-            // like it did nothing.
-            val warmedHash = prefetchedInfoHash
+            // The warm is consumed: clear the pin and re-arm the trigger for the episode we're entering.
+            // The warmed BYTES are not discarded — the streamer keeps its eviction protection and the
+            // torrent stays paused-in-session, so start() re-attaches and finishes it via StartGate.
             prefetchJob?.cancel()
-            prefetchedInfoHash = null
+            warmed = null
+            warmAttemptedFor = null
+            warmRetryAtMs = 0L
+            warmPhase = WarmPhase.IDLE
 
             currentSeason = season
             currentEpisode = episode
@@ -2472,6 +2579,38 @@ class PlayerViewModel @Inject constructor(
 
             // Reload subtitles for the new episode.
             viewModelScope.launch { loadSubtitles(d) }
+
+            // FAST PATH — the whole point of precaching. When the pin is for THIS episode and its head
+            // (plus index, where the container needs one) is already on disk, start it NOW. Redeeming
+            // only after the resolve meant every hop still paid for a full addon fan-out first, and that
+            // fan-out is guaranteed cold: ResolveKey is per-episode and the cache TTL is 30 s while the
+            // warm ran minutes earlier. That single await was the difference between "~1 second" and
+            // "Finding sources…", i.e. between the feature working and appearing not to exist.
+            // The real candidate list is still fetched, in the background, purely to fill the source
+            // picker and the failover pool.
+            NextEpisodeWarm.fastStart(warm, season, episode)?.let { warmSource ->
+                _sources.value = listOf(warmSource)
+                triedInfoHashes.clear()
+                failoverCount = 0
+                directFailoverCount = 0
+                diagnostics.breadcrumb("warmFastStart src=${warmSource.diagTag()}")
+                startSource(warmSource)
+                viewModelScope.launch {
+                    val full = (sourceRepository.resolve(d, season, episode) as? DataResult.Success)?.data
+                    // Only adopt if the user is still on this episode — a hop or a Back can land first.
+                    if (full != null && currentSeason == season && currentEpisode == episode) {
+                        _sources.value = (
+                            listOf(warmSource) +
+                                full.filterNot { it.infoHash.equals(warmSource.infoHash, ignoreCase = true) }
+                                    .sortedWith(
+                                        compareByDescending<StreamSource> { it.isDirect }
+                                            .thenByDescending { it.rank },
+                                    )
+                            )
+                    }
+                }
+                return@launch
+            }
 
             _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Finding sources…")
             val list = when (val r = sourceRepository.resolve(d, currentSeason, currentEpisode)) {
@@ -2499,10 +2638,34 @@ class PlayerViewModel @Inject constructor(
             triedInfoHashes.clear()
             failoverCount = 0
             directFailoverCount = 0
-            // Prefer the torrent we PRE-WARMED for this episode (instant start), then one we already
-            // partly downloaded, then a fresh auto-pick.
-            val best = warmedHash?.let { w -> list.firstOrNull { it.infoHash == w } }
-                ?: pickResumeOrPreferred(list, currentSeason, currentEpisode)
+            // Prefer the release we PRE-WARMED for this episode (its head + index are on disk), then one
+            // we already partly downloaded, then a fresh auto-pick.
+            //
+            // Prefer-if-ELIGIBLE, never force: redeem() re-validates the pin against this device's
+            // current quality/decoder gates with the same StreamPicker.isResumeCompatible the saved-
+            // resume path uses, and returns null to mean "re-rank normally". Crucially it can also
+            // REPLAY the warmed StreamSource object when this fresh resolve has lost that row — the
+            // resolve cache TTL is 30 s and the warm ran minutes ago, so this is a second real addon
+            // fan-out and one addon timing out was enough to silently discard the whole warm.
+            val preference = networkQualityPreference()
+            val redeemed = NextEpisodeWarm.redeem(
+                warm = warm,
+                season = season,
+                episode = episode,
+                candidates = list,
+                maxTier = minOf(preference.maxTier, deviceProfile.maxDisplayTier),
+                lowPower = deviceProfile.isLowPower,
+            )
+            diagnostics.breadcrumb(
+                "warmRedeem hit=${redeemed != null} pinned=${warm != null} " +
+                    "inFreshList=${warm != null && list.any { it.infoHash.equals(warm.source.infoHash, true) }}",
+            )
+            // A replayed release that the fresh resolve dropped is not in the picker list — splice it in
+            // so the source panel shows what is actually playing.
+            if (redeemed != null && list.none { it.infoHash.equals(redeemed.infoHash, ignoreCase = true) }) {
+                _sources.value = listOf(redeemed) + _sources.value
+            }
+            val best = redeemed ?: pickResumeOrPreferred(list, currentSeason, currentEpisode)
             startSource(best)
         }
     }
@@ -2628,10 +2791,11 @@ class PlayerViewModel @Inject constructor(
          *  down instead of abandoning a healthy torrent. ~2 MB/s comfortably exceeds any <=1080p bitrate. */
         const val HEALTHY_RATE_BYTES = 2 * 1024 * 1024
         const val PROGRESS_INTERVAL_MS = 10_000L
-        /** Start warming the next episode when this close to the end (~3 min). */
-        const val PREFETCH_LEAD_MS = 3 * 60_000L
-        /** ...or once past this fraction of the runtime, whichever comes first. */
-        const val PREFETCH_PCT = 0.85f
+
+        /** After a failed next-episode warm (dead magnet / no sources), wait this long before the ticker
+         *  may try again. The old code set a one-shot boolean and never retried for the whole episode,
+         *  so a single slow-metadata swarm produced a WORSE outcome than no precache at all. */
+        const val WARM_RETRY_BACKOFF_MS = 45_000L
 
         /** Contiguous head gate used by TorrentStreamer before it emits READY. MP4 tail readiness is
          *  represented separately by the streamer's ETA; keeping this identical prevents a 33% bar
