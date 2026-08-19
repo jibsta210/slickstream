@@ -814,6 +814,15 @@ class TorrentEngine @Inject constructor(
      * than the one currently selected — the season-pack next-episode case — re-run [selectFile] so the
      * piece range, path and priorities move to the requested episode. A null/invalid preferred index
      * keeps the existing selection untouched.
+     *
+     * IMPORTANT: when a specific episode WAS requested and we cannot identify it, this must not return
+     * quietly. It used to, and that made the two paths disagree about the same pack: [selectFile]
+     * refuses to guess and throws, while a re-attach silently kept whatever was already selected — the
+     * episode the user just finished watching. Whether you got an honest error or the previous episode
+     * playing under the next episode's title came down to nothing more than whether the torrent happened
+     * to still be in `torrents[infoHash]` (keep-paused-in-session, a Details prewarm, or the next-episode
+     * warm all leave it there), which is exactly the silent-wrong-episode outcome this code exists to
+     * prevent. So an unidentifiable episode now falls through to [selectFile] and throws there.
      */
     private fun reselectFileIfNeeded(
         handle: TorrentHandle,
@@ -832,8 +841,14 @@ class TorrentEngine @Inject constructor(
             index in 0 until files.numFiles() && isVideoFile(files.fileName(index)) &&
                 !isSampleFile(files.fileName(index))
         }
-        val episodeMatch = matchingEpisodeFile(files, expectedSeason, expectedEpisode)
-        val requested = episodeMatch ?: validPreferred
+        val match = matchEpisodeFile(files, expectedSeason, expectedEpisode)
+        val requested = resolveMatch(match, files, validPreferred) ?: validPreferred
+        if (requested == null && expectedSeason != null && expectedEpisode != null) {
+            // Unidentifiable, and an episode was asked for: hand it to selectFile, which either finds
+            // the pack has exactly one video (harmless) or throws the same error a fresh attach would.
+            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode)
+            return
+        }
         if (requested == null || requested == active.fileIndex) return
         selectFile(handle, info, active, requested, expectedSeason, expectedEpisode)
     }
@@ -865,10 +880,10 @@ class TorrentEngine @Inject constructor(
         val largestVideo = playableVideos
             .maxByOrNull { files.fileSize(it) }
 
-        val episodeMatch = matchingEpisodeFile(files, expectedSeason, expectedEpisode)
+        val match = matchEpisodeFile(files, expectedSeason, expectedEpisode)
         // Clear filename evidence beats a stale-but-in-range addon index. With no index and several
         // episode files, failing is safer than silently serving the longest/random episode.
-        val chosen = episodeMatch ?: prefValid ?: largestVideo?.takeIf {
+        val chosen = resolveMatch(match, files, prefValid) ?: prefValid ?: largestVideo?.takeIf {
             expectedSeason == null || expectedEpisode == null || playableVideos.size == 1
         }
             ?: run {
@@ -877,6 +892,11 @@ class TorrentEngine @Inject constructor(
                 // and the old message asserted the wrong one: a season pack of 23 ordinary .avi episodes
                 // whose naming we could not parse was reported as an "archive/RAR release", which sent
                 // the user (and me) looking for a RAR that was never there.
+                //
+                // There is no file-picker UI to escape to, so the message has to carry the evidence: the
+                // episodes we COULD read out of the pack are what tells the user (and the log) whether
+                // this pack simply does not contain S{x}E{y} — which is a real outcome, e.g. Netflix
+                // ships Octonauts S01 as thirteen PAIRED files — or whether the naming defeated us.
                 error(
                     if (playableVideos.isEmpty()) {
                         "No playable video file in this torrent (archive/RAR release) — " +
@@ -885,7 +905,8 @@ class TorrentEngine @Inject constructor(
                     } else {
                         "Couldn't tell which file is S${expectedSeason}E$expectedEpisode in this " +
                             "${playableVideos.size}-episode pack — try another source. " +
-                            "numFiles=$numFiles pref=$preferredFileIndex files=[$names]"
+                            "numFiles=$numFiles pref=$preferredFileIndex " +
+                            "read=[${readableEpisodes(files, playableVideos)}] files=[$names]"
                     },
                 )
             }
@@ -942,13 +963,73 @@ class TorrentEngine @Inject constructor(
 
     /** Recover a pack episode when the addon omitted fileIdx. Torrent filenames overwhelmingly encode
      *  SxxExx or 1x02; selecting the largest file silently chose a random/long episode. */
-    private fun matchingEpisodeFile(files: FileStorage, season: Int?, episode: Int?): Int? {
-        if (season == null || episode == null) return null
+    private fun matchEpisodeFile(files: FileStorage, season: Int?, episode: Int?): EpisodeFileMatcher.Match {
+        if (season == null || episode == null) return EpisodeFileMatcher.Match.None
         val names = (0 until files.numFiles()).map { files.filePath(it) }
-        return EpisodeFileMatcher.indexOf(names, season, episode) { path ->
+        return EpisodeFileMatcher.resolve(names, season, episode) { path ->
             val name = path.substringAfterLast('/')
             isVideoFile(name) && !isSampleFile(name)
         }
+    }
+
+    /**
+     * The episode codes we could actually READ out of the pack, e.g. "S1E1,S1E2-3,S1E4-5". Without a
+     * file-picker UI this is the user's only clue, and it answers the question the raw file list does
+     * not: "is my episode simply not in here?".
+     */
+    private fun readableEpisodes(files: FileStorage, playable: List<Int>): String =
+        playable.take(30).joinToString(",") { i ->
+            val path = files.filePath(i)
+            val codes = EpisodeFileMatcher.explicitCodes(path)
+                .ifEmpty { EpisodeFileMatcher.compactCodes(path.substringAfterLast('/')) }
+            if (codes.isEmpty()) {
+                "?"
+            } else {
+                val season = codes.first().first
+                val eps = codes.filter { it.first == season }.map { it.second }
+                "S$season" + "E" + eps.min() + if (eps.max() != eps.min()) "-${eps.max()}" else ""
+            }
+        }
+
+    /**
+     * Collapse a [EpisodeFileMatcher.Match] to one file index, or null to let the caller decide.
+     *
+     * The Ambiguous case is safe to break here and ONLY here: every candidate the matcher reports
+     * CLAIMS THE REQUESTED EPISODE (that is how each tier builds its hit list), so this can never play a
+     * different episode — the tie is between two copies of the same one, e.g. a PROPER alongside the
+     * original, or an ENG/JPN dual-audio pair. Preferring the addon's own fileIdx when it names one of
+     * them, then the largest, picks the full episode over a short commentary/recap variant. The
+     * refusal that actually matters — "several DIFFERENT episodes and no way to tell which" — is
+     * [EpisodeFileMatcher.Match.None], which is not resolved here.
+     */
+    private fun resolveMatch(
+        match: EpisodeFileMatcher.Match,
+        files: FileStorage,
+        prefValid: Int?,
+    ): Int? = when (match) {
+        is EpisodeFileMatcher.Match.Unique -> match.index
+        is EpisodeFileMatcher.Match.Ambiguous -> {
+            // An addon that named a specific file breaks the tie outright — that is outside evidence.
+            val byAddon = prefValid?.takeIf { it in match.indices }
+            // Otherwise "pick the biggest" is only safe when the tied files are INTERCHANGEABLE, i.e.
+            // every one of them states the SAME set of episodes: a PROPER/REPACK beside the original, a
+            // 1080p/720p pair, a dual-audio duplicate. Then the largest is simply the best copy of the
+            // right episode.
+            // When the sets DIFFER the tie is between DIFFERENT episodes, and taking the largest is the
+            // "wrong episode plays and nothing tells the viewer" outcome this whole path exists to
+            // prevent. Refuse, and let selectFile fail with a message naming the files.
+            val interchangeable = match.indices
+                .map { EpisodeFileMatcher.basenameCodes(files.filePath(it)).toSet() }
+                .distinct().size == 1
+            val chosen = byAddon ?: match.indices.maxByOrNull { files.fileSize(it) }.takeIf { interchangeable }
+            Log.w(
+                TAG,
+                "episode match ambiguous (${match.evidence}) interchangeable=$interchangeable among " +
+                    "[${match.indices.joinToString { files.fileName(it) }}] -> idx=$chosen",
+            )
+            chosen
+        }
+        EpisodeFileMatcher.Match.None -> null
     }
 
     private fun applySequentialAndPriority(handle: TorrentHandle, active: ActiveTorrent) {
@@ -1306,10 +1387,11 @@ class TorrentEngine @Inject constructor(
         if (numFiles <= 1) return null   // single-file release: there is no other episode in here
 
         // Same precedence as selectFile: filename evidence beats a possibly-stale addon file index.
-        val target = matchingEpisodeFile(files, expectedSeason, expectedEpisode)
-            ?: preferredFileIndex?.takeIf {
-                it in 0 until numFiles && isVideoFile(files.fileName(it)) && !isSampleFile(files.fileName(it))
-            }
+        val prefValid = preferredFileIndex?.takeIf {
+            it in 0 until numFiles && isVideoFile(files.fileName(it)) && !isSampleFile(files.fileName(it))
+        }
+        val target = resolveMatch(matchEpisodeFile(files, expectedSeason, expectedEpisode), files, prefValid)
+            ?: prefValid
             ?: return null
         // The file the user is watching needs no help, and touching it here could only collide with the
         // head/read-ahead bands that are already deadlined for it.
@@ -2521,9 +2603,15 @@ class TorrentEngine @Inject constructor(
             "udp://opentracker.io:6969/announce",
         )
 
+        // Archive/disc extensions stay OUT on purpose: a .rar/.iso release must still hard-fail with
+        // "no playable video" so the player fails over. The extras here are ordinary episode containers
+        // (divx/ogm/rmvb/3gp/…) whose absence turned a perfectly playable pack into that same
+        // "archive/RAR release" misdiagnosis — the exact wrong-error bug the compact-numbering fix
+        // removed for Law & Order, re-created by file extension instead of by file name.
         private val VIDEO_EXTS = setOf(
             "mp4", "mkv", "avi", "webm", "mov", "m4v", "flv", "ts",
             "wmv", "asf", "mpg", "mpeg", "m2ts", "mts", "vob", "ogv",
+            "divx", "ogm", "rm", "rmvb", "3gp", "m2v", "mpe", "mpv", "f4v",
         )
         private val MOOV_EXTS = setOf("mp4", "m4v", "mov")
 
