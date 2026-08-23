@@ -75,6 +75,39 @@ enum class SubtitleLanguage(val label: String, val code: String) {
     HINDI("Hindi", "hin"),
 }
 
+/**
+ * Preferred AUDIO language — the language the film should actually be SPOKEN in.
+ *
+ * Separate from [SubtitleLanguage] on purpose: plenty of people want English audio with Spanish subs
+ * (or the reverse), and until now the audio preference was a hardcoded "en" literal buried in the
+ * ExoPlayer builder, which the libVLC backend never saw at all — the reason a MULTI release of
+ * "Mutiny" played in Chinese with no way out.
+ *
+ * [code] is ISO-639-1; every other form a container might write ("eng", "English", "en-US") is
+ * normalised at match time by
+ * [com.slickstream.feature.player.AudioTrackChoice.normalizeCode], so this list stays short.
+ */
+enum class AudioLanguage(val label: String, val code: String) {
+    ENGLISH("English", "en"),
+    SPANISH("Spanish", "es"),
+    FRENCH("French", "fr"),
+    GERMAN("German", "de"),
+    ITALIAN("Italian", "it"),
+    PORTUGUESE("Portuguese", "pt"),
+    DUTCH("Dutch", "nl"),
+    RUSSIAN("Russian", "ru"),
+    ARABIC("Arabic", "ar"),
+    HINDI("Hindi", "hi"),
+    JAPANESE("Japanese", "ja"),
+    KOREAN("Korean", "ko"),
+    CHINESE("Chinese", "zh"),
+    ;
+
+    companion object {
+        val DEFAULT = ENGLISH
+    }
+}
+
 /** Subtitle text size, as a fraction of the view height (Media3 SubtitleView.setFractionalTextSize). */
 enum class SubtitleSize(val label: String, val fraction: Float) {
     // Fraction of the VIEW HEIGHT, so it scales with the panel — which is why the old values looked
@@ -124,6 +157,8 @@ data class AppSettings(
     val density: UiDensity = UiDensity.COMFORTABLE,
     val subtitlesEnabled: Boolean = false,
     val subtitleLanguage: SubtitleLanguage = SubtitleLanguage.ENGLISH,
+    /** The language films/shows should be SPOKEN in. Applied to BOTH playback backends. */
+    val audioLanguage: AudioLanguage = AudioLanguage.DEFAULT,
     val subtitleSize: SubtitleSize = SubtitleSize.DEFAULT,
     val subtitleStyle: SubtitleStyle = SubtitleStyle.DEFAULT,
     val streamSize: StreamSizePreference = StreamSizePreference.DEFAULT,
@@ -201,6 +236,8 @@ class SettingsRepository @Inject constructor(
             subtitlesEnabled = p[KEY_SUBS_ON] ?: false,
             subtitleLanguage = p[KEY_SUB_LANG]?.let { runCatching { SubtitleLanguage.valueOf(it) }.getOrNull() }
                 ?: SubtitleLanguage.ENGLISH,
+            audioLanguage = p[KEY_AUDIO_LANG]?.let { runCatching { AudioLanguage.valueOf(it) }.getOrNull() }
+                ?: AudioLanguage.DEFAULT,
             subtitleSize = p[KEY_SUB_SIZE]?.let { runCatching { SubtitleSize.valueOf(it) }.getOrNull() }
                 ?: SubtitleSize.DEFAULT,
             subtitleStyle = p[KEY_SUB_STYLE]?.let { runCatching { SubtitleStyle.valueOf(it) }.getOrNull() }
@@ -233,6 +270,7 @@ class SettingsRepository @Inject constructor(
     suspend fun setDensity(d: UiDensity) = dataStore.edit { it[KEY_DENSITY] = d.name; it.stampSynced() }
     suspend fun setSubtitlesEnabled(enabled: Boolean) = dataStore.edit { it[KEY_SUBS_ON] = enabled; it.stampSynced() }
     suspend fun setSubtitleLanguage(lang: SubtitleLanguage) = dataStore.edit { it[KEY_SUB_LANG] = lang.name; it.stampSynced() }
+    suspend fun setAudioLanguage(lang: AudioLanguage) = dataStore.edit { it[KEY_AUDIO_LANG] = lang.name; it.stampSynced() }
     suspend fun setSubtitleSize(size: SubtitleSize) = dataStore.edit { it[KEY_SUB_SIZE] = size.name; it.stampSynced() }
     suspend fun setSubtitleStyle(style: SubtitleStyle) = dataStore.edit { it[KEY_SUB_STYLE] = style.name; it.stampSynced() }
     suspend fun setStreamSize(s: StreamSizePreference) = dataStore.edit { it[KEY_STREAM_SIZE] = s.name; it.stampSynced() }
@@ -303,6 +341,7 @@ class SettingsRepository @Inject constructor(
             "density" to s.density.name,
             "subtitlesEnabled" to s.subtitlesEnabled,
             "subtitleLanguage" to s.subtitleLanguage.name,
+            "audioLanguage" to s.audioLanguage.name,
             "subtitleSize" to s.subtitleSize.name,
             "subtitleStyle" to s.subtitleStyle.name,
             "streamSize" to s.streamSize.name,
@@ -333,6 +372,7 @@ class SettingsRepository @Inject constructor(
             (remote["density"] as? String)?.let { v -> if (runCatching { UiDensity.valueOf(v) }.isSuccess) p[KEY_DENSITY] = v }
             (remote["subtitlesEnabled"] as? Boolean)?.let { p[KEY_SUBS_ON] = it }
             (remote["subtitleLanguage"] as? String)?.let { v -> if (runCatching { SubtitleLanguage.valueOf(v) }.isSuccess) p[KEY_SUB_LANG] = v }
+            (remote["audioLanguage"] as? String)?.let { v -> if (runCatching { AudioLanguage.valueOf(v) }.isSuccess) p[KEY_AUDIO_LANG] = v }
             (remote["subtitleSize"] as? String)?.let { v -> if (runCatching { SubtitleSize.valueOf(v) }.isSuccess) p[KEY_SUB_SIZE] = v }
             (remote["subtitleStyle"] as? String)?.let { v -> if (runCatching { SubtitleStyle.valueOf(v) }.isSuccess) p[KEY_SUB_STYLE] = v }
             (remote["streamSize"] as? String)?.let { v -> if (runCatching { StreamSizePreference.valueOf(v) }.isSuccess) p[KEY_STREAM_SIZE] = v }
@@ -384,6 +424,7 @@ class SettingsRepository @Inject constructor(
         val KEY_DENSITY = stringPreferencesKey("ui_density")
         val KEY_SUBS_ON = booleanPreferencesKey("subs_enabled")
         val KEY_SUB_LANG = stringPreferencesKey("sub_language")
+        val KEY_AUDIO_LANG = stringPreferencesKey("audio_language")
         val KEY_SUB_SIZE = stringPreferencesKey("sub_size")
         val KEY_SUB_STYLE = stringPreferencesKey("sub_style")
         val KEY_STREAM_SIZE = stringPreferencesKey("stream_size")
@@ -402,8 +443,8 @@ class SettingsRepository @Inject constructor(
         /** Field order for [syncedSignature] — keep in sync with [syncedSettingsMap]'s keys. */
         val SYNCED_KEYS = listOf(
             "wifiQuality", "cellularQuality", "density", "subtitlesEnabled", "subtitleLanguage",
-            "subtitleSize", "subtitleStyle", "streamSize", "upNextPercent", "movieBarPercent",
-            "customSourceUrl",
+            "audioLanguage", "subtitleSize", "subtitleStyle", "streamSize", "upNextPercent",
+            "movieBarPercent", "customSourceUrl",
         )
 
         // Calibration bounds (shared by the persisted read/write and the live in-memory preview).

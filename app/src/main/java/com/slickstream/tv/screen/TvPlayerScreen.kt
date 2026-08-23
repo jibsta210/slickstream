@@ -52,6 +52,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.focusGroup
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
@@ -137,6 +138,8 @@ fun TvPlayerScreen(
     val subtitles by viewModel.subtitles.collectAsStateWithLifecycle()
     val currentSubtitle by viewModel.currentSubtitle.collectAsStateWithLifecycle()
     val audioTracks by viewModel.audioTracks.collectAsStateWithLifecycle()
+    val currentAudio by viewModel.currentAudio.collectAsStateWithLifecycle()
+    val audioNeedsAttention by viewModel.audioNeedsAttention.collectAsStateWithLifecycle()
     val captionPrefs by viewModel.captionPrefs.collectAsStateWithLifecycle()
     val episodes by viewModel.episodes.collectAsStateWithLifecycle()
     val currentSeasonNumber by viewModel.currentSeasonNumber.collectAsStateWithLifecycle()
@@ -499,7 +502,13 @@ fun TvPlayerScreen(
                         controlsVisible = true
                         if (subtitles.isEmpty()) viewModel.refreshSubtitles()
                     },
-                    showAudioButton = audioTracks.size > 1,
+                    // isNotEmpty, not size > 1: with ONE track the panel is informational and tells
+                    // you what you're listening to. Hiding it at size<=1 meant the picker — the only
+                    // place the app ever named the playing language — vanished exactly when a
+                    // single wrong-language track made that information most valuable.
+                    showAudioButton = audioTracks.isNotEmpty(),
+                    audioLabel = currentAudio?.language?.takeIf { it.isNotBlank() }?.uppercase(),
+                    audioNeedsAttention = audioNeedsAttention,
                     onOpenAudio = { audioPanelOpen = true; controlsVisible = true },
                     // Episode navigation — only present for TV shows (episode list resolved).
                     hasEpisodes = episodes.isNotEmpty(),
@@ -652,6 +661,8 @@ fun TvPlayerScreen(
         ) {
             AudioPanel(
                 tracks = audioTracks,
+                current = currentAudio,
+                needsAttention = audioNeedsAttention,
                 onSelect = { track ->
                     viewModel.selectAudioTrack(track)
                     audioPanelOpen = false
@@ -1044,6 +1055,10 @@ private fun TransportOverlay(
     subtitlesActive: Boolean,
     onOpenSubtitles: () -> Unit,
     showAudioButton: Boolean,
+    /** Short code of the track playing NOW ("EN"/"ZH"), or null when it declares no language. */
+    audioLabel: String?,
+    /** The playing track isn't provably the preferred language (wrong, or undeclared). */
+    audioNeedsAttention: Boolean,
     onOpenAudio: () -> Unit,
     hasEpisodes: Boolean,
     hasPrevious: Boolean,
@@ -1090,6 +1105,17 @@ private fun TransportOverlay(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+            }
+            // Audio-language chip. Shown only once a backend has reported tracks. When the playing
+            // track declares NO language we say "unknown" rather than inferring one from the release
+            // name — the name said MULTI, which is exactly the claim we cannot resolve.
+            if (showAudioButton) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = audioLabel?.let { "Audio: $it" } ?: "Audio: unknown",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (audioNeedsAttention) Brand.Amber else Brand.OnSurfaceDim,
+                )
             }
         }
 
@@ -1153,7 +1179,20 @@ private fun TransportOverlay(
                     tint = if (subtitlesActive) Brand.Cyan else Color.White,
                 )
                 if (showAudioButton) {
-                    TransportButton(Icons.Rounded.GraphicEq, "Audio track", onOpenAudio)
+                    // Tinted like the subtitles button, but AMBER for "check this": the failure this
+                    // whole path exists for is silent — the film simply speaks the wrong language and
+                    // nothing on screen admits it. Cyan = we matched your language; amber = we
+                    // couldn't prove we did.
+                    TransportButton(
+                        Icons.Rounded.GraphicEq,
+                        audioLabel?.let { "Audio track — $it" } ?: "Audio track",
+                        onOpenAudio,
+                        tint = when {
+                            audioNeedsAttention -> Brand.Amber
+                            audioLabel != null -> Brand.Cyan
+                            else -> Color.White
+                        },
+                    )
                 }
                 TransportButton(
                     Icons.Rounded.AspectRatio,
@@ -1676,34 +1715,80 @@ private fun SourceRow(
 @Composable
 private fun AudioPanel(
     tracks: List<com.slickstream.feature.player.AudioTrackOption>,
+    current: com.slickstream.feature.player.AudioTrackOption?,
+    needsAttention: Boolean,
     onSelect: (com.slickstream.feature.player.AudioTrackOption) -> Unit,
     onClose: () -> Unit,
 ) {
     BackHandler(enabled = true) { onClose() }
     val firstFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
+    // Retry past the slide-in animation — a single requestFocus can fire before the LazyColumn's first
+    // item is placed, and runCatching then swallows the failure, leaving the panel open with NOTHING
+    // focused (D-pad dead, only BACK works). The same fix already exists twice elsewhere in this file.
+    // Keyed on the list so a late-arriving track set (libVLC reports its ES table asynchronously) also
+    // lands focus instead of opening dead.
+    LaunchedEffect(tracks) {
+        repeat(12) {
+            if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            kotlinx.coroutines.delay(50)
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxHeight()
             .width(420.dp)
             .background(Color(0xF2101019))
+            // Contain focus: the panel overlaps the transport row that is still composed BEHIND it,
+            // so a LEFT press from a track row could hand focus to a button hidden under the panel —
+            // the highlight invisible, the remote apparently dead. Swallow LEFT inside the panel
+            // (focusGroup keeps up/down traversal inside the list).
+            .focusGroup()
+            .onPreviewKeyEvent { event ->
+                event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft
+            }
             .padding(28.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         Text(text = "Audio", style = MaterialTheme.typography.titleLarge, color = Brand.OnSurface)
+        // Say what is playing RIGHT NOW. Before this, the app never named the audio language anywhere
+        // — you heard Chinese and nothing on screen acknowledged it.
         Text(
-            text = "Pick the audio track / language.",
+            text = when {
+                tracks.isEmpty() -> "No audio tracks reported yet."
+                current == null -> "Playing: unknown track"
+                else -> "Playing: ${current.label}"
+            },
             style = MaterialTheme.typography.bodyMedium,
-            color = Brand.OnSurfaceDim,
+            color = if (needsAttention) Brand.Amber else Brand.OnSurfaceDim,
         )
+        if (needsAttention && tracks.size > 1) {
+            Text(
+                text = "This release carries several audio tracks and we couldn't confirm the language. " +
+                    "Pick one below.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Brand.OnSurfaceDim,
+            )
+        }
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp),
         ) {
+            if (tracks.isEmpty()) {
+                // Always leave a focusable target: an empty LazyColumn has nothing to focus, so the
+                // panel opens with a dead remote.
+                item {
+                    TvSubtitleRow(
+                        label = "Nothing to choose",
+                        selected = false,
+                        modifier = Modifier.focusRequester(firstFocus),
+                    ) { onClose() }
+                }
+            }
             itemsIndexed(tracks, key = { _, t -> t.id }) { index, track ->
                 TvSubtitleRow(
                     label = track.label,
                     selected = track.selected,
+                    maxLines = 2,
                     modifier = if (index == 0) Modifier.focusRequester(firstFocus) else Modifier,
                 ) { onSelect(track) }
             }
@@ -1813,6 +1898,9 @@ private fun TvSubtitleRow(
     label: String,
     selected: Boolean,
     accent: Boolean = false,
+    /** 2 for the audio picker: its rows carry language + codec + channels, and clipping that detail
+     *  to one line is what made three untagged tracks look identical. */
+    maxLines: Int = 1,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
@@ -1842,8 +1930,9 @@ private fun TvSubtitleRow(
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelLarge,
-                maxLines = 1,
+                maxLines = maxLines,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
             )
             if (selected) {
                 Spacer(Modifier.width(10.dp))

@@ -22,6 +22,9 @@ object Brand {
     val OnSurfaceDim = Color(0xFF9A9AA8)
     val Error = Color(0xFFFF5470)
     val Star = Color(0xFFFFC857)
+    /** "Check this" — a warning that isn't an error. Used for the player's audio control when the
+     *  playing track can't be proved to be the user's language (wrong, or undeclared). */
+    val Amber = Color(0xFFFFB020)
 }
 
 private val SlickDarkColors = darkColorScheme(

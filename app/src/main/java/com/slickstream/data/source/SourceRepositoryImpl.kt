@@ -391,6 +391,10 @@ class SourceRepositoryImpl @Inject constructor(
             // Detect language from the FULL text (filename + Torrentio title/description), not just
             // the short label — so a Russian/foreign release is de-prioritized in favour of English.
             englishLikely = StreamPicker.looksEnglish(haystack, movieTitle),
+            // "MULTi"/"DUAL AUDIO" is not a rejection (those releases usually DO carry English) — it
+            // tells the PLAYER that this file holds several languages, so an untagged audio track set
+            // must never be resolved by trusting the container's default.
+            multiAudio = StreamPicker.looksMultiAudio(haystack),
             // Detect the codec/container so an undecodable XviD/AVI release is never auto-picked over
             // a playable x264 (the "valid torrent, black screen" bug).
             playable = StreamPicker.looksPlayable(haystack),

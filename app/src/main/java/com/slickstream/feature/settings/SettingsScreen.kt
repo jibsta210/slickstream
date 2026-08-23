@@ -40,6 +40,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.slickstream.data.settings.CacheSize
 import com.slickstream.data.settings.QualityPreference
+import com.slickstream.data.settings.AudioLanguage
 import com.slickstream.data.settings.SubtitleLanguage
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
@@ -224,6 +225,23 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(6.dp))
             Hint("Hides Hindi, Tamil, Telugu, Malayalam and other Indian-language titles from every listing — Home, Movies, TV and search. Doesn't affect anything you've already saved.")
+        }
+
+        SettingsSection("Audio") {
+            OptionGroup(
+                label = "Preferred language",
+                options = AudioLanguage.entries,
+                selected = settings.audioLanguage,
+                labelOf = { it.label },
+                onSelect = viewModel::setAudioLanguage,
+            )
+            Spacer(Modifier.height(6.dp))
+            Hint(
+                "The language films and shows should be SPOKEN in. Applied to both playback engines. " +
+                    "Multi-language releases (\"MULTi\", \"DUAL AUDIO\") often don't label their tracks — " +
+                    "when we can't tell, the player says so and the audio button turns amber instead of " +
+                    "quietly picking one.",
+            )
         }
 
         SettingsSection("Subtitles") {

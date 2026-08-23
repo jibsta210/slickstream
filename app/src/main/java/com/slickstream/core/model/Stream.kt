@@ -22,6 +22,11 @@ data class StreamSource(
     val isPack: Boolean = false,
     /** False when the torrent text signals a non-English language (so we can default to English). */
     val englishLikely: Boolean = true,
+    /** True when the release NAME advertises several audio languages ("MULTI", "DUAL AUDIO", "VFF").
+     *  Such a release is still English-watchable — so it is deliberately NOT rejected — but its
+     *  container default proves nothing about which language plays, so the player must not lean on it
+     *  when the tracks themselves are untagged. See [com.slickstream.feature.player.AudioTrackChoice]. */
+    val multiAudio: Boolean = false,
     /** False when the release names a codec/container ExoPlayer can't decode (XviD/DivX/AVI/WMV…). */
     val playable: Boolean = true,
     /** True when the release name marks it a CAM / TS / TELESYNC (a filmed-in-cinema rip — terrible

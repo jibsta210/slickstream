@@ -132,6 +132,7 @@ class TrackerFallback @Inject constructor(
         expectedEpisode = episode,
         isPack = StreamPicker.looksLikePack(label, null),
         englishLikely = StreamPicker.looksEnglish(label, ""),
+        multiAudio = StreamPicker.looksMultiAudio(label),
         playable = StreamPicker.looksPlayable(label),
         isCam = StreamPicker.looksLikeCam(label, ""),
         frontIndexContainer = StreamPicker.looksFrontIndexContainer(label),

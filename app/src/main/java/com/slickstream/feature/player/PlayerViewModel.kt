@@ -44,6 +44,7 @@ import com.slickstream.core.repository.SourceRepository
 import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.core.model.SubtitleTrack
 import com.slickstream.data.download.DownloadManager
+import com.slickstream.data.settings.AudioLanguage
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.settings.StreamSizePreference
@@ -107,10 +108,19 @@ data class RebufferState(
     val payloadRateBytes: Int,
 )
 
-/** One selectable audio track for the in-player audio picker. [id] is "groupIndex:trackIndex" over the
- *  ExoPlayer audio track groups. */
+/**
+ * One selectable audio track for the in-player audio picker.
+ *
+ * [id] is backend-scoped: "groupIndex:trackIndex" over the ExoPlayer audio track groups, or
+ * "vlc:<esId>" for a libVLC elementary stream. [PlayerViewModel.selectAudioTrack] routes on the prefix,
+ * so a stale id from the other backend can never be applied to the wrong player.
+ *
+ * [label] comes from [AudioTrackChoice.describe] and is guaranteed to DISTINGUISH the tracks — the old
+ * `Format.label ?: languageName` rendered three identical "Unknown" rows on an untagged MULTI file.
+ */
 data class AudioTrackOption(
     val id: String,
+    /** Resolved ISO-639-1 code ("en", "zh"), or "" when the track identifies no language at all. */
     val language: String,
     val label: String,
     val selected: Boolean,
@@ -435,9 +445,49 @@ class PlayerViewModel @Inject constructor(
     private val _currentSubtitle = MutableStateFlow<SubtitleTrack?>(null)
     val currentSubtitle: StateFlow<SubtitleTrack?> = _currentSubtitle.asStateFlow()
 
-    // --- Audio tracks (manual selector; default is English via setPreferredAudioLanguage) ---
+    // --- Audio tracks -------------------------------------------------------------------------
+    // Populated by BOTH backends (ExoPlayer's onTracksChanged and libVLC's ESAdded/ESSelected), so the
+    // one picker the UI renders works whichever player is running. It used to be written only by the
+    // ExoPlayer listener, which is why a source that routed to libVLC showed NO audio button at all
+    // while VLC was happily decoding three tracks.
     private val _audioTracks = MutableStateFlow<List<AudioTrackOption>>(emptyList())
     val audioTracks: StateFlow<List<AudioTrackOption>> = _audioTracks.asStateFlow()
+
+    /** The track playing RIGHT NOW, as the transport chip shows it ("English · AC3 · 5.1"), or null
+     *  before any backend has reported. Nothing outside the picker used to say what you were hearing. */
+    private val _currentAudio = MutableStateFlow<AudioTrackOption?>(null)
+    val currentAudio: StateFlow<AudioTrackOption?> = _currentAudio.asStateFlow()
+
+    /** True when the playing track is NOT provably the user's preferred language — either it declares
+     *  a different one, or it declares nothing at all. Drives the amber tint on the audio button and
+     *  the "we couldn't confirm the language" line in the picker. Deliberately honest: "we can't tell"
+     *  counts as needing attention, because that is exactly the case that played Chinese silently. */
+    private val _audioNeedsAttention = MutableStateFlow(false)
+    val audioNeedsAttention: StateFlow<Boolean> = _audioNeedsAttention.asStateFlow()
+
+    /** Preferred SPOKEN language (ISO-639-1), from settings. Applied to both backends — it was a
+     *  hardcoded "en" in the ExoPlayer builder that the VLC path never saw. */
+    private val audioLanguage: StateFlow<String> = settingsRepository.settings
+        .map { it.audioLanguage.code }
+        .stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.Eagerly,
+            AudioLanguage.DEFAULT.code,
+        )
+    private val preferredAudioCode: String get() = audioLanguage.value
+
+    /** One automatic audio decision per source. Re-armed in startSource and on an Exo->VLC handoff
+     *  (the new backend must decide again), and stood down the moment the user picks by hand. */
+    private var audioDecisionMade = false
+    /** How many audio ES the last VLC decision was made from. libVLC announces streams one at a time,
+     *  so a decision taken at 2 tracks must be revisited when the 3rd arrives. */
+    private var audioDecidedTrackCount = 0
+
+    /** The user chose a track by hand for this source. Suppresses [_audioNeedsAttention] for the rest
+     *  of it — re-flagging a track they deliberately selected (because it declares no language) would
+     *  turn an honest warning into a nag. */
+    private var audioPickedByUser = false
+
     /** Latest ExoPlayer Tracks, kept so selectAudioTrack can build a precise per-track override. */
     private var latestTracks: androidx.media3.common.Tracks? = null
     private var subtitleConfigs: List<ExoMediaItem.SubtitleConfiguration> = emptyList()
@@ -792,8 +842,10 @@ class PlayerViewModel @Inject constructor(
         firstReadyAtMs = 0L
         // The old source's audio-track list is meaningless for the new stream (and on the VLC path it
         // would leave a picker that silently no-ops) — clear until the new player reports its tracks.
-        latestTracks = null
-        _audioTracks.value = emptyList()
+        clearAudioTracks()
+        audioDecisionMade = false       // fresh source -> pick its audio language once, from scratch
+        audioDecidedTrackCount = 0
+        audioPickedByUser = false
         bufferingSinceMs = android.os.SystemClock.elapsedRealtime()
         _uiState.value = PlayerUiState.Buffering(
             percent = 0,
@@ -1380,6 +1432,15 @@ class PlayerViewModel @Inject constructor(
             // any leftover ENDED/error state that otherwise wedged the new media in a permanent buffer.
             existing.stop()
             existing.clearMediaItems()
+            // Drop any audio override from the PREVIOUS media: it is keyed to that file's TrackGroup,
+            // and trackSelectionParameters survive a media swap. On an episode hop it either did
+            // nothing (different group) or, worse, silently re-applied to a coincidentally-identical
+            // group — an override the user set on episode 1 quietly steering episode 2. The language
+            // preference below is the thing that should carry over, not a per-file override.
+            existing.trackSelectionParameters = existing.trackSelectionParameters.buildUpon()
+                .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+                .setPreferredAudioLanguage(preferredAudioCode)
+                .build()
             existing.setMediaItem(buildMediaItem(url))
             existing.prepare()
             // While casting, keep the local surface paused and push the new source to the TV.
@@ -1446,10 +1507,18 @@ class PlayerViewModel @Inject constructor(
             .setLoadControl(loadControl)
             .setMediaSourceFactory(mediaSourceFactory)
             .build().apply {
-                // Dual/multi-audio releases: prefer ENGLISH and let ExoPlayer auto-detect it (the user
-                // kept landing on Italian). Set before prepare so the first track selection honours it.
+                // Dual/multi-audio releases: prefer the user's language (English by default) and let
+                // ExoPlayer auto-detect it. Set before prepare so the FIRST track selection honours it
+                // — no audible mid-playback switch when we get it right.
+                //
+                // This is necessary but NOT sufficient, which is why onTracksChanged re-checks the
+                // outcome: DefaultTrackSelector's comparator ranks isWithinRendererCapabilities ABOVE
+                // preferredLanguageScore, so an E-AC3/DTS English track on a device with no such
+                // decoder loses to an AAC foreign dub, and an UNTAGGED multi-audio file ties on
+                // language and falls through to the CHANNEL COUNT tie-break — which on a MULTI
+                // release favours the 5.1 dub over the 2.0 original.
                 trackSelectionParameters = trackSelectionParameters.buildUpon()
-                    .setPreferredAudioLanguage("en")
+                    .setPreferredAudioLanguage(preferredAudioCode)
                     .build()
                 setMediaItem(buildMediaItem(url))
                 prepare()
@@ -1586,19 +1655,8 @@ class PlayerViewModel @Inject constructor(
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
                 // Enumerate audio tracks for the manual picker (label + language + which is selected).
                 latestTracks = tracks
-                _audioTracks.value = tracks.groups
-                    .filter { it.type == C.TRACK_TYPE_AUDIO }
-                    .flatMapIndexed { gi, group ->
-                        (0 until group.length).map { ti ->
-                            val fmt = group.getTrackFormat(ti)
-                            AudioTrackOption(
-                                id = "$gi:$ti",
-                                language = fmt.language ?: "und",
-                                label = fmt.label?.takeIf { it.isNotBlank() } ?: languageDisplayName(fmt.language),
-                                selected = group.isTrackSelected(ti),
-                            )
-                        }
-                    }
+                val audio = exoAudioTracks(tracks)
+                publishAudioTracks(audio)
                 // No-sound bug (~20% of torrents): AC3 / E-AC3 / DTS / DTS-HD / TrueHD audio that
                 // ExoPlayer can't decode on this device (esp. phones, which lack those licensed decoders)
                 // -> the video plays but it's SILENT. If the release HAS audio track(s) but the device
@@ -1616,13 +1674,16 @@ class PlayerViewModel @Inject constructor(
                 // "und"/missing languages are benign (most legit English releases declare nothing), so
                 // they never trigger this. Once per source; only when untried alternatives remain.
                 if (!foreignAudioChecked) {
-                    val langs = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
-                        .flatMap { g -> (0 until g.length).map { g.getTrackFormat(it).language } }
+                    val langs = audio.map { it.language }
                     if (langs.isNotEmpty()) {
                         foreignAudioChecked = true
-                        val declared = langs.filterNotNull().filter { it.isNotBlank() && it != "und" }
+                        // Normalised, so "zho"/"chi"/"zh-Hans" are one language and "eng"/"en-GB"
+                        // both count as English. The old raw startsWith("en") also matched nothing
+                        // else by luck, but would have read "enm"/"ene" as English.
+                        val want = AudioTrackChoice.normalizeCode(preferredAudioCode)
+                        val declared = langs.mapNotNull { AudioTrackChoice.normalizeCode(it) }
                         val confidentlyForeign =
-                            declared.size == langs.size && declared.none { it.lowercase().startsWith("en") }
+                            declared.size == langs.size && declared.none { it == want }
                         if (confidentlyForeign &&
                             _sources.value.any { it.infoHash !in triedInfoHashes }
                         ) {
@@ -1633,6 +1694,49 @@ class PlayerViewModel @Inject constructor(
                             viewModelScope.launch { failoverToNext() }
                             return
                         }
+                    }
+                }
+                // ENGLISH (or whatever the user set) ENFORCEMENT — see AudioTrackChoice for the two
+                // ExoPlayer behaviours that make setPreferredAudioLanguage insufficient on its own.
+                // Runs once per source, and not at all once the user has picked by hand.
+                if (!audioDecisionMade && audio.size > 1) {
+                    audioDecisionMade = true
+                    val src = _currentSource.value
+                    val pick = AudioTrackChoice.choose(
+                        tracks = audio,
+                        preferredLanguage = preferredAudioCode,
+                        releaseLanguageLikely = src?.englishLikely != false,
+                        releaseMultiAudio = src?.multiAudio == true,
+                    )
+                    diagnostics.event(
+                        "player_audio_pick",
+                        mapOf(
+                            "backend" to "exo",
+                            "want" to preferredAudioCode,
+                            "reason" to pick.reason.name,
+                            "confident" to pick.confident.toString(),
+                            "tracks" to audio.joinToString("|") {
+                                "${it.language ?: "-"}/${if (it.supported) "ok" else "nodec"}"
+                            },
+                            "source" to src.diagTag(),
+                        ),
+                    )
+                    if (pick.needsFallbackDecoder) {
+                        // The user's language IS in this file — this device just can't decode it
+                        // (E-AC3/DTS-HD/TrueHD on a phone). ExoPlayer would silently settle for the
+                        // foreign dub because renderer capability outranks language in its comparator,
+                        // and the existing isTypeSupported rescue can't see it (some OTHER track is
+                        // decodable). libVLC bundles FFmpeg and plays it.
+                        val url = currentMediaUrl
+                        if (url != null) {
+                            diagnostics.event("player_english_unsupported_vlc", mapOf("source" to src.diagTag()))
+                            switchToVlc(url, exo.currentPosition.coerceAtLeast(0L))
+                            return
+                        }
+                    }
+                    val target = pick.trackId
+                    if (target != null && audio.firstOrNull { it.id == target }?.selected != true) {
+                        applyExoAudioOverride(exo, target)
                     }
                 }
                 val hasAudio = tracks.groups.any { it.type == C.TRACK_TYPE_AUDIO }
@@ -1774,6 +1878,12 @@ class PlayerViewModel @Inject constructor(
         // panel over a video that was playing FINE. Re-set on every (re)use: it's the current source's
         // watchdog this must stand down.
         vlc.onFirstFrame = { firstFrameRendered = true }
+        // Audio-track plumbing for the VLC backend. libVLC only knows its elementary streams once the
+        // demuxer has opened the file, so we can't read them here — ESAdded/ESSelected call back and we
+        // enumerate then. Without this the picker list stayed EMPTY on every VLC source and the audio
+        // button was never composed (both surfaces gate on the list), which is the "no audio-track
+        // selector available" half of the Mutiny report.
+        vlc.onAudioTracksChanged = { refreshVlcAudioTracks(vlc) }
         // Reusing a VlcPlayer across a switch: drop its STALE surface binding so PlayerView's rebind
         // triggers a real re-attach. Without this, attachSurface() early-returns on the same SurfaceView
         // and the vout is never reattached -> the exact "audio plays but NO video" bug.
@@ -1781,6 +1891,10 @@ class PlayerViewModel @Inject constructor(
         // A direct source falling back to libVLC (rare — a direct stream in a codec ExoPlayer can't
         // decode) must carry its host headers too, or libVLC 403s the same way. No-op for torrents.
         vlc.setRequestHeaders(_currentSource.value?.takeIf { it.isDirect }?.requestHeaders ?: emptyMap())
+        // Preferred SPOKEN language, as a media option so it applies at the FIRST track selection —
+        // libVLC with no --audio-language takes the container's default/first audio ES, which on a
+        // Chinese-sourced MULTI WEB-DL is Mandarin. Must be set before setMediaItem builds the Media.
+        vlc.setPreferredAudioLanguages(AudioTrackChoice.vlcPreferenceList(preferredAudioCode))
         vlc.setMediaItem(buildMediaItem(url), startPositionMs)
         vlc.prepare()
         vlc.playWhenReady = !_isCasting.value
@@ -1894,6 +2008,14 @@ class PlayerViewModel @Inject constructor(
             label = "Switching player…",
         )
         currentMediaUrl = null   // force ensureVlcPlayer to (re)load even if the url matches
+        // The dying ExoPlayer's track list describes a stream that is about to stop existing. Leaving
+        // it up left the audio button on screen carrying dead ids — and since selectAudioTrack read
+        // _player (now null), every tap was a silent no-op against a picker that still rendered. VLC
+        // republishes its own list from ESAdded within a second or two.
+        clearAudioTracks()
+        audioDecisionMade = false   // the new backend gets its own decision
+        audioDecidedTrackCount = 0
+        audioPickedByUser = false   // the ids the user picked from belonged to the dying player
         // try/finally: a throw from native libVLC construction/prepare must NOT leak the transition slot
         // true forever — that permanently no-ops selectSource() and failoverToNext(), which is the
         // "switch-source button does nothing from every state" wedge.
@@ -1943,31 +2065,193 @@ class PlayerViewModel @Inject constructor(
         _currentSubtitle.value = track
     }
 
-    /** Force a specific AUDIO track (precise per-track override, so two same-language tracks are
-     *  distinguishable) — the manual fix when the English default picks the wrong one. */
+    /**
+     * Force a specific AUDIO track — the manual fix when the automatic pick lands wrong.
+     *
+     * BACKEND-AWARE. It used to open with `val exo = _player.value ?: return`, which meant that after a
+     * mid-stream Exo->VLC failover (ensureVlcPlayer nulls `_player`) every tap on the picker was a
+     * silent no-op: the panel closed, the row didn't even get its checkmark, and the audio never
+     * changed. Now the id's prefix decides which player receives it, and a genuine failure leaves a
+     * diagnostics breadcrumb instead of vanishing.
+     */
     @OptIn(UnstableApi::class)
     fun selectAudioTrack(option: AudioTrackOption) {
-        val exo = _player.value ?: return
-        val tracks = latestTracks ?: return
+        // A hand-pick outranks anything automatic for the rest of this source.
+        audioDecisionMade = true
+        audioPickedByUser = true
+        if (option.id.startsWith(VLC_TRACK_PREFIX)) {
+            val vlc = vlcPlayer
+            val esId = option.id.removePrefix(VLC_TRACK_PREFIX).toIntOrNull()
+            if (vlc == null || esId == null || !vlc.selectAudioTrack(esId)) {
+                diagnostics.breadcrumb("audioSelect VLC failed id=${option.id} player=${vlc != null}")
+                return
+            }
+            markAudioSelected(option)
+            return
+        }
+        val exo = _player.value
+        val tracks = latestTracks
+        if (exo == null || tracks == null) {
+            diagnostics.breadcrumb("audioSelect Exo unavailable id=${option.id} player=${_player.value != null}")
+            return
+        }
         val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
         val parts = option.id.split(":")
         val gi = parts.getOrNull(0)?.toIntOrNull() ?: return
         val ti = parts.getOrNull(1)?.toIntOrNull() ?: return
         val group = audioGroups.getOrNull(gi) ?: return
+        applyExoOverride(exo, group, ti)
+        markAudioSelected(option)
+    }
+
+    // --- Audio track plumbing (shared by both backends) ---------------------------------------
+
+    /** Flatten ExoPlayer's Tracks into the backend-neutral shape [AudioTrackChoice] reasons over. */
+    @OptIn(UnstableApi::class)
+    private fun exoAudioTracks(tracks: androidx.media3.common.Tracks): List<AudioTrackChoice.Track> =
+        tracks.groups
+            .filter { it.type == C.TRACK_TYPE_AUDIO }
+            .flatMapIndexed { gi, group ->
+                (0 until group.length).map { ti ->
+                    val fmt = group.getTrackFormat(ti)
+                    AudioTrackChoice.Track(
+                        id = "$gi:$ti",
+                        language = fmt.language,
+                        label = fmt.label,
+                        codec = fmt.sampleMimeType,
+                        channelCount = fmt.channelCount.takeIf { it != androidx.media3.common.Format.NO_VALUE } ?: 0,
+                        isDefault = fmt.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
+                        // The single most important field: ExoPlayer's own comparator ranks this above
+                        // language, so we have to see it to know when English LOST on capability.
+                        //
+                        // allowExceedsCapabilities = TRUE deliberately. The single-argument overload is
+                        // FORMAT_HANDLED only, so it reports a merely EXCEEDS_CAPABILITIES track (a
+                        // decoder exists, the format just pushes past its declared limits — commonly
+                        // fine in practice) as unsupported. Since this flag gates the automatic
+                        // ExoPlayer -> libVLC handoff, the strict form would tear down the working
+                        // backend and restart playback on a fallback that was never needed. Hand off
+                        // only when the track is genuinely UNHANDLED.
+                        supported = group.isTrackSupported(ti, /* allowExceedsCapabilities= */ true),
+                        selected = group.isTrackSelected(ti),
+                    )
+                }
+            }
+
+    /** Re-read libVLC's audio ES list and publish it into the SAME flow the picker renders. */
+    private fun refreshVlcAudioTracks(vlc: VlcPlayer) {
+        val infos = vlc.audioTracks().map { t ->
+            AudioTrackChoice.Track(
+                id = VLC_TRACK_PREFIX + t.id,
+                language = t.language,
+                label = t.name,
+                codec = t.codec,
+                channelCount = t.channels,
+                // libVLC 3.x exposes no container disposition on IMedia.Track, so we can't see the
+                // DEFAULT flag here. Harmless: it only feeds the last-resort untagged tier, and on
+                // that tier a null pick simply leaves libVLC's own default in place.
+                isDefault = false,
+                // libVLC bundles FFmpeg — if it listed the track, it can decode it. There is no
+                // "English exists but is undecodable" case on this backend.
+                supported = true,
+                selected = t.selected,
+            )
+        }
+        if (infos.isEmpty()) return   // ESAdded for a video/subtitle ES, or the stream closed
+        publishAudioTracks(infos)
+        // libVLC announces elementary streams INCREMENTALLY — one ESAdded per stream — unlike
+        // ExoPlayer's onTracksChanged, which hands over the complete Tracks for the container. Latching
+        // on the first callback that showed >= 2 tracks therefore decided from a PARTIAL list: on a
+        // 3-track MULTI we could pick "the best of the first two" and never reconsider once the English
+        // track finally arrived, which is the very failure this whole change exists to fix.
+        // Re-decide whenever the track set GROWS. Re-running is safe: the choice is a pure function of
+        // the list, and a user pick always wins (audioPickedByUser).
+        if (audioPickedByUser || infos.size <= 1 || infos.size <= audioDecidedTrackCount) return
+        audioDecidedTrackCount = infos.size
+        audioDecisionMade = true
+        val src = _currentSource.value
+        val pick = AudioTrackChoice.choose(
+            tracks = infos,
+            preferredLanguage = preferredAudioCode,
+            releaseLanguageLikely = src?.englishLikely != false,
+            releaseMultiAudio = src?.multiAudio == true,
+        )
+        diagnostics.event(
+            "player_audio_pick",
+            mapOf(
+                "backend" to "vlc",
+                "want" to preferredAudioCode,
+                "reason" to pick.reason.name,
+                "confident" to pick.confident.toString(),
+                "tracks" to infos.joinToString("|") { it.language ?: "-" },
+                "source" to src.diagTag(),
+            ),
+        )
+        val target = pick.trackId ?: return
+        if (infos.firstOrNull { it.id == target }?.selected == true) return
+        val esId = target.removePrefix(VLC_TRACK_PREFIX).toIntOrNull() ?: return
+        if (vlc.selectAudioTrack(esId)) {
+            publishAudioTracks(infos.map { it.copy(selected = it.id == target) })
+        }
+    }
+
+    /** Push a backend's track list to the UI, and derive "what am I hearing?" + "is that right?". */
+    private fun publishAudioTracks(infos: List<AudioTrackChoice.Track>) {
+        val options = infos.mapIndexed { i, t ->
+            AudioTrackOption(
+                id = t.id,
+                language = AudioTrackChoice.resolveLanguage(t).orEmpty(),
+                label = AudioTrackChoice.describe(t, i),
+                selected = t.selected,
+            )
+        }
+        _audioTracks.value = options
+        val activeIndex = infos.indexOfFirst { it.selected }
+        _currentAudio.value = options.getOrNull(activeIndex)
+        val want = AudioTrackChoice.normalizeCode(preferredAudioCode)
+        val playing = infos.getOrNull(activeIndex)?.let { AudioTrackChoice.resolveLanguage(it) }
+        // Warn only when the evidence CONTRADICTS the preference, never when it is merely ABSENT.
+        // Most legitimate English releases declare no language at all, so "playing != want" flagged
+        // ordinary correct content — a nag on the common case, which trains the user to ignore the one
+        // signal that matters. A genuine MULTI whose tracks identify nothing is still flagged, because
+        // that arrives as an UNIDENTIFIED/NO_PREFERRED reason rather than as a silent null.
+        _audioNeedsAttention.value = !audioPickedByUser && infos.size > 1 &&
+            playing != null && want != null && playing != want
+    }
+
+    private fun clearAudioTracks() {
+        latestTracks = null
+        _audioTracks.value = emptyList()
+        _currentAudio.value = null
+        _audioNeedsAttention.value = false
+    }
+
+    private fun markAudioSelected(option: AudioTrackOption) {
+        _audioTracks.value = _audioTracks.value.map { it.copy(selected = it.id == option.id) }
+        _currentAudio.value = option.copy(selected = true)
+        _audioNeedsAttention.value = false   // the user has decided; stop nagging
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun applyExoAudioOverride(exo: ExoPlayer, trackId: String) {
+        val tracks = latestTracks ?: return
+        val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        val parts = trackId.split(":")
+        val gi = parts.getOrNull(0)?.toIntOrNull() ?: return
+        val ti = parts.getOrNull(1)?.toIntOrNull() ?: return
+        val group = audioGroups.getOrNull(gi) ?: return
+        applyExoOverride(exo, group, ti)
+    }
+
+    /** The precise per-track override, so two same-language tracks stay distinguishable (a plain
+     *  language preference can't separate "English 5.1" from "English commentary"). */
+    @OptIn(UnstableApi::class)
+    private fun applyExoOverride(exo: ExoPlayer, group: androidx.media3.common.Tracks.Group, ti: Int) {
         exo.trackSelectionParameters = exo.trackSelectionParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
             .setOverrideForType(
                 androidx.media3.common.TrackSelectionOverride(group.mediaTrackGroup, ti),
             )
             .build()
-        _audioTracks.value = _audioTracks.value.map { it.copy(selected = it.id == option.id) }
-    }
-
-    /** ISO-639 code -> display name for the audio picker (Format.label is often null). */
-    private fun languageDisplayName(code: String?): String {
-        val c = code?.takeIf { it.isNotBlank() && it != "und" } ?: return "Unknown"
-        return runCatching { java.util.Locale(c).displayLanguage.takeIf { it.isNotBlank() && it != c } }
-            .getOrNull() ?: c.uppercase(java.util.Locale.ROOT)
     }
 
     /** Re-query the subtitle addon (the in-player "search") and re-attach to the live player. */
@@ -2753,6 +3037,10 @@ class PlayerViewModel @Inject constructor(
         /** ExoPlayer's own per-load retry count — keeps re-requesting a not-yet-downloaded range. */
         const val SOURCE_LOAD_RETRIES = 12
         /** Backstop: re-prepare the player up to this many times after a load gives up entirely. */
+        /** Id prefix that marks an [AudioTrackOption] as a libVLC elementary stream rather than an
+         *  ExoPlayer "group:track" pair — so a list left over from the other backend can never be
+         *  applied to the wrong player. */
+        const val VLC_TRACK_PREFIX = "vlc:"
         const val MAX_SOURCE_RETRIES = 8
         const val SOURCE_RETRY_BACKOFF_MS = 1_500L
 

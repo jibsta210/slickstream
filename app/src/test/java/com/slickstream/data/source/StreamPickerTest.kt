@@ -144,6 +144,32 @@ class StreamPickerTest {
         assertEquals(healthyMp4, picked)
     }
 
+    // --- Multi-audio detection -----------------------------------------------------------------
+
+    @Test
+    fun `MULTI and DUAL AUDIO releases are flagged as multi-audio`() {
+        assertTrue(StreamPicker.looksMultiAudio("Mutiny.2026.1080p.WEB-DL.MULTi.DDP5.1.H264-GROUP"))
+        assertTrue(StreamPicker.looksMultiAudio("Some.Show.S01E01.720p.BluRay.Dual.Audio.x264"))
+        assertTrue(StreamPicker.looksMultiAudio("Film.2024.1080p.BluRay.VFF.x264"))
+    }
+
+    @Test
+    fun `a plain WEB-DL is not multi-audio`() {
+        // The German scene's "DL" (Dual Language) tag would match the "DL" in "WEB-DL" — the hyphen is
+        // a word boundary — and mark essentially every modern release as multi-audio, permanently
+        // disabling the player's container-default fallback. It is deliberately not in the pattern.
+        assertFalse(StreamPicker.looksMultiAudio("Mutiny.2026.1080p.WEB-DL.DDP5.1.H264-GROUP"))
+        assertFalse(StreamPicker.looksMultiAudio("Movie.2023.2160p.AMZN.WEB-DL.DDP5.1.HDR.H265"))
+        assertFalse(StreamPicker.looksMultiAudio("Movie.1994.1080p.BluRay.x264-SPARKS"))
+    }
+
+    @Test
+    fun `MULTI is not treated as a foreign tag - those releases usually carry english`() {
+        // Deliberate: rejecting MULTI would throw away good sources. It only lowers the PLAYER's
+        // confidence in the container default; it never rejects the source.
+        assertTrue(StreamPicker.looksEnglish("Mutiny.2026.1080p.WEB-DL.MULTi.DDP5.1.H264", "Mutiny"))
+    }
+
     private fun source(
         hash: String,
         seeders: Int,

@@ -208,6 +208,23 @@ object StreamPicker {
      *  never want to surface as a pickable source. */
     fun hasNonLatin(text: String): Boolean = NON_LATIN.containsMatchIn(text)
 
+    // Release tags that advertise SEVERAL audio languages in one file. Deliberately NOT part of
+    // [FOREIGN]: a MULTI release usually DOES contain English and rejecting them would throw away good
+    // sources. What it changes is the PLAYER's confidence — a release whose name says "several
+    // languages" cannot have its container-default audio track trusted as English when the tracks
+    // themselves carry no language tags. That is precisely the 1080p WEB-DL MULTI of "Mutiny" that
+    // played in Chinese.
+    // NB: the German scene's "DL" (Dual Language) is deliberately ABSENT — `\bdl\b` matches the "DL"
+    // in "WEB-DL" (the hyphen is a word boundary), which would mark essentially every modern release
+    // as multi-audio and permanently disable the container-default fallback.
+    private val MULTI_AUDIO = Regex(
+        "(?i)\\b(multi|multi-?audio|multi-?lang(?:ue|uage)?|dual|dual-?audio|" +
+            "vff|vfq|vfi|vf2|truefrench)\\b",
+    )
+
+    /** True when the release name advertises multiple audio languages ("MULTi", "DUAL AUDIO", "VFF"). */
+    fun looksMultiAudio(text: String): Boolean = MULTI_AUDIO.containsMatchIn(text)
+
     // Bare English language-NAMES. Kept OUT of FOREIGN (they collide with real English titles) and only
     // applied with the movie's own title words stripped — see [noForeignLanguageTag].
     private val LANG_NAME = Regex(

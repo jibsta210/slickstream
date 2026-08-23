@@ -30,6 +30,7 @@ import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import com.slickstream.data.settings.CacheSize
 import com.slickstream.data.settings.QualityPreference
+import com.slickstream.data.settings.AudioLanguage
 import com.slickstream.data.settings.SubtitleLanguage
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
@@ -164,6 +165,12 @@ fun TvSettingsScreen(
         item {
             TvSettingSection("Content") {
                 TvOptionRow("Hide Indian films & TV", listOf(true, false), settings.hideIndianContent, { if (it) "On" else "Off" }, viewModel::setHideIndianContent)
+            }
+        }
+
+        item {
+            TvSettingSection("Audio") {
+                TvOptionRow("Spoken language", AudioLanguage.entries, settings.audioLanguage, { it.label }, viewModel::setAudioLanguage)
             }
         }
 

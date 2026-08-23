@@ -15,6 +15,8 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -34,6 +36,7 @@ class LivePlayerViewModel @Inject constructor(
     private val holder: LivePlaybackHolder,
     private val resolver: WebViewStreamResolver,
     private val diagnostics: com.slickstream.core.diagnostics.Diagnostics,
+    private val settingsRepository: com.slickstream.data.settings.SettingsRepository,
 ) : ViewModel() {
 
     sealed interface UiState {
@@ -42,6 +45,16 @@ class LivePlayerViewModel @Inject constructor(
         data class Error(val message: String) : UiState
         data object NoStream : UiState
     }
+
+    /** Preferred spoken language, one source of truth with the main player (AppSettings). */
+    private val audioLanguage: StateFlow<String> = settingsRepository.settings
+        .map { it.audioLanguage.code }
+        .stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.Eagerly,
+            com.slickstream.data.settings.AudioLanguage.DEFAULT.code,
+        )
+    private val preferredAudioCode: String get() = audioLanguage.value
 
     private val _uiState = MutableStateFlow<UiState>(UiState.Buffering)
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
@@ -127,6 +140,13 @@ class LivePlayerViewModel @Inject constructor(
             .setMediaSourceFactory(DefaultMediaSourceFactory(http))
             .build()
             .apply {
+                // Same preferred-SPOKEN-language rule as the main player. International IPTV/HLS feeds
+                // very often carry several audio renditions, and with no preference set ExoPlayer falls
+                // through to the DEFAULT-flag / channel-count tie-break — the identical
+                // silent-wrong-language outcome, on a surface with no picker to escape it.
+                trackSelectionParameters = trackSelectionParameters.buildUpon()
+                    .setPreferredAudioLanguage(preferredAudioCode)
+                    .build()
                 setMediaItem(MediaItem.fromUri(url))
                 addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(state: Int) {

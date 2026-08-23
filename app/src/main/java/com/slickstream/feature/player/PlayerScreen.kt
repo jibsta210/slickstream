@@ -135,6 +135,8 @@ fun PlayerScreen(
     val subtitles by viewModel.subtitles.collectAsState()
     val currentSubtitle by viewModel.currentSubtitle.collectAsState()
     val audioTracks by viewModel.audioTracks.collectAsState()
+    val currentAudio by viewModel.currentAudio.collectAsState()
+    val audioNeedsAttention by viewModel.audioNeedsAttention.collectAsState()
     val captionPrefs by viewModel.captionPrefs.collectAsState()
     val episodes by viewModel.episodes.collectAsState()
     val currentSeasonNumber by viewModel.currentSeasonNumber.collectAsState()
@@ -356,7 +358,12 @@ fun PlayerScreen(
                 onSubtitles = { showSubtitles = true },
                 subtitlesActive = currentSubtitle != null,
                 onAudio = { showAudio = true },
-                showAudioButton = audioTracks.size > 1,
+                // isNotEmpty, not size > 1: with ONE track the sheet is informational and names the
+                // language you're hearing. The old gate hid the picker — the only place the app ever
+                // stated the audio language — precisely when a single wrong-language track made that
+                // the one thing worth knowing. AudioSheetContent already handled the 1-track case.
+                showAudioButton = audioTracks.isNotEmpty(),
+                audioNeedsAttention = audioNeedsAttention,
                 zoomFill = zoomFill,
                 onToggleZoom = { zoomFill = !zoomFill },
                 // Episode navigation — only present for TV shows (episode list resolved).
@@ -548,6 +555,8 @@ fun PlayerScreen(
         ) {
             AudioSheetContent(
                 tracks = audioTracks,
+                current = currentAudio,
+                needsAttention = audioNeedsAttention,
                 onSelect = { track ->
                     viewModel.selectAudioTrack(track)
                     scope.launch { audioSheetState.hide() }.invokeOnCompletion {
@@ -666,6 +675,8 @@ private fun TopOverlay(
     subtitlesActive: Boolean,
     onAudio: () -> Unit,
     showAudioButton: Boolean,
+    /** The playing track isn't provably the preferred language (wrong, or undeclared). */
+    audioNeedsAttention: Boolean,
     zoomFill: Boolean,
     onToggleZoom: () -> Unit,
     hasEpisodes: Boolean,
@@ -745,7 +756,9 @@ private fun TopOverlay(
                 Icon(
                     imageVector = Icons.Filled.GraphicEq,
                     contentDescription = "Audio track",
-                    tint = Brand.OnSurface,
+                    // Amber = "we could not confirm this is your language". The failure mode is
+                    // otherwise silent: the film just speaks the wrong language.
+                    tint = if (audioNeedsAttention) Brand.Amber else Brand.OnSurface,
                 )
             }
         }
@@ -1311,6 +1324,8 @@ private fun CastingOverlay(controlsVisible: Boolean, onPlayOnDevice: () -> Unit)
 @Composable
 private fun AudioSheetContent(
     tracks: List<AudioTrackOption>,
+    current: AudioTrackOption?,
+    needsAttention: Boolean,
     onSelect: (AudioTrackOption) -> Unit,
 ) {
     Column(modifier = Modifier.padding(bottom = 24.dp)) {
@@ -1321,11 +1336,17 @@ private fun AudioSheetContent(
             fontSize = 18.sp,
             modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 4.dp),
         )
+        // Name the track that is playing. Nothing outside this sheet ever did, so "it's in Chinese"
+        // was something the user could only discover by ear.
         Text(
-            text = if (tracks.size == 1) "1 track" else "${tracks.size} tracks",
-            color = Brand.OnSurfaceDim,
+            text = buildString {
+                append(if (tracks.size == 1) "1 track" else "${tracks.size} tracks")
+                append(" · Playing: ")
+                append(current?.label ?: "unknown")
+            },
+            color = if (needsAttention) Brand.Amber else Brand.OnSurfaceDim,
             fontSize = 13.sp,
-            modifier = Modifier.padding(start = 20.dp, bottom = 12.dp),
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
         )
         LazyColumn {
             items(tracks, key = { it.id }) { track ->
@@ -1338,21 +1359,17 @@ private fun AudioSheetContent(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
+                        // 2 lines: the label now carries language + codec + channels, which is what
+                        // makes three untagged tracks in a MULTI file tellable apart. Clipping it to
+                        // one line would put the disambiguating half off-screen.
                         Text(
                             text = track.label,
                             color = Brand.OnSurface,
                             fontWeight = if (track.selected) FontWeight.SemiBold else FontWeight.Normal,
                             fontSize = 15.sp,
-                            maxLines = 1,
+                            maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        if (track.language.isNotBlank() && track.language != "und") {
-                            Text(
-                                text = track.language.uppercase(),
-                                color = Brand.OnSurfaceDim,
-                                fontSize = 12.sp,
-                            )
-                        }
                     }
                     if (track.selected) {
                         Icon(

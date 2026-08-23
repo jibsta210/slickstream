@@ -17,6 +17,7 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.interfaces.IMedia
 
 /**
  * A libVLC-backed [androidx.media3.common.Player].
@@ -50,6 +51,29 @@ class VlcPlayer(
     fun setRequestHeaders(headers: Map<String, String>) {
         requestHeaders = headers
     }
+
+    /**
+     * Comma-separated `--audio-language` list (e.g. "en,eng,english"), applied as a MEDIA option.
+     *
+     * Without this libVLC has no language preference at all: its es_out picks the audio ES with the
+     * highest priority, which means the container's DEFAULT/FORCED disposition and otherwise the FIRST
+     * audio ES in demux order. On a Chinese-sourced `MULTI` WEB-DL the Mandarin track is routinely both
+     * — which is exactly how "Mutiny" played in Chinese on this backend while the ExoPlayer path had a
+     * preference the VLC path never saw. Set before [handleSetMediaItems]; empty = no preference.
+     */
+    private var audioLanguagePreference: String = ""
+
+    fun setPreferredAudioLanguages(commaSeparated: String) {
+        audioLanguagePreference = commaSeparated.trim()
+    }
+
+    /**
+     * Fired on the main thread whenever libVLC's elementary-stream set changes (ESAdded / ESSelected /
+     * ESDeleted). The owning ViewModel re-enumerates [audioTracks] here — libVLC does NOT know its
+     * track list at prepare() time, only once the demuxer has opened the stream, so a one-shot read
+     * after play() finds nothing.
+     */
+    var onAudioTracksChanged: (() -> Unit)? = null
 
     /** Fired (on the main thread, once per vout creation) when libVLC reports a LIVE video output —
      *  the authoritative "frames are rendering" signal. The VM's no-first-frame watchdog keys on this:
@@ -94,11 +118,39 @@ class VlcPlayer(
         val timeMs = runCatching { event.timeChanged }.getOrDefault(0L)
         val lengthMs = runCatching { event.lengthChanged }.getOrDefault(0L)
         val voutCount = runCatching { event.voutCount }.getOrDefault(0)
-        mainHandler.post { onVlcEventMain(type, buffering, timeMs, lengthMs, voutCount) }
+        // ES events carry their type on the event object, which libVLC may recycle — read it HERE,
+        // on libVLC's thread, like every other field above.
+        val esType = if (type == MediaPlayer.Event.ESAdded ||
+            type == MediaPlayer.Event.ESDeleted ||
+            type == MediaPlayer.Event.ESSelected
+        ) {
+            runCatching { event.esChangedType }.getOrDefault(IMedia.Track.Type.Unknown)
+        } else {
+            IMedia.Track.Type.Unknown
+        }
+        mainHandler.post { onVlcEventMain(type, buffering, timeMs, lengthMs, voutCount, esType) }
     }
 
-    private fun onVlcEventMain(type: Int, buffering: Float, timeMs: Long, lengthMs: Long, voutCount: Int) {
+    private fun onVlcEventMain(
+        type: Int,
+        buffering: Float,
+        timeMs: Long,
+        lengthMs: Long,
+        voutCount: Int,
+        esType: Int,
+    ) {
         when (type) {
+            // The ONLY moment libVLC knows what audio streams the file has. Previously these three
+            // fell into the `else -> return` branch below and were dropped, which is why the VLC
+            // backend never populated an audio-track list and the picker button never appeared.
+            MediaPlayer.Event.ESAdded,
+            MediaPlayer.Event.ESDeleted,
+            MediaPlayer.Event.ESSelected,
+            -> {
+                if (esType == IMedia.Track.Type.Audio) onAudioTracksChanged?.invoke()
+                return   // no Media3 state changed — don't invalidate
+            }
+
             MediaPlayer.Event.Opening -> {
                 playbackStateField = Player.STATE_BUFFERING
                 isLoadingField = true
@@ -289,6 +341,14 @@ class VlcPlayer(
             (requestHeaders["Referer"] ?: requestHeaders["Origin"])?.let {
                 media.addOption(":http-referrer=$it")
             }
+            // Preferred SPOKEN language. libVLC 3.x matches each comma-separated entry against the
+            // track's language string, so we pass every form a container writes ("en,eng,english").
+            // This only helps TAGGED tracks — an untagged MULTI still needs the explicit pick the
+            // ViewModel applies from AudioTrackChoice once ESAdded lands — but it is free and it fixes
+            // the common case before the first frame, with no audible track switch.
+            if (audioLanguagePreference.isNotEmpty()) {
+                media.addOption(":audio-language=$audioLanguagePreference")
+            }
             mediaPlayer.media = media
             media.release()
 
@@ -348,6 +408,85 @@ class VlcPlayer(
         return Futures.immediateVoidFuture()
     }
 
+    // ---------------------------------------------------------------------
+    // Audio tracks
+    // ---------------------------------------------------------------------
+
+    /** One libVLC audio elementary stream, flattened for the ViewModel's picker. */
+    data class VlcAudioTrack(
+        /** libVLC ES id — the value [selectAudioTrack] takes. NOT an index. */
+        val id: Int,
+        /** libVLC's display name, e.g. "Track 1 - [English]". */
+        val name: String?,
+        /** ISO language tag straight from the container ("eng", "zh", null). */
+        val language: String?,
+        /** libVLC codec string ("a52", "mp4a", "dts"). */
+        val codec: String?,
+        val channels: Int,
+        val selected: Boolean,
+    )
+
+    /**
+     * Enumerate the stream's audio tracks.
+     *
+     * Uses the LEGACY libVLC 3.x API, which is what `libvlc-all:3.6.5` actually ships — verified with
+     * `javap` on the AAR's classes.jar: `getAudioTracksCount()`, `getAudioTracks(): TrackDescription[]`
+     * (fields `int id`, `String name`), `getAudioTrack(): int`, `setAudioTrack(int): boolean`. The
+     * newer `getTracks(type)` / `selectTrack()` 4.x API is NOT present in this build; writing against
+     * it compiles nowhere.
+     *
+     * `TrackDescription` only carries id + display name, so the real language/codec/channel metadata
+     * comes from the Media's own track table ([IMedia.AudioTrack]) matched by ES id. Returns an empty
+     * list until libVLC has opened the stream (before the first ESAdded event there is nothing to
+     * report) — which is why the ViewModel re-reads this on [onAudioTracksChanged].
+     */
+    fun audioTracks(): List<VlcAudioTrack> = runCatching {
+        // libVLC prepends a synthetic "Disable" entry with id -1; it isn't a track.
+        val descriptions = mediaPlayer.audioTracks?.filter { it.id >= 0 } ?: return emptyList()
+        if (descriptions.isEmpty()) return emptyList()
+        val currentId = runCatching { mediaPlayer.audioTrack }.getOrDefault(-1)
+        val meta = audioTrackMetadata()
+        descriptions.mapIndexed { index, d ->
+            // Match by ES id (both APIs report libvlc's i_id); fall back to position if a demuxer
+            // ever disagrees, so we degrade to "no language shown" rather than to a wrong language.
+            val m = meta.firstOrNull { it.id == d.id } ?: meta.getOrNull(index)
+            VlcAudioTrack(
+                id = d.id,
+                name = d.name,
+                language = m?.language,
+                codec = m?.codec ?: m?.originalCodec,
+                channels = m?.channels ?: 0,
+                selected = d.id == currentId,
+            )
+        }
+    }.getOrElse {
+        Log.w(TAG, "audioTracks() failed", it)
+        emptyList()
+    }
+
+    /** Force a specific audio ES. Returns false if libVLC rejected it (e.g. the stream closed). */
+    fun selectAudioTrack(id: Int): Boolean =
+        runCatching { mediaPlayer.setAudioTrack(id) }.getOrElse {
+            Log.w(TAG, "setAudioTrack($id) failed", it)
+            false
+        }
+
+    /**
+     * The Media's parsed track table. `MediaPlayer.getMedia()` hands back a RETAINED reference, so it
+     * must be released or the native Media leaks for the life of the process (one per source switch).
+     */
+    private fun audioTrackMetadata(): List<IMedia.AudioTrack> {
+        val media = runCatching { mediaPlayer.media }.getOrNull() ?: return emptyList()
+        return try {
+            (0 until media.trackCount).mapNotNull { media.getTrack(it) as? IMedia.AudioTrack }
+        } catch (t: Throwable) {
+            Log.w(TAG, "audioTrackMetadata() failed", t)
+            emptyList()
+        } finally {
+            runCatching { media.release() }
+        }
+    }
+
     /**
      * Media3 video-surface SPI: PlayerView (and the TV PlayerView) call `setVideoSurfaceView(...)`
      * when the player is bound, which routes here. We attach libVLC's video output to that SurfaceView
@@ -365,6 +504,10 @@ class VlcPlayer(
 
     override fun handleRelease(): ListenableFuture<*> {
         detachSurface()
+        // Drop the ViewModel's callbacks BEFORE releasing: a late ES event would otherwise call back
+        // into a VM that has already moved on to another player and republish a dead track list.
+        onAudioTracksChanged = null
+        onFirstFrame = null
         runCatching { mediaPlayer.release() }
         // Do NOT release the shared LibVLC here — VlcEngine owns it.
         return Futures.immediateVoidFuture()

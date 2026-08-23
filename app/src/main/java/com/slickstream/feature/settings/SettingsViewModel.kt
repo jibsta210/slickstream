@@ -8,6 +8,7 @@ import com.slickstream.data.settings.AppSettings
 import com.slickstream.data.settings.CacheSize
 import com.slickstream.data.settings.QualityPreference
 import com.slickstream.data.settings.SettingsRepository
+import com.slickstream.data.settings.AudioLanguage
 import com.slickstream.data.settings.SubtitleLanguage
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
@@ -89,6 +90,7 @@ class SettingsViewModel @Inject constructor(
     fun setSubtitlesEnabled(enabled: Boolean) = viewModelScope.launch { repo.setSubtitlesEnabled(enabled) }
     fun setHideIndianContent(hide: Boolean) = viewModelScope.launch { repo.setHideIndianContent(hide) }
     fun setSubtitleLanguage(lang: SubtitleLanguage) = viewModelScope.launch { repo.setSubtitleLanguage(lang) }
+    fun setAudioLanguage(lang: AudioLanguage) = viewModelScope.launch { repo.setAudioLanguage(lang) }
     fun setSubtitleSize(size: SubtitleSize) = viewModelScope.launch { repo.setSubtitleSize(size) }
     fun setSubtitleStyle(style: SubtitleStyle) = viewModelScope.launch { repo.setSubtitleStyle(style) }
     fun setStreamSize(s: com.slickstream.data.settings.StreamSizePreference) =
