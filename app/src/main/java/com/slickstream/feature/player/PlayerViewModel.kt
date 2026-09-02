@@ -1493,7 +1493,28 @@ class PlayerViewModel @Inject constructor(
         // Decoder fallback: on a weak TV a single HEVC/10-bit/4K decoder-init failure would
         // otherwise dead-end straight into Error; fallback retries on a secondary/software decoder.
         // No behaviour change when the primary decoder works (the phone path).
-        val renderers = DefaultRenderersFactory(appContext).setEnableDecoderFallback(true)
+        val renderers = DefaultRenderersFactory(appContext)
+            .setEnableDecoderFallback(true)
+            // NO VIDEO JOINING WINDOW. This is what actually produced "black for about 3 seconds" after
+            // the screensaver, and it is worth understanding because it is counter-intuitive.
+            //
+            // On a surface change while the renderer is STARTED, media3 arms
+            // joiningDeadlineMs = now + allowedVideoJoiningTimeMs (default 5000, from
+            // DefaultRenderersFactory.DEFAULT_ALLOWED_VIDEO_JOINING_TIME_MS). Two things then happen:
+            // VideoFrameReleaseControl.isReady() returns true for that whole window on the DEADLINE
+            // ALONE — so the player stays READY and audio plays with no stall reported — and, decisively,
+            // shouldForceRelease() opens with "if (joiningDeadlineMs != TIME_UNSET && !renderNextFrame
+            // Immediately) return false", which SUPPRESSES the one free first-frame render a surface
+            // change grants. So the frame we rebound the surface for was deliberately withheld.
+            //
+            // That is also exactly why PAUSING painted the picture instantly: pause -> stopRenderers ->
+            // onStopped() clears joiningDeadlineMs, the suppression lifts, and the very next buffer is
+            // released immediately.
+            //
+            // The window exists to let video re-sync after a track change without reporting a stall.
+            // Here it only hides a black screen behind a "ready" state; 0 makes the renderer honest and
+            // lets the forced first frame through at once.
+            .setAllowedVideoJoiningTimeMs(0L)
         // Keep playing through a torrent stall. Our local HTTP server throws when a piece isn't on
         // disk YET (slow swarm) — ExoPlayer would otherwise treat that as a FATAL source error and
         // kill the stream. A high source-retry count makes it rebuffer + re-request the byte range
