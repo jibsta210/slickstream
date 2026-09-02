@@ -3,6 +3,7 @@ package com.slickstream.feature.player
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.runtime.Composable
+import androidx.core.view.doOnPreDraw
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.lifecycle.Lifecycle
@@ -88,14 +89,21 @@ fun RebindVideoSurfaceOnResume(player: Player?, playerView: PlayerView?) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> gate.onBackgrounded()
-                Lifecycle.Event.ON_START -> attemptRebind()
+                // DELIBERATELY NOT ON_START. media3 grants exactly ONE free frame per surface change:
+                // setOutput -> lowerFirstFrameState(FIRST_FRAME_NOT_RENDERED) makes shouldForceRelease()
+                // return true for the very next frame, then latches FIRST_FRAME_RENDERED — there is no
+                // second one. ON_START runs before the window is visible, so rebinding there SPENT that
+                // free frame into a window nobody could see, and the picture then had to wait for
+                // ordinary frame timing: the reported "black for about 3 seconds". Waiting for the first
+                // PRE-DRAW after ON_RESUME puts the forced frame on screen instead. doOnPreDraw is the
+                // real beat: View.post() runs on the next handler message, which normally lands BEFORE
+                // the traversal, so it is not late enough to help.
                 Lifecycle.Event.ON_RESUME -> {
-                    attemptRebind()
-                    // ...and once more after the next layout/traversal. If the surface was not yet
-                    // valid at ON_START/ON_RESUME the attempts above correctly do nothing, and the gate
-                    // stays armed — but on Android 14+ there is no surfaceCreated coming to drive it,
-                    // so without this retry the black picture would simply persist. The gate makes the
-                    // retry a no-op in every case where the earlier attempt already succeeded.
+                    val v = playerView ?: surfaceView
+                    if (v != null) v.doOnPreDraw { attemptRebind() } else attemptRebind()
+                    // Belt and braces: if that view never draws (it was detached before the pre-draw),
+                    // the gate stays armed and this post picks it up. A no-op whenever the pre-draw
+                    // already succeeded.
                     surfaceView?.post { attemptRebind() }
                 }
                 else -> Unit
