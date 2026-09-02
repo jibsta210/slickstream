@@ -184,6 +184,10 @@ fun PlayerScreen(
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
     val activity = context.findActivity()
     var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+    // Put the video output back together whenever we return to the foreground (screensaver, Home,
+    // another app). Without it the surface goes stale while we're stopped and playback resumes as
+    // audio over a black picture — on ExoPlayer AND on the libVLC fallback.
+    RebindVideoSurfaceOnResume(player, playerViewRef)
     val isInPip = rememberIsInPipMode()
     val videoAspect by viewModel.videoAspect.collectAsState()
     val pipController = LocalPipController.current

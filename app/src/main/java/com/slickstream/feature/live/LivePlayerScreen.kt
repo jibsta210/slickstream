@@ -85,12 +85,18 @@ fun LivePlayerScreen(
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
     val playing = state is LivePlayerViewModel.UiState.Playing
+    // The live PlayerView, so the resume-time video-surface repair can reach its SurfaceView.
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
 
     // Keep the TV awake while a live stream is playing/loading (this is a SEPARATE player from the
     // torrent one, so it needs its own wake lock — the screensaver was kicking in during sports).
     com.slickstream.feature.player.KeepScreenOn(
         enabled = playing || state is LivePlayerViewModel.UiState.Buffering,
     )
+
+    // Same resume-time video-surface repair as the VOD players: a feed left paused/idle long enough
+    // for the screensaver came back as audio over a black picture.
+    com.slickstream.feature.player.RebindVideoSurfaceOnResume(player, playerViewRef)
 
     val rootFocus = remember { FocusRequester() }
     val backFocus = remember { FocusRequester() }
@@ -146,6 +152,7 @@ fun LivePlayerScreen(
                         isFocusableInTouchMode = false
                         descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
                         setShutterBackgroundColor(android.graphics.Color.BLACK)
+                        playerViewRef = this
                     }
                 },
                 update = { it.player = player },

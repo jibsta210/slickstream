@@ -221,6 +221,7 @@ class VlcPlayer(
                     // played invisibly under a black view ("every video black, frames flash on
                     // back-press"). Vout(count>0) is the authoritative "video output live" event, so
                     // clear it here too and re-assert the window size so the picture fills the surface.
+                    hasRenderedFrame = true
                     currentSurfaceView?.let { sv ->
                         sv.setBackgroundColor(android.graphics.Color.TRANSPARENT)
                         if (sv.width > 0 && sv.height > 0) applyWindowSize(sv.width, sv.height)
@@ -327,6 +328,9 @@ class VlcPlayer(
     ): ListenableFuture<*> {
         val item = mediaItems.firstOrNull()
         mediaItemField = item
+        // A NEW media item has painted nothing yet, so the anti-"blue box" black backing is earned
+        // again for this source (see [hasRenderedFrame] / [doAttach]).
+        hasRenderedFrame = false
 
         if (item != null) {
             val uriString = item.localConfiguration!!.uri.toString()
@@ -526,8 +530,12 @@ class VlcPlayer(
      * sized. Also attach immediately if the surface is already valid (re-bind case).
      */
     fun attachSurface(surfaceView: SurfaceView) {
+        // Same VIEW re-handed. Do NOT short-circuit on view identity: the same SurfaceView can come
+        // back carrying a BRAND NEW android.view.Surface (screensaver/background return), and a View
+        // check cannot see that — it reports "already attached" and leaves libVLC's vout pointing at a
+        // dead surface, which is exactly audio-over-black. Re-attach whenever the surface is live;
+        // doAttach is idempotent and [attachedSurface] tracks the Surface, not the view.
         if (currentSurfaceView === surfaceView) {
-            // Same surface re-handed: attach now if it's already live.
             if (surfaceView.holder.surface?.isValid == true && surfaceView.width > 0) {
                 doAttach(surfaceView, surfaceView.width, surfaceView.height)
             }
@@ -542,19 +550,42 @@ class VlcPlayer(
     }
 
     private val surfaceCallback = object : SurfaceHolder.Callback {
-        override fun surfaceCreated(holder: SurfaceHolder) {}
+        override fun surfaceCreated(holder: SurfaceHolder) {
+            // Second, independent signal for the same re-attach. Recovery used to ride on
+            // surfaceChanged ALONE, and libVLC itself can't help: AWindow's own SurfaceHolder.Callback
+            // has a surfaceChanged that is a compiled no-op, and its surfaceDestroyed REMOVES that
+            // callback (AWindow.onSurfaceDestroyed -> detachViews -> SurfaceHelper.release), so after a
+            // destroy libVLC hears nothing at all. If doAttach fails here it gets a second chance below.
+            val sv = currentSurfaceView ?: return
+            if (sv.width > 0 && sv.height > 0) doAttach(sv, sv.width, sv.height)
+        }
         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             // Re-attach whenever the vout isn't bound to THIS exact surface. A mid-stream failover
             // remounts PlayerView with a FRESH SurfaceView; a stale voutAttached==true latch (from the
             // previous surface) used to make this a no-op resize, so the new surface never got a vout —
             // AUDIO played over a BLACK screen. The identity check forces a real re-attach.
+            //
+            // The check is on the android.view.Surface, not on the SurfaceView: a screensaver/background
+            // round trip hands back the SAME VIEW with a NEW SURFACE, and a view-level check calls that
+            // "already attached" — the same black-with-audio outcome by a different route.
             val sv = currentSurfaceView
-            if (voutAttached && attachedSurface === sv) applyWindowSize(width, height)
-            else sv?.let { doAttach(it, width, height) }
+            if (voutAttached && attachedView === sv && attachedSurface === holder.surface) {
+                applyWindowSize(width, height)
+            } else {
+                sv?.let { doAttach(it, width, height) }
+            }
         }
         override fun surfaceDestroyed(holder: SurfaceHolder) {
             voutAttached = false
+            attachedView = null
             attachedSurface = null
+            // The anti-BLUE-BOX black backing is scoped to the SURFACE, not to the media item: a brand
+            // new surface has painted nothing, so it shows libVLC's uninitialised buffer (blue) until a
+            // frame lands. hasRenderedFrame is otherwise reset only per media item, so on a
+            // pause -> screensaver -> resume with the SAME item it would still read true and the backing
+            // would be skipped — reinstating the v1.4.53 blue screen on API < 34 boxes, where this
+            // destroy/create pair really does fire. Earn the backing again.
+            hasRenderedFrame = false
             // Disable the video track while there's no surface (mirrors the enable in doAttach) so the
             // next attach's setVideoTrackEnabled(true) is a real transition that rebuilds the vout.
             runCatching { mediaPlayer.setVideoTrackEnabled(false) }
@@ -566,7 +597,19 @@ class VlcPlayer(
     private var voutAttached = false
     /** The exact SurfaceView the vout is currently attached to — so a remounted (different-identity)
      *  surface forces a real re-attach even if [voutAttached] is stale-true. */
-    private var attachedSurface: SurfaceView? = null
+    private var attachedView: SurfaceView? = null
+    /** The exact android.view.Surface the vout is attached to. Tracked SEPARATELY from [attachedView]
+     *  because the same view can be handed back with a new Surface behind it (screensaver return, PiP,
+     *  any window recreate) — view identity says "unchanged" while the vout is in fact pointing at a
+     *  dead buffer producer: video black, audio fine. */
+    private var attachedSurface: android.view.Surface? = null
+
+    /** True once libVLC has actually PAINTED a frame for the current media item (Vout / new-video-layout).
+     *  Gates the opaque black backing in [doAttach]: it is anti-"blue box" protection that is only
+     *  earned BEFORE the first frame. Re-painting it on a LATER re-attach hid a picture that was
+     *  rendering perfectly well — the screensaver-return black screen on the libVLC backend, where a
+     *  PAUSED libVLC decodes nothing, so no Vout event ever arrives to lift the backing again. */
+    private var hasRenderedFrame = false
 
     /**
      * libVLC reports the decoded video layout here. We re-assert the FULL surface as the window so VLC
@@ -582,6 +625,7 @@ class VlcPlayer(
             if (width > 0 && height > 0) {
                 // A real frame is decoding now — drop the black backing so VLC's video shows (and any
                 // letterbox region isn't forced black over the picture).
+                hasRenderedFrame = true
                 currentSurfaceView?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
                 val par = if (sarNum > 0 && sarDen > 0) sarNum.toFloat() / sarDen.toFloat() else 1f
                 videoSize = VideoSize(width, height, par)
@@ -611,14 +655,45 @@ class VlcPlayer(
             // track after attach forces libVLC to (re)create the vout against the now-attached views —
             // the same pattern VLC-android's own VideoPlayerActivity uses. No-op when playback hasn't
             // started yet (the cold-start ordering), so the happy path is untouched.
+            //
+            // DESELECT FIRST *if something is still selected*. `setVideoTrackEnabled(true)` bails out
+            // internally unless the current video track is already -1, so on a re-attach where nothing
+            // deselected it (a background return with NO surfaceDestroyed — the Android 14+
+            // FOLLOWS_ATTACHMENT case) the "true" call is a NO-OP and the vout is never rebuilt: audio
+            // over black. Forcing -1 first makes it a real transition. Guarded on the current track so
+            // the cold-start ordering (no media open yet, track already -1) is bit-for-bit unchanged.
+            if (runCatching { mediaPlayer.videoTrack }.getOrDefault(-1) != -1) {
+                runCatching { mediaPlayer.setVideoTrackEnabled(false) }
+            }
             runCatching { mediaPlayer.setVideoTrackEnabled(true) }
+            // ...and VERIFY, because libVLC can refuse silently: MediaPlayer.setVideoTrack() returns
+            // false without acting while AWindow still reports surfaces "waiting" rather than ready,
+            // and setVideoTrackEnabled discards that boolean. A single posted retry runs after AWindow
+            // has settled, so one unlucky refusal can't strand the session in audio-only black.
+            mainHandler.post {
+                if (currentSurfaceView === surfaceView &&
+                    runCatching { mediaPlayer.videoTrack }.getOrDefault(0) == -1
+                ) {
+                    runCatching { mediaPlayer.setVideoTrackEnabled(true) }
+                }
+            }
             voutAttached = true
-            attachedSurface = surfaceView
+            attachedView = surfaceView
+            attachedSurface = surfaceView.holder?.surface
             // Black out the SurfaceView buffer until VLC paints its first frame — otherwise the
             // uninitialised surface buffer shows through as the Android-TV "blue box" while buffering
             // (a slow source that never decodes a frame left the whole screen blue). Cleared to
             // transparent in [videoLayoutListener] once real video dimensions arrive (decode has begun).
-            surfaceView.setBackgroundColor(android.graphics.Color.BLACK)
+            //
+            // ONLY before the first frame of this media item. This is a View background painted OVER
+            // the SurfaceView's punched hole, so re-painting it on a LATER re-attach hides video that
+            // is rendering fine — and the only things that lift it (Vout / new-video-layout) cannot
+            // fire while libVLC is PAUSED, because a paused libVLC decodes no picture. That is exactly
+            // "pause, screensaver, come back: audio plays, screen black" on the libVLC backend.
+            surfaceView.setBackgroundColor(
+                if (hasRenderedFrame) android.graphics.Color.TRANSPARENT
+                else android.graphics.Color.BLACK
+            )
         }.onFailure {
             voutAttached = false
             Log.e(TAG, "doAttach failed", it)
@@ -626,9 +701,14 @@ class VlcPlayer(
     }
 
     fun detachSurface() {
+        // Hand the view back CLEAN. PlayerView reuses the same SurfaceView across a player swap, so a
+        // VlcPlayer released while its black backing was painted left the next player — including a
+        // fresh ExoPlayer — behind a permanently opaque view.
+        currentSurfaceView?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
         currentSurfaceView?.holder?.removeCallback(surfaceCallback)
         currentSurfaceView = null
         voutAttached = false
+        attachedView = null
         attachedSurface = null
         runCatching { mediaPlayer.setVideoTrackEnabled(false) }
         runCatching { mediaPlayer.vlcVout.detachViews() }

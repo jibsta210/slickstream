@@ -160,6 +160,8 @@ fun TvPlayerScreen(
     var audioPanelOpen by remember { mutableStateOf(false) }
     var episodesPanelOpen by remember { mutableStateOf(false) }
     var isPlaying by remember { mutableStateOf(true) }
+    // The live PlayerView, so the resume-time video-surface repair can reach its SurfaceView.
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
     var scrubbing by remember { mutableStateOf(false) }
     // Fit (letterbox) vs Zoom (crop-to-fill) — toggled from the transport row.
     var zoomFill by remember { mutableStateOf(false) }
@@ -198,6 +200,11 @@ fun TvPlayerScreen(
         // while ExoPlayer re-buffers, which used to drop the flag and let the screensaver start.
         enabled = isPlaying || uiState is PlayerUiState.Buffering || rebuffering != null,
     )
+
+    // ...and when the screensaver DOES legitimately start (paused movie), put the video output back
+    // together on the way in. Without this the surface goes stale behind the Dream and the user comes
+    // back to a black picture with working audio — on ExoPlayer AND on the libVLC fallback.
+    com.slickstream.feature.player.RebindVideoSurfaceOnResume(player, playerViewRef)
 
     val anyPanelOpen = panelOpen || subsPanelOpen || audioPanelOpen || episodesPanelOpen
 
@@ -394,6 +401,7 @@ fun TvPlayerScreen(
                     PlayerView(ctx).apply {
                         useController = false // we draw our own 10-foot transport controls
                         setShutterBackgroundColor(android.graphics.Color.BLACK)
+                        playerViewRef = this
                     }
                 },
                 update = { view ->
