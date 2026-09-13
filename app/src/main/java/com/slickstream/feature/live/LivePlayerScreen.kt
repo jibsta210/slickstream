@@ -12,6 +12,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -46,6 +47,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -56,6 +58,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -116,8 +119,16 @@ fun LivePlayerScreen(
             controlsVisible = false
         }
     }
+    // Is a full-screen overlay (Error / NoStream) currently up? While one is, IT owns the cursor.
+    val overlayUp = state is LivePlayerViewModel.UiState.Error ||
+        state == LivePlayerViewModel.UiState.NoStream
+
     // Keep a focus target: the back button when chrome is up, else the root (so any key re-shows it).
-    LaunchedEffect(controlsVisible, panelOpen, playing) {
+    // EXCEPT while an overlay is up. This effect used to fire on the overlay too and drag focus off the
+    // big Retry button onto the tiny corner back arrow — the one control whose focus treatment is the
+    // faint tint the overlay was rebuilt to get away from. Two writers of focus is a race, not a design.
+    LaunchedEffect(controlsVisible, panelOpen, playing, overlayUp) {
+        if (overlayUp) return@LaunchedEffect
         runCatching {
             when {
                 panelOpen -> Unit
@@ -134,7 +145,14 @@ fun LivePlayerScreen(
             .focusRequester(rootFocus)
             .focusable()
             .onPreviewKeyEvent { e ->
-                if (e.type == KeyEventType.KeyDown && e.key != Key.Back && !controlsVisible && !panelOpen) {
+                // The "any key wakes the chrome" shortcut must NOT run while an overlay is up. A feed
+                // that freezes mid-game does so with the chrome ALREADY auto-hidden (4s), so this
+                // consumed the very first press on the focused Retry button — the press did nothing, and
+                // flipping controlsVisible then pulled focus onto the corner arrow. Pressing OK on an
+                // obviously-highlighted button has to actually press it.
+                if (e.type == KeyEventType.KeyDown && e.key != Key.Back &&
+                    !controlsVisible && !panelOpen && !overlayUp
+                ) {
                     controlsVisible = true
                     true
                 } else {
@@ -169,15 +187,31 @@ fun LivePlayerScreen(
             is LivePlayerViewModel.UiState.Error -> CenterOverlay {
                 Text("Couldn't play this feed", style = MaterialTheme.typography.titleLarge, color = Color.White)
                 Text(s.message, style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim, textAlign = TextAlign.Center)
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(onClick = viewModel::retry) { Text("Retry") }
-                    if (feeds.size > 1) Button(onClick = { panelOpen = true }) { Text("Other streams") }
-                    Button(onClick = onBack) { Text("Back") }
+                // Land the cursor on Retry, so there is always a defined starting point. Without this
+                // the first D-pad press just "wakes up" some arbitrary button and the press is wasted.
+                val retryFocus = remember { FocusRequester() }
+                LaunchedEffect(Unit) {
+                    repeat(12) {
+                        kotlinx.coroutines.delay(40)
+                        if (runCatching { retryFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    OverlayActionButton("Retry", onClick = viewModel::retry, modifier = Modifier.focusRequester(retryFocus))
+                    if (feeds.size > 1) OverlayActionButton("Other streams", onClick = { panelOpen = true })
+                    OverlayActionButton("Back", onClick = onBack)
                 }
             }
             LivePlayerViewModel.UiState.NoStream -> CenterOverlay {
                 Text("No stream selected", style = MaterialTheme.typography.titleLarge, color = Color.White)
-                Button(onClick = onBack) { Text("Back") }
+                val backOnlyFocus = remember { FocusRequester() }
+                LaunchedEffect(Unit) {
+                    repeat(12) {
+                        kotlinx.coroutines.delay(40)
+                        if (runCatching { backOnlyFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                    }
+                }
+                OverlayActionButton("Back", onClick = onBack, modifier = Modifier.focusRequester(backOnlyFocus))
             }
             LivePlayerViewModel.UiState.Playing -> Unit
         }
@@ -320,6 +354,55 @@ private fun StreamRow(
         Text(
             label,
             style = MaterialTheme.typography.titleMedium,
+            color = if (focused) Color.White else Brand.OnSurface,
+        )
+    }
+}
+
+/**
+ * A full-screen-overlay action button with UNMISTAKABLE focus.
+ *
+ * The overlay used plain Material3 [Button]s, whose focus treatment is a faint container tint — on a
+ * TV, across the room, over a dark backdrop, the focused and unfocused buttons were nearly identical
+ * and you could not tell which one Enter would press. Every other TV surface in this app states focus
+ * three ways at once, so this matches: a solid violet fill, a 3.dp white ring, and a size bump.
+ * Redundant on purpose — any ONE of the three is enough to read at a glance.
+ *
+ * Built on foundation APIs rather than androidx.tv.material3 because this screen is shared with the
+ * phone, where the same button has to behave as an ordinary touch target.
+ */
+@Composable
+private fun OverlayActionButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(50)
+    val scale by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (focused) 1.08f else 1f,
+        label = "overlayButtonScale",
+    )
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .clip(shape)
+            .background(if (focused) Brand.Violet else Brand.Surface)
+            .border(
+                width = if (focused) 3.dp else 1.dp,
+                color = if (focused) Color.White else Brand.OnSurfaceDim.copy(alpha = 0.35f),
+                shape = shape,
+            )
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+            .focusable(interactionSource = interaction)
+            .padding(horizontal = 30.dp, vertical = 14.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = if (focused) FontWeight.Bold else FontWeight.Medium,
             color = if (focused) Color.White else Brand.OnSurface,
         )
     }

@@ -75,6 +75,23 @@ class SportsViewModel @Inject constructor(
 
     private var eventsJob: Job? = null
 
+    /**
+     * The event card the cursor was last on, so returning from the live player puts you back on the
+     * GAME you were watching rather than dumping focus at the top of the screen.
+     *
+     * Deliberately held on the ViewModel, not in the composable. The Sports screen LEAVES COMPOSITION
+     * while the player is on top of it, so anything in a `remember` is gone by the time you press Back
+     * — which is exactly why focus used to reset. This ViewModel is scoped to the Sports back-stack
+     * entry, which stays alive underneath the player, so this field survives precisely as long as the
+     * screen it describes. Plain var, not State: nothing should recompose when it changes, it is read
+     * once on the way back in.
+     */
+    var lastFocusedEventId: String? = null
+        private set
+
+    /** Called as the D-pad moves across the grid. Cheap by design — a field write per focus change. */
+    fun rememberFocusedEvent(id: String) { lastFocusedEventId = id }
+
     fun select(categoryId: String) {
         // Select-on-focus drives this from the TV chip rail, so ignore re-selecting the current tab
         // and cancel any in-flight load when the tab changes (no stale results racing in).

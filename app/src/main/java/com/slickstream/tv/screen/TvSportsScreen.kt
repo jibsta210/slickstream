@@ -74,6 +74,21 @@ fun TvSportsScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val sheet by viewModel.sheet.collectAsStateWithLifecycle()
 
+    // RETURNING FROM THE PLAYER. This screen leaves composition while the player is on top, so it is
+    // rebuilt from scratch on the way back and every `remember` is already gone — which is why focus
+    // used to land back at the top of the screen (and, when the chip request lost its race, on the nav
+    // rail) instead of on the game you had just been watching. The id is snapshotted ONCE per entry so
+    // that moving around afterwards cannot re-trigger a restore mid-session.
+    // Held as SCREEN-level state and cleared the instant the restore resolves, either way. It cannot
+    // live inside TvEventList: `select()` empties the event list, which routes the list through its
+    // loading branch and DESTROYS that composition scope — so a guard kept down there was rebuilt on
+    // every category change and the stale restore fired again, throwing focus to the first chip (and,
+    // through select-on-focus, silently changing the league you had just picked).
+    var restoreTarget by remember { mutableStateOf(viewModel.lastFocusedEventId) }
+    // Only the FAILURE path may hand the cursor to the chip row. Flipping this on success too would
+    // have let the chips fire straight after the restore and steal the focus right back off the card.
+    var chipMayBootstrap by remember { mutableStateOf(restoreTarget == null) }
+
     Box(modifier = modifier.fillMaxSize()) {
         Column(
             // Outer pad trimmed — the screen-wide overscan inset in TvApp supplies the safe margin.
@@ -93,9 +108,27 @@ fun TvSportsScreen(
                 state.error != null && state.categories.isEmpty() ->
                     TvErrorRetry(message = state.error!!, onRetry = viewModel::retry, modifier = Modifier.fillMaxSize())
                 else -> {
-                    TvSportsChips(state.categories, state.selectedId, viewModel::select)
+                    // While a restore is pending the chip row must NOT grab the cursor: both would
+                    // request focus and the last one to land would win, which is a race, not a design.
+                    TvSportsChips(
+                        categories = state.categories,
+                        selectedId = state.selectedId,
+                        onSelect = viewModel::select,
+                        bootstrapFocus = chipMayBootstrap,
+                    )
                     Spacer(Modifier.height(18.dp))
-                    TvEventList(state.events, state.loadingEvents, state.error, viewModel::openStreams)
+                    TvEventList(
+                        events = state.events,
+                        loading = state.loadingEvents,
+                        error = state.error,
+                        onClick = viewModel::openStreams,
+                        onFocused = viewModel::rememberFocusedEvent,
+                        restoreEventId = restoreTarget,
+                        onRestoreResolved = { landed ->
+                            restoreTarget = null
+                            if (!landed) chipMayBootstrap = true
+                        },
+                    )
                 }
             }
         }
@@ -118,11 +151,19 @@ fun TvSportsScreen(
 }
 
 @Composable
-private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, onSelect: (String) -> Unit) {
+private fun TvSportsChips(
+    categories: List<SportCategory>,
+    selectedId: String?,
+    onSelect: (String) -> Unit,
+    bootstrapFocus: Boolean = true,
+) {
     // Auto-load the focused tab, but DEBOUNCED: settle on a chip for 250ms before switching, so
     // scrubbing the D-pad across the row doesn't fire a cancelling network load + grid wipe per
     // chip (the #1 cause of the choppiness). A click still switches instantly.
-    var focusedId by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    // Seeded with the ACTIVE tab, not null. The debounce below only fires when the focused chip differs
+    // from the selected one, so seeding it means landing the cursor on the tab you are already on is a
+    // no-op rather than a category change.
+    var focusedId by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(selectedId) }
     LaunchedEffect(focusedId) {
         val id = focusedId ?: return@LaunchedEffect
         kotlinx.coroutines.delay(250)
@@ -132,12 +173,20 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
     // event. Fires once, retried past layout so the request lands.
     val firstFocus = remember { FocusRequester() }
     var didFocus by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-    LaunchedEffect(categories.isNotEmpty()) {
-        if (categories.isNotEmpty() && !didFocus) {
+    // Keep retrying until a chip REPORTS focus, not merely until requestFocus() stops throwing.
+    // requestFocus() returns Unit and throws only when no node is attached, so the old `.isSuccess`
+    // test passed the moment the row existed — a request that attached but never moved the cursor ended
+    // the loop as a success and left the screen with nothing focused, which is how focus ends up
+    // stranded on the nav rail. This row is now also the fallback for a failed game restore, so a silent
+    // no-op here would put the user right back in the bug they reported.
+    var chipFocused by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    LaunchedEffect(categories.isNotEmpty(), bootstrapFocus) {
+        if (bootstrapFocus && categories.isNotEmpty() && !didFocus) {
             didFocus = true
             repeat(12) {
+                runCatching { firstFocus.requestFocus() }
                 kotlinx.coroutines.delay(40)
-                if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+                if (chipFocused) return@LaunchedEffect
             }
         }
     }
@@ -161,8 +210,24 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
                 ),
                 scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.06f),
                 modifier = Modifier
-                    .then(if (index == 0) Modifier.focusRequester(firstFocus) else Modifier)
-                    .onFocusChanged { if (it.isFocused) focusedId = c.id },
+                    // The SELECTED chip, not chip 0. At launch these are the same thing (the first
+                    // category is auto-selected), but the restore-failure handoff can fire while you are
+                    // on category #5 — and because focusing a chip auto-selects it after 250ms, landing
+                    // on chip 0 would not just move the cursor, it would silently switch you back to the
+                    // first league.
+                    .then(
+                        if (c.id == selectedId || (selectedId == null && index == 0)) {
+                            Modifier.focusRequester(firstFocus)
+                        } else {
+                            Modifier
+                        },
+                    )
+                    .onFocusChanged {
+                        if (it.isFocused) {
+                            focusedId = c.id
+                            chipFocused = true
+                        }
+                    },
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -191,26 +256,96 @@ private fun TvSportsChips(categories: List<SportCategory>, selectedId: String?, 
 }
 
 @Composable
-private fun TvEventList(events: List<SportEvent>, loading: Boolean, error: String?, onClick: (SportEvent) -> Unit) {
+private fun TvEventList(
+    events: List<SportEvent>,
+    loading: Boolean,
+    error: String?,
+    onClick: (SportEvent) -> Unit,
+    onFocused: (String) -> Unit = {},
+    restoreEventId: String? = null,
+    onRestoreResolved: (landed: Boolean) -> Unit = {},
+) {
     when {
         loading && events.isEmpty() -> TvLoading(Modifier.fillMaxSize())
-        events.isEmpty() -> TvCenteredMessage(error ?: "No events scheduled here right now.")
-        else -> LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            contentPadding = PaddingValues(bottom = 48.dp, end = 24.dp),
-            modifier = Modifier.fillMaxSize(),
-        ) {
-            // events are deduped by id in the ViewModel, so this key is collision-free (a duplicate
-            // provider id used to crash the grid with "Key was already used").
-            gridItems(events, key = { it.id }) { event -> TvEventCard(event, onClick) }
+        events.isEmpty() -> {
+            // Nothing to restore onto — release the chip row so the screen is not left unfocusable.
+            LaunchedEffect(restoreEventId) { if (restoreEventId != null) onRestoreResolved(false) }
+            TvCenteredMessage(error ?: "No events scheduled here right now.")
+        }
+        else -> {
+            val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+            val restoreIndex = remember(events, restoreEventId) {
+                restoreEventId?.let { id -> events.indexOfFirst { it.id == id }.takeIf { it >= 0 } }
+            }
+            val restoreFocus = remember { FocusRequester() }
+
+            // Put the cursor back on the game you came from. The card must be SCROLLED IN first: a
+            // LazyVerticalGrid does not compose off-screen items, so an un-scrolled requester belongs to
+            // no node and the request is silently dropped. The retry loop then covers the frames before
+            // layout settles — requestFocus() returning without throwing only means a node was attached.
+            // Did the target card ACTUALLY take focus? requestFocus() returns Unit and throws only when
+            // no node is attached, so `runCatching { … }.isSuccess` proves the card exists — not that the
+            // cursor moved. Believing it meant a rejected request counted as success, the fallback never
+            // ran, and the screen was left with nothing focused: precisely the nav-rail symptom this is
+            // meant to cure. So the card itself reports the truth, via onFocusChanged.
+            var landed by remember(restoreEventId) { mutableStateOf(false) }
+            LaunchedEffect(restoreEventId, restoreIndex, loading) {
+                if (restoreEventId == null) return@LaunchedEffect
+                if (restoreIndex == null) {
+                    // Loaded, but this game is gone — a finished fixture drops off the feed.
+                    if (!loading) onRestoreResolved(false)
+                    return@LaunchedEffect
+                }
+                // A LazyVerticalGrid does not compose off-screen items, so an un-scrolled requester
+                // belongs to no node and the request is dropped on the floor.
+                runCatching { gridState.scrollToItem(restoreIndex) }
+                repeat(12) {
+                    runCatching { restoreFocus.requestFocus() }
+                    kotlinx.coroutines.delay(40)
+                    if (landed) { onRestoreResolved(true); return@LaunchedEffect }
+                }
+                // Twelve frames and it never landed: hand the cursor to the chip row rather than leave
+                // the screen with nothing focused, which is exactly what strands it on the nav rail.
+                onRestoreResolved(false)
+            }
+
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(2),
+                state = gridState,
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+                contentPadding = PaddingValues(bottom = 48.dp, end = 24.dp),
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                // events are deduped by id in the ViewModel, so this key is collision-free (a duplicate
+                // provider id used to crash the grid with "Key was already used").
+                gridItems(events, key = { it.id }) { event ->
+                    TvEventCard(
+                        event = event,
+                        onClick = onClick,
+                        onFocused = { id ->
+                            if (id == restoreEventId) landed = true
+                            onFocused(id)
+                        },
+                        modifier = if (event.id == restoreEventId) {
+                            Modifier.focusRequester(restoreFocus)
+                        } else {
+                            Modifier
+                        },
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun TvEventCard(event: SportEvent, onClick: (SportEvent) -> Unit) {
+private fun TvEventCard(
+    event: SportEvent,
+    onClick: (SportEvent) -> Unit,
+    onFocused: (String) -> Unit = {},
+    modifier: Modifier = Modifier,
+) {
     val shape = RoundedCornerShape(14.dp)
     Surface(
         onClick = { onClick(event) },
@@ -225,7 +360,11 @@ private fun TvEventCard(event: SportEvent, onClick: (SportEvent) -> Unit) {
             focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White), shape = shape),
         ),
         scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.04f),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            // Recorded as the cursor moves so Back returns to wherever you actually were, not only to
+            // the game you opened.
+            .onFocusChanged { if (it.isFocused) onFocused(event.id) },
     ) {
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(
