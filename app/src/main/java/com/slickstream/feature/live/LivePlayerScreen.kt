@@ -87,7 +87,13 @@ fun LivePlayerScreen(
 
     var controlsVisible by remember { mutableStateOf(true) }
     var panelOpen by remember { mutableStateOf(false) }
-    val playing = state is LivePlayerViewModel.UiState.Playing
+    // Recovering counts as "playing" for every CHROME decision. The last decoded frame is still on
+    // screen and the retry engine is repairing the feed underneath it, so the chrome must behave
+    // exactly as it did a second earlier — auto-hidden, switch-stream chip available, screen awake.
+    // Treating a 2-second self-healing hiccup as "not playing" would pop the back arrow and the chip
+    // back up every few minutes, which is the flicker the user was already annoyed by.
+    val playing = state is LivePlayerViewModel.UiState.Playing ||
+        state is LivePlayerViewModel.UiState.Recovering
     // The live PlayerView, so the resume-time video-surface repair can reach its SurfaceView.
     var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
 
@@ -213,6 +219,12 @@ fun LivePlayerScreen(
                 }
                 OverlayActionButton("Back", onClick = onBack, modifier = Modifier.focusRequester(backOnlyFocus))
             }
+            // Non-blocking, and deliberately NOT a CenterOverlay: the frozen frame stays visible and
+            // the user can still open the stream switcher. The whole point of the badge is to stop the
+            // UI lying that it is Playing while the picture is stuck — without escalating a hiccup the
+            // engine is about to fix into the 3-button dead end.
+            is LivePlayerViewModel.UiState.Recovering ->
+                ReconnectingBadge(s.message, Modifier.align(Alignment.TopCenter))
             LivePlayerViewModel.UiState.Playing -> Unit
         }
 
@@ -405,6 +417,33 @@ private fun OverlayActionButton(
             fontWeight = if (focused) FontWeight.Bold else FontWeight.Medium,
             color = if (focused) Color.White else Brand.OnSurface,
         )
+    }
+}
+
+/**
+ * "Reconnecting…" over a frozen picture — the honest version of what the live player used to do,
+ * which was to keep claiming `Playing` while nothing moved.
+ *
+ * A pill, not an overlay, on purpose: the automatic ladder in [LivePlayerViewModel] fixes the great
+ * majority of these within a couple of seconds, and blacking out the game to announce that would be
+ * worse than the freeze. The 3-button Error overlay stays reserved for a genuinely exhausted feed.
+ */
+@Composable
+private fun ReconnectingBadge(message: String, modifier: Modifier = Modifier) {
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = Color(0xCC000000),
+        contentColor = Color.White,
+        modifier = modifier.padding(top = 24.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(color = Brand.Violet, strokeWidth = 2.5.dp, modifier = Modifier.size(18.dp))
+            Text(message, style = MaterialTheme.typography.labelLarge, color = Color.White)
+        }
     }
 }
 
