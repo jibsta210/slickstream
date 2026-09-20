@@ -32,6 +32,12 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        with:
+          # Don't install the obsolete `tools` meta-package. The runner's cmdline-tools 16.0 dropped
+          # it, so the action's default `packages: tools platform-tools` fails with "Failed to find
+          # package 'tools'" before the build ever starts. platform-tools is all we need up front;
+          # AGP auto-downloads the required platform + build-tools during the Gradle build.
+          packages: 'platform-tools'
 
       - name: Decode keystore
         run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/slickstream-release.jks"
