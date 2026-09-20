@@ -51,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -116,29 +117,48 @@ fun LivePlayerScreen(
             expandedId != null -> {
                 val s = sessions.firstOrNull { it.id == expandedId }
                 if (s != null) {
+                    // The chrome chip sits INSIDE the full-screen tile's bounds, so 2D focus search
+                    // cannot find it from the tile. Wire UP/DOWN explicitly.
+                    val tileFocus = remember { FocusRequester() }
+                    val chipFocus = remember { FocusRequester() }
                     LiveTile(
                         session = s,
                         audible = s.id == audibleId,
                         cornerLabel = false,
                         onOpenMenu = { menuForId = s.id },
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusRequester(tileFocus)
+                            .focusProperties { up = chipFocus },
                     )
-                    ExpandedChrome(title = s.title, onCollapse = viewModel::collapse)
+                    ExpandedChrome(
+                        title = s.title,
+                        onCollapse = viewModel::collapse,
+                        chipFocus = chipFocus,
+                        tileFocus = tileFocus,
+                    )
                 }
             }
             layout == LiveMultiView.Layout.SINGLE -> {
                 val s = sessions.first()
+                val tileFocus = remember { FocusRequester() }
+                val backFocus = remember { FocusRequester() }
                 LiveTile(
                     session = s,
                     audible = s.id == audibleId,
                     cornerLabel = false,
                     onOpenMenu = { menuForId = s.id },
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .focusRequester(tileFocus)
+                        .focusProperties { up = backFocus },
                 )
                 SingleChrome(
                     onBack = onBack,
                     onAdd = viewModel::openPicker.takeIf { canAdd },
                     onSwitchFeed = { feedSwitchForId = s.id }.takeIf { s.feeds.size > 1 },
+                    backFocus = backFocus,
+                    tileFocus = tileFocus,
                 )
             }
             layout == LiveMultiView.Layout.PIP -> PipLayout(
@@ -171,6 +191,7 @@ fun LivePlayerScreen(
                 onListen = { viewModel.setAudible(id); menuForId = null },
                 onSwitchFeed = { menuForId = null; feedSwitchForId = id },
                 onRemove = { viewModel.removeSession(id); menuForId = null },
+                onExit = { menuForId = null; onBack() },
                 onDismiss = { menuForId = null },
             )
         }
@@ -223,8 +244,28 @@ private fun PipLayout(
 ) {
     val primary = sessions[0]
     val secondary = sessions[1]
+    // EVERYTHING here overlaps the full-screen tile — the corner tile, the Back arrow, the Add chip
+    // all sit inside its bounds. Compose's D-pad focus search only considers targets BEYOND the
+    // focused rect, so from the big picture there was nothing to move to and the user was stuck
+    // (the grid never had this problem: its cells don't overlap). Spell the graph out instead.
+    val primaryFocus = remember { FocusRequester() }
+    val cornerFocus = remember { FocusRequester() }
+    val backFocus = remember { FocusRequester() }
     Box(Modifier.fillMaxSize()) {
-        LiveTile(primary, primary.id == audibleId, cornerLabel = false, onOpenMenu = { onOpenMenu(primary.id) }, modifier = Modifier.fillMaxSize())
+        LiveTile(
+            session = primary,
+            audible = primary.id == audibleId,
+            cornerLabel = false,
+            onOpenMenu = { onOpenMenu(primary.id) },
+            modifier = Modifier
+                .fillMaxSize()
+                .focusRequester(primaryFocus)
+                .focusProperties {
+                    up = backFocus
+                    right = cornerFocus
+                    down = cornerFocus
+                },
+        )
         // Corner overlay — a real focusable tile, so OK on it opens its menu just like a grid cell.
         LiveTile(
             session = secondary,
@@ -235,9 +276,20 @@ private fun PipLayout(
                 .align(Alignment.BottomEnd)
                 .padding(24.dp)
                 .fillMaxWidth(0.34f)
-                .aspectRatio(16f / 9f),
+                .aspectRatio(16f / 9f)
+                .focusRequester(cornerFocus)
+                .focusProperties {
+                    left = primaryFocus
+                    up = primaryFocus
+                },
         )
-        SingleChrome(onBack = onBack, onAdd = onAdd, onSwitchFeed = null)
+        SingleChrome(
+            onBack = onBack,
+            onAdd = onAdd,
+            onSwitchFeed = null,
+            backFocus = backFocus,
+            tileFocus = primaryFocus,
+        )
     }
 }
 
@@ -435,35 +487,60 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
     onBack: () -> Unit,
     onAdd: (() -> Unit)?,
     onSwitchFeed: (() -> Unit)?,
+    backFocus: FocusRequester,
+    tileFocus: FocusRequester,
 ) {
     // Always visible, small, in the corners. Auto-hiding chrome would need a re-wake key that competes
     // with the focusable tile underneath; on a full-screen game these three chips are unobtrusive and
     // always reachable, which matters more here than hiding them.
+    //
+    // Every chip points DOWN at the tile explicitly: the tile encloses the chips, so geometric focus
+    // search from a chip finds nothing "below" it either. Without this you could get up here and
+    // never get back onto the picture.
     Row(
         Modifier.align(Alignment.TopStart).padding(16.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        RoundIconButton(Icons.AutoMirrored.Rounded.ArrowBack, "Back", onBack)
+        RoundIconButton(
+            Icons.AutoMirrored.Rounded.ArrowBack,
+            "Back",
+            onBack,
+            modifier = Modifier.focusRequester(backFocus).focusProperties { down = tileFocus },
+        )
     }
     Row(
         Modifier.align(Alignment.TopEnd).padding(16.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (onSwitchFeed != null) ChromeChip(Icons.Rounded.GridView, "Switch stream", onSwitchFeed)
-        if (onAdd != null) ChromeChip(Icons.Rounded.Add, "Add game", onAdd)
+        if (onSwitchFeed != null) {
+            ChromeChip(Icons.Rounded.GridView, "Switch stream", onSwitchFeed, Modifier.focusProperties { down = tileFocus })
+        }
+        if (onAdd != null) {
+            ChromeChip(Icons.Rounded.Add, "Add game", onAdd, Modifier.focusProperties { down = tileFocus })
+        }
     }
 }
 
 @Composable
-private fun androidx.compose.foundation.layout.BoxScope.ExpandedChrome(title: String, onCollapse: () -> Unit) {
+private fun androidx.compose.foundation.layout.BoxScope.ExpandedChrome(
+    title: String,
+    onCollapse: () -> Unit,
+    chipFocus: FocusRequester,
+    tileFocus: FocusRequester,
+) {
     Row(
         Modifier.align(Alignment.TopStart).padding(16.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ChromeChip(Icons.Rounded.GridView, "Back to grid", onCollapse)
+        ChromeChip(
+            Icons.Rounded.GridView,
+            "Back to grid",
+            onCollapse,
+            Modifier.focusRequester(chipFocus).focusProperties { down = tileFocus },
+        )
         Text(title, color = Color.White, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(360.dp))
     }
 }
@@ -481,6 +558,7 @@ private fun androidx.compose.foundation.layout.BoxScope.TileMenu(
     onListen: () -> Unit,
     onSwitchFeed: () -> Unit,
     onRemove: () -> Unit,
+    onExit: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     BackHandler(enabled = true) { onDismiss() }
@@ -507,6 +585,10 @@ private fun androidx.compose.foundation.layout.BoxScope.TileMenu(
             if (!audible) MenuRow("Listen to this game", onListen)
             if (canSwitchFeed) MenuRow("Switch feed", onSwitchFeed)
             MenuRow("Remove", onRemove, destructive = true)
+            // A guaranteed way out from ANY layout, two presses from any tile. The grid has no chrome
+            // at all, and in PiP the Back arrow was unreachable by D-pad, so this is the exit that
+            // never depends on focus geometry.
+            MenuRow("Exit to Sports", onExit)
         }
     }
 }
@@ -696,12 +778,17 @@ private fun PillButton(label: String, onClick: () -> Unit, modifier: Modifier = 
 }
 
 @Composable
-private fun ChromeChip(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
+private fun ChromeChip(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     val shape = RoundedCornerShape(50)
     Row(
-        modifier = Modifier
+        modifier = modifier
             .clip(shape)
             .background(if (focused) Brand.Violet else Color(0x66000000))
             .border(if (focused) 3.dp else 0.dp, if (focused) Color.White else Color.Transparent, shape)
@@ -717,11 +804,16 @@ private fun ChromeChip(icon: androidx.compose.ui.graphics.vector.ImageVector, la
 }
 
 @Composable
-private fun RoundIconButton(icon: androidx.compose.ui.graphics.vector.ImageVector, desc: String, onClick: () -> Unit) {
+private fun RoundIconButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    desc: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(44.dp)
             .clip(CircleShape)
             .background(if (focused) Brand.Violet else Color(0x66000000))
