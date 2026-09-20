@@ -177,6 +177,7 @@ class PlayerViewModel @Inject constructor(
     private val vlcEngine: VlcEngine,
     private val downloadManager: DownloadManager,
     private val diagnostics: com.slickstream.core.diagnostics.Diagnostics,
+    private val livePlaybackHolder: com.slickstream.feature.live.LivePlaybackHolder,
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
 
@@ -2481,6 +2482,28 @@ class PlayerViewModel @Inject constructor(
                 maybeWarmNextEpisode()
             }
         }
+    }
+
+    /**
+     * "Add to multiview": hand THIS title, at THIS position, to the multiview screen as its first
+     * tile, so games can be added beside it. Progress is saved first, so if the tile fails to start
+     * the film is still exactly where it was in Continue Watching. Returns false when there is
+     * nothing to hand off yet (details not loaded).
+     */
+    fun handOffToMultiview(): Boolean {
+        val d = details ?: return false
+        val p: Player? = _player.value ?: vlcPlayer
+        val position = p?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        val duration = p?.duration?.takeIf { it > 0L } ?: 0L
+        saveProgressNow()
+        livePlaybackHolder.setMedia(
+            com.slickstream.feature.live.LivePlaybackHolder.MediaSeed(
+                item = d.item, season = currentSeason, episode = currentEpisode,
+                positionMs = position, durationMs = duration,
+            ),
+        )
+        diagnostics.breadcrumb("player.multiview handoff s=$currentSeason e=$currentEpisode pos=$position")
+        return true
     }
 
     private fun progressSnapshot(updatedAt: Long = System.currentTimeMillis()): Pair<MediaItem, PlaybackProgress>? {

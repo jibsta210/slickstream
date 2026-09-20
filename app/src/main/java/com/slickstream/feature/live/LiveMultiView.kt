@@ -92,6 +92,10 @@ object LiveMultiView {
 
     fun cellFor(position: Int): Cell = Cell(row = position / 2, col = position % 2)
 
+    /** "Title · S1 E3" for an episode, plain title for a movie. What a media tile is labelled. */
+    fun mediaLabel(title: String, season: Int?, episode: Int?): String =
+        if (season != null && episode != null) "$title · S$season E$episode" else title
+
     /**
      * The message shown when a box runs out of decoders. Stated as a fact about THIS device, with
      * the number it managed, so the user learns their ceiling instead of retrying forever.

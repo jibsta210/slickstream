@@ -305,6 +305,16 @@ fun TvApp() {
                                         launchSingleTop = true
                                     }
                                 },
+                                // "Add to multiview": REPLACE the player with the multiview screen so the
+                                // single-title player (and its torrent/decoder) is released and the film
+                                // continues as a tile. Back from multiview returns to browse, not to a
+                                // second copy of the same film.
+                                onOpenMultiview = {
+                                    navController.navigate(Routes.LIVE) {
+                                        popUpTo(Routes.PLAYER) { inclusive = true }
+                                        launchSingleTop = true
+                                    }
+                                },
                             )
                         }
                     }

@@ -48,8 +48,8 @@ import kotlinx.coroutines.launch
  */
 @OptIn(UnstableApi::class)
 class LiveSession(
-    val id: Int,
-    val title: String,
+    override val id: Int,
+    override val title: String,
     val feeds: List<LivePlaybackHolder.Feed>,
     startIndex: Int,
     private val appContext: Context,
@@ -57,21 +57,14 @@ class LiveSession(
     private val diagnostics: Diagnostics,
     private val audioCode: () -> String,
     private val scope: CoroutineScope,
-) {
+) : TileSession {
 
-    sealed interface UiState {
-        data object Buffering : UiState
-        data object Playing : UiState
-        data class Recovering(val message: String) : UiState
-        data class Error(val message: String) : UiState
-        data object NoStream : UiState
-    }
 
-    private val _uiState = MutableStateFlow<UiState>(UiState.Buffering)
-    val uiState: StateFlow<UiState> = _uiState.asStateFlow()
+    private val _uiState = MutableStateFlow<TileUiState>(TileUiState.Buffering)
+    override val uiState: StateFlow<TileUiState> = _uiState.asStateFlow()
 
     private val _player = MutableStateFlow<ExoPlayer?>(null)
-    val player: StateFlow<ExoPlayer?> = _player.asStateFlow()
+    override val player: StateFlow<ExoPlayer?> = _player.asStateFlow()
 
     private val _currentIndex = MutableStateFlow(startIndex.coerceIn(0, (feeds.size - 1).coerceAtLeast(0)))
     val currentIndex: StateFlow<Int> = _currentIndex.asStateFlow()
@@ -99,14 +92,14 @@ class LiveSession(
 
     fun start() {
         if (feeds.isEmpty()) {
-            _uiState.value = UiState.NoStream
+            _uiState.value = TileUiState.NoStream
             return
         }
         play(_currentIndex.value)
     }
 
     /** Only one tile is heard at a time; the rest are muted at the player, not merely lowered. */
-    fun setAudible(value: Boolean) {
+    override fun setAudible(value: Boolean) {
         if (audible == value) return
         audible = value
         _player.value?.let { runCatching { it.volume = if (value) 1f else 0f } }
@@ -117,14 +110,14 @@ class LiveSession(
      * Disabling the video TRACK releases the codec; re-enabling re-inits it — a ~1s cost paid only
      * when collapsing back to the grid, versus a cold player rebuild.
      */
-    fun setVideoEnabled(value: Boolean) {
+    override fun setVideoEnabled(value: Boolean) {
         if (videoEnabled == value) return
         videoEnabled = value
         _player.value?.let { applyTrackParams(it) }
     }
 
     /** Cap the decoded rendition to the size the tile is actually drawn at (grid/PiP), or null for full. */
-    fun setVideoCap(cap: LiveMultiView.VideoCap?) {
+    override fun setVideoCap(cap: LiveMultiView.VideoCap?) {
         if (videoCap == cap) return
         videoCap = cap
         _player.value?.let { applyTrackParams(it) }
@@ -157,11 +150,11 @@ class LiveSession(
         attempt = 0
         hasReachedPlaying = false
         monitor.reset()
-        _uiState.value = UiState.Buffering
+        _uiState.value = TileUiState.Buffering
         playJob = scope.launch {
             runCatching {
                 if (feed.needsResolution && !resolver.isWebViewAvailable()) {
-                    _uiState.value = UiState.Error(
+                    _uiState.value = TileUiState.Error(
                         "Live sports need Android System WebView, which isn't available on this device. " +
                             "Install/enable it from the Play Store, then try again.",
                     )
@@ -256,11 +249,11 @@ class LiveSession(
             when (state) {
                 Player.STATE_READY -> {
                     hasReachedPlaying = true
-                    _uiState.value = UiState.Playing
+                    _uiState.value = TileUiState.Playing
                 }
                 Player.STATE_BUFFERING ->
-                    if (_uiState.value !is UiState.Playing && _uiState.value !is UiState.Recovering) {
-                        _uiState.value = UiState.Buffering
+                    if (_uiState.value !is TileUiState.Playing && _uiState.value !is TileUiState.Recovering) {
+                        _uiState.value = TileUiState.Buffering
                     }
                 else -> Unit
             }
@@ -303,7 +296,7 @@ class LiveSession(
 
     private fun onHealthyTick(playingForMs: Long) {
         hasReachedPlaying = true
-        if (_uiState.value !is UiState.Playing) _uiState.value = UiState.Playing
+        if (_uiState.value !is TileUiState.Playing) _uiState.value = TileUiState.Playing
         val idx = _currentIndex.value
         val health = feedHealth[idx] ?: LiveFeedHealth()
         feedHealth[idx] = health.copy(totalPlayedMs = health.totalPlayedMs + LiveRecoveryPlan.WATCHDOG_TICK_MS)
@@ -342,11 +335,11 @@ class LiveSession(
         val p = _player.value
         recoveryJob = scope.launch {
             if (step.action != LiveRecoveryAction.GIVE_UP) {
-                _uiState.value = UiState.Recovering(labelFor(step.action))
+                _uiState.value = TileUiState.Recovering(labelFor(step.action))
             }
             if (step.delayMs > 0) {
                 delay(step.delayMs)
-                if (_uiState.value is UiState.Playing) {
+                if (_uiState.value is TileUiState.Playing) {
                     attempt = (attempt - 1).coerceAtLeast(0)
                     return@launch
                 }
@@ -368,7 +361,7 @@ class LiveSession(
                 LiveRecoveryAction.GIVE_UP -> {
                     markFeedFailed(idx)
                     watchdogJob?.cancel()
-                    _uiState.value = UiState.Error(
+                    _uiState.value = TileUiState.Error(
                         if (hasReachedPlaying) "This feed keeps dropping and we couldn't get it back. Try another source."
                         else "This feed didn't load. Try another source.",
                     )
@@ -429,7 +422,7 @@ class LiveSession(
             null
         }
         if (target != null) switchTo(target, auto = true)
-        else _uiState.value = UiState.Error("Couldn't find a playable stream for this feed. Try another source.")
+        else _uiState.value = TileUiState.Error("Couldn't find a playable stream for this feed. Try another source.")
     }
 
     private fun markFeedFailed(index: Int) {
@@ -471,9 +464,9 @@ class LiveSession(
     }
 
     /** Manual retry from the tile's error overlay: a clean restart of this feed, budget reset. */
-    fun retry() = switchTo(_currentIndex.value, auto = false)
+    override fun retry() = switchTo(_currentIndex.value, auto = false)
 
-    fun release() {
+    override fun release() {
         generation++
         watchdogJob?.cancel()
         recoveryJob?.cancel()

@@ -69,15 +69,15 @@ import com.slickstream.feature.sports.SportEvent
 import com.slickstream.ui.theme.Brand
 
 /**
- * Live-sports player — now MULTIVIEW. One game is the classic full-screen player; two is
- * picture-in-picture; three or four is a 2x2 grid. Each tile is an independent, self-healing
- * [LiveSession]; this file is only the layout, the D-pad focus, and the deliberately-obvious way to
- * add another game.
+ * MULTIVIEW. One tile is the classic full-screen player; two is picture-in-picture; three or four is
+ * a 2x2 grid. A tile is a live game ([LiveSession]) or a movie/episode ([MediaSession]); this file
+ * is only the layout, the D-pad focus, and the deliberately-obvious way to add another.
  *
  * The interaction model is built for a remote across a room: focus a tile (bright ring), press OK for
- * a small styled menu — Watch full / Listen / Switch feed / Remove. An empty grid cell is itself the
- * "＋ Add game" button, so there is no mode to discover. Shared with the phone, where the same
- * focusable/clickable surfaces work as taps.
+ * a small styled menu — Watch full screen / Listen / Retry / Switch feed / Remove / Exit. An empty grid
+ * cell is itself the "＋ Add" button, so there is no mode to discover. The Add browser asks WHAT KIND
+ * first — Continue watching, Favourites, or a sport — and never assumes you want more of what is
+ * already on. Shared with the phone, where the same focusable/clickable surfaces work as taps.
  */
 @OptIn(UnstableApi::class)
 @Composable
@@ -93,12 +93,9 @@ fun LivePlayerScreen(
     val canAdd by viewModel.canAdd.collectAsStateWithLifecycle()
     val picker by viewModel.picker.collectAsStateWithLifecycle()
 
-    // The whole screen means to keep playing — hold the TV awake regardless of any single tile's phase.
     com.slickstream.feature.player.KeepScreenOn(enabled = sessions.isNotEmpty())
 
-    // Per-tile menu (null = none open). Holds the session id the menu acts on.
     var menuForId by remember { mutableStateOf<Int?>(null) }
-    // Per-tile feed switcher (null = none open).
     var feedSwitchForId by remember { mutableStateOf<Int?>(null) }
 
     BackHandler {
@@ -156,7 +153,7 @@ fun LivePlayerScreen(
                 SingleChrome(
                     onBack = onBack,
                     onAdd = viewModel::openPicker.takeIf { canAdd },
-                    onSwitchFeed = { feedSwitchForId = s.id }.takeIf { s.feeds.size > 1 },
+                    onSwitchFeed = { feedSwitchForId = s.id }.takeIf { s.feedCount() > 1 },
                     backFocus = backFocus,
                     tileFocus = tileFocus,
                 )
@@ -177,7 +174,6 @@ fun LivePlayerScreen(
             )
         }
 
-        // Per-tile action menu.
         menuForId?.let { id ->
             val s = sessions.firstOrNull { it.id == id }
             if (s == null) menuForId = null
@@ -185,10 +181,11 @@ fun LivePlayerScreen(
                 title = s.title,
                 expanded = expandedId == id,
                 audible = audibleId == id,
-                canSwitchFeed = s.feeds.size > 1,
+                canSwitchFeed = s.feedCount() > 1,
                 onWatchFull = { viewModel.expand(id); menuForId = null },
                 onExitFull = { viewModel.collapse(); menuForId = null },
                 onListen = { viewModel.setAudible(id); menuForId = null },
+                onRetry = { viewModel.retry(id); menuForId = null },
                 onSwitchFeed = { menuForId = null; feedSwitchForId = id },
                 onRemove = { viewModel.removeSession(id); menuForId = null },
                 onExit = { menuForId = null; onBack() },
@@ -196,14 +193,13 @@ fun LivePlayerScreen(
             )
         }
 
-        // Per-tile feed switcher.
         feedSwitchForId?.let { id ->
-            val s = sessions.firstOrNull { it.id == id }
-            if (s == null) feedSwitchForId = null
+            val live = sessions.firstOrNull { it.id == id } as? LiveSession
+            if (live == null) feedSwitchForId = null
             else {
-                val currentIndex by s.currentIndex.collectAsStateWithLifecycle()
+                val currentIndex by live.currentIndex.collectAsStateWithLifecycle()
                 FeedSwitchPanel(
-                    feeds = s.feeds,
+                    feeds = live.feeds,
                     currentIndex = currentIndex,
                     onSelect = { viewModel.switchFeed(id, it); feedSwitchForId = null },
                     onClose = { feedSwitchForId = null },
@@ -211,7 +207,6 @@ fun LivePlayerScreen(
             }
         }
 
-        // The add-game browser.
         AnimatedVisibility(
             visible = picker != null,
             enter = slideInHorizontally { it } + fadeIn(),
@@ -219,11 +214,13 @@ fun LivePlayerScreen(
             modifier = Modifier.align(Alignment.CenterEnd),
         ) {
             picker?.let { p ->
-                AddGamePicker(
+                AddPicker(
                     picker = p,
                     onSelectCategory = viewModel::pickerSelectCategory,
+                    onSelectMediaKind = viewModel::pickerSelectMedia,
                     onSelectEvent = viewModel::addFromEvent,
-                    onBackToCategories = viewModel::pickerBackToCategories,
+                    onSelectMedia = viewModel::addFromMedia,
+                    onBack = viewModel::pickerBack,
                     onClose = viewModel::closePicker,
                 )
             }
@@ -231,12 +228,15 @@ fun LivePlayerScreen(
     }
 }
 
+/** Only a live game has feeds to switch between. */
+private fun TileSession.feedCount(): Int = (this as? LiveSession)?.feeds?.size ?: 0
+
 // --- Layouts -------------------------------------------------------------------------------------
 
 @OptIn(UnstableApi::class)
 @Composable
 private fun PipLayout(
-    sessions: List<LiveSession>,
+    sessions: List<TileSession>,
     audibleId: Int?,
     onOpenMenu: (Int) -> Unit,
     onAdd: (() -> Unit)?,
@@ -266,12 +266,12 @@ private fun PipLayout(
                     down = cornerFocus
                 },
         )
-        // Corner overlay — a real focusable tile, so OK on it opens its menu just like a grid cell.
         LiveTile(
             session = secondary,
             audible = secondary.id == audibleId,
             cornerLabel = true,
             onOpenMenu = { onOpenMenu(secondary.id) },
+            zOrderOverlay = true,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .padding(24.dp)
@@ -296,13 +296,12 @@ private fun PipLayout(
 @OptIn(UnstableApi::class)
 @Composable
 private fun GridLayout(
-    sessions: List<LiveSession>,
+    sessions: List<TileSession>,
     audibleId: Int?,
     canAdd: Boolean,
     onOpenMenu: (Int) -> Unit,
     onAdd: () -> Unit,
 ) {
-    // Up to four cells, row-major. Real tiles first; the next empty cell is the "＋ Add game" button.
     val cells = LiveMultiView.MAX_SLOTS
     Column(
         Modifier.fillMaxSize().padding(12.dp),
@@ -326,7 +325,6 @@ private fun GridLayout(
                             onOpenMenu = { onOpenMenu(s.id) },
                             modifier = cellMod,
                         )
-                        // The FIRST empty cell is the add button; further empties stay blank.
                         position == sessions.size && canAdd -> AddGameCell(onAdd = onAdd, modifier = cellMod)
                         else -> Box(cellMod)
                     }
@@ -341,11 +339,18 @@ private fun GridLayout(
 @OptIn(UnstableApi::class)
 @Composable
 private fun LiveTile(
-    session: LiveSession,
+    session: TileSession,
     audible: Boolean,
     cornerLabel: Boolean,
     onOpenMenu: () -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * True for a tile drawn ON TOP of another tile (the PiP corner). Two overlapping SurfaceViews
+     * have no defined z-order — the corner game was rendering UNDER the full-screen film, visible
+     * only where it poked past the film's letterbox edge. setZOrderMediaOverlay lifts this tile's
+     * surface above sibling surfaces (still below the window, so labels and rings stay on top).
+     */
+    zOrderOverlay: Boolean = false,
 ) {
     val state by session.uiState.collectAsStateWithLifecycle()
     val player by session.player.collectAsStateWithLifecycle()
@@ -353,7 +358,6 @@ private fun LiveTile(
     val focused by interaction.collectIsFocusedAsState()
     var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
 
-    // Same resume-time surface repair the VOD/single-live players use, per tile.
     com.slickstream.feature.player.RebindVideoSurfaceOnResume(player, playerViewRef)
 
     val shape = RoundedCornerShape(if (cornerLabel) 12.dp else 0.dp)
@@ -361,7 +365,6 @@ private fun LiveTile(
         modifier = modifier
             .clip(shape)
             .background(Color.Black)
-            // A bright ring is the whole "which tile am I on" signal on a 10-foot screen.
             .border(
                 width = if (focused) 4.dp else if (cornerLabel) 1.dp else 0.dp,
                 color = if (focused) Brand.Violet else Color(0x33FFFFFF),
@@ -379,6 +382,9 @@ private fun LiveTile(
                         isFocusableInTouchMode = false
                         descendantFocusability = android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS
                         setShutterBackgroundColor(android.graphics.Color.BLACK)
+                        // Must be set before the surface is attached to a window — the factory is
+                        // the one place that is guaranteed.
+                        (videoSurfaceView as? android.view.SurfaceView)?.setZOrderMediaOverlay(zOrderOverlay)
                         playerViewRef = this
                     }
                 },
@@ -387,23 +393,21 @@ private fun LiveTile(
             )
         }
 
-        // Per-tile status, compact so it never covers the game in a small cell.
         when (val s = state) {
-            LiveSession.UiState.Buffering ->
+            TileUiState.Buffering ->
                 TileCenter { CircularProgressIndicator(color = Brand.Violet, strokeWidth = 3.dp, modifier = Modifier.size(34.dp)) }
-            is LiveSession.UiState.Recovering ->
+            is TileUiState.Recovering ->
                 TilePill(s.message, Modifier.align(Alignment.TopCenter))
-            is LiveSession.UiState.Error ->
+            is TileUiState.Error ->
                 TileCenter {
-                    Text("Feed failed", color = Color.White, style = MaterialTheme.typography.titleSmall)
+                    Text(s.message.substringBefore('.').ifBlank { "Failed" }, color = Color.White, style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
                     Text("OK for options", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodySmall)
                 }
-            LiveSession.UiState.NoStream ->
+            TileUiState.NoStream ->
                 TileCenter { Text("No feed", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.titleSmall) }
-            LiveSession.UiState.Playing -> Unit
+            TileUiState.Playing -> Unit
         }
 
-        // Label + audio indicator, only in multiview cells (full-screen doesn't need them).
         if (cornerLabel) {
             Row(
                 modifier = Modifier
@@ -429,7 +433,7 @@ private fun LiveTile(
     }
 }
 
-// --- Add-game affordances ------------------------------------------------------------------------
+// --- Add affordances -----------------------------------------------------------------------------
 
 @Composable
 private fun AddGameCell(onAdd: () -> Unit, modifier: Modifier = Modifier) {
@@ -451,7 +455,8 @@ private fun AddGameCell(onAdd: () -> Unit, modifier: Modifier = Modifier) {
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(Icons.Rounded.Add, contentDescription = null, tint = if (focused) Color.White else Brand.OnSurface, modifier = Modifier.size(44.dp))
-            Text("Add game", color = if (focused) Color.White else Brand.OnSurface, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Add", color = if (focused) Color.White else Brand.OnSurface, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("game or title", color = if (focused) Color.White.copy(alpha = 0.8f) else Brand.OnSurfaceDim, style = MaterialTheme.typography.labelMedium)
         }
     }
 }
@@ -462,11 +467,11 @@ private fun EmptyMultiview(onAdd: () -> Unit) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(20.dp),
-            modifier = Modifier.width(420.dp),
+            modifier = Modifier.width(440.dp),
         ) {
             Text("Multiview", style = MaterialTheme.typography.headlineMedium, color = Color.White)
             Text(
-                "Add up to four live games and watch them side by side.",
+                "Add up to four live games or titles and watch them side by side.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Brand.OnSurfaceDim,
                 textAlign = TextAlign.Center,
@@ -475,7 +480,7 @@ private fun EmptyMultiview(onAdd: () -> Unit) {
             LaunchedEffect(Unit) {
                 repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { focus.requestFocus() }.isSuccess) return@LaunchedEffect }
             }
-            PillButton("＋  Add a game", onClick = onAdd, modifier = Modifier.focusRequester(focus))
+            PillButton("＋  Add", onClick = onAdd, modifier = Modifier.focusRequester(focus))
         }
     }
 }
@@ -490,13 +495,8 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
     backFocus: FocusRequester,
     tileFocus: FocusRequester,
 ) {
-    // Always visible, small, in the corners. Auto-hiding chrome would need a re-wake key that competes
-    // with the focusable tile underneath; on a full-screen game these three chips are unobtrusive and
-    // always reachable, which matters more here than hiding them.
-    //
-    // Every chip points DOWN at the tile explicitly: the tile encloses the chips, so geometric focus
-    // search from a chip finds nothing "below" it either. Without this you could get up here and
-    // never get back onto the picture.
+    // Always visible, small, in the corners. Every chip points DOWN at the tile explicitly: the tile
+    // encloses the chips, so geometric focus search from a chip finds nothing "below" it either.
     Row(
         Modifier.align(Alignment.TopStart).padding(16.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -518,7 +518,7 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
             ChromeChip(Icons.Rounded.GridView, "Switch stream", onSwitchFeed, Modifier.focusProperties { down = tileFocus })
         }
         if (onAdd != null) {
-            ChromeChip(Icons.Rounded.Add, "Add game", onAdd, Modifier.focusProperties { down = tileFocus })
+            ChromeChip(Icons.Rounded.Add, "Add", onAdd, Modifier.focusProperties { down = tileFocus })
         }
     }
 }
@@ -548,7 +548,7 @@ private fun androidx.compose.foundation.layout.BoxScope.ExpandedChrome(
 // --- Per-tile menu -------------------------------------------------------------------------------
 
 @Composable
-private fun androidx.compose.foundation.layout.BoxScope.TileMenu(
+private fun TileMenu(
     title: String,
     expanded: Boolean,
     audible: Boolean,
@@ -556,6 +556,7 @@ private fun androidx.compose.foundation.layout.BoxScope.TileMenu(
     onWatchFull: () -> Unit,
     onExitFull: () -> Unit,
     onListen: () -> Unit,
+    onRetry: () -> Unit,
     onSwitchFeed: () -> Unit,
     onRemove: () -> Unit,
     onExit: () -> Unit,
@@ -577,18 +578,14 @@ private fun androidx.compose.foundation.layout.BoxScope.TileMenu(
         ) {
             Text(title, style = MaterialTheme.typography.titleLarge, color = Brand.OnSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(4.dp))
-            if (expanded) {
-                MenuRow("Back to grid", onExitFull, Modifier.focusRequester(firstFocus))
-            } else {
-                MenuRow("Watch full screen", onWatchFull, Modifier.focusRequester(firstFocus))
-            }
-            if (!audible) MenuRow("Listen to this game", onListen)
+            if (expanded) MenuRow("Back to grid", onExitFull, Modifier.focusRequester(firstFocus))
+            else MenuRow("Watch full screen", onWatchFull, Modifier.focusRequester(firstFocus))
+            if (!audible) MenuRow("Listen to this one", onListen)
+            MenuRow("Retry", onRetry)
             if (canSwitchFeed) MenuRow("Switch feed", onSwitchFeed)
             MenuRow("Remove", onRemove, destructive = true)
-            // A guaranteed way out from ANY layout, two presses from any tile. The grid has no chrome
-            // at all, and in PiP the Back arrow was unreachable by D-pad, so this is the exit that
-            // never depends on focus geometry.
-            MenuRow("Exit to Sports", onExit)
+            // A guaranteed way out from ANY layout, two presses from any tile, independent of focus geometry.
+            MenuRow("Exit multiview", onExit)
         }
     }
 }
@@ -618,7 +615,7 @@ private fun MenuRow(label: String, onClick: () -> Unit, modifier: Modifier = Mod
     }
 }
 
-// --- Feed switch panel (per tile) ----------------------------------------------------------------
+// --- Feed switch panel (live tiles only) ---------------------------------------------------------
 
 @Composable
 private fun androidx.compose.foundation.layout.BoxScope.FeedSwitchPanel(
@@ -651,61 +648,79 @@ private fun androidx.compose.foundation.layout.BoxScope.FeedSwitchPanel(
     }
 }
 
-// --- Add-game picker (leagues -> games) ----------------------------------------------------------
+// --- The Add browser: type first ------------------------------------------------------------------
 
 @Composable
-private fun AddGamePicker(
+private fun AddPicker(
     picker: LivePlayerViewModel.Picker,
     onSelectCategory: (String, String) -> Unit,
+    onSelectMediaKind: (LivePlayerViewModel.MediaListKind) -> Unit,
     onSelectEvent: (SportEvent) -> Unit,
-    onBackToCategories: () -> Unit,
+    onSelectMedia: (LivePlayerViewModel.MediaPick) -> Unit,
+    onBack: () -> Unit,
     onClose: () -> Unit,
 ) {
-    BackHandler(enabled = true) {
-        if (picker.step == LivePlayerViewModel.PickerStep.EVENTS) onBackToCategories() else onClose()
+    val atRoot = picker.step == LivePlayerViewModel.PickerStep.ROOT
+    BackHandler(enabled = true) { if (atRoot) onClose() else onBack() }
+    val (heading, hint) = when (picker.step) {
+        LivePlayerViewModel.PickerStep.ROOT -> "Add to multiview" to "What do you want to add?"
+        LivePlayerViewModel.PickerStep.EVENTS -> picker.selectedCategoryName to "Pick a game."
+        LivePlayerViewModel.PickerStep.MEDIA -> (picker.mediaKind?.label ?: "Titles") to "Pick a title."
     }
     Column(
-        modifier = Modifier.fillMaxHeight().width(500.dp).background(Color(0xF2101019)).padding(28.dp),
+        modifier = Modifier.fillMaxHeight().width(520.dp).background(Color(0xF2101019)).padding(28.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            if (picker.step == LivePlayerViewModel.PickerStep.CATEGORIES) "Add a game" else picker.selectedCategoryName,
-            style = MaterialTheme.typography.titleLarge,
-            color = Brand.OnSurface,
-        )
-        Text(
-            if (picker.step == LivePlayerViewModel.PickerStep.CATEGORIES) "Pick a league." else "Pick a game to add.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Brand.OnSurfaceDim,
-        )
+        Text(heading, style = MaterialTheme.typography.titleLarge, color = Brand.OnSurface)
+        Text(hint, style = MaterialTheme.typography.bodyMedium, color = Brand.OnSurfaceDim)
         when {
-            picker.adding -> PanelCenter { Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            picker.adding -> PanelCenter {
                 CircularProgressIndicator(color = Brand.Violet, strokeWidth = 3.dp, modifier = Modifier.size(34.dp))
+                Spacer(Modifier.height(12.dp))
                 Text("Adding…", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyMedium)
-            } }
+            }
             picker.loading -> PanelCenter { CircularProgressIndicator(color = Brand.Violet, strokeWidth = 3.dp, modifier = Modifier.size(34.dp)) }
             picker.error != null -> Text(picker.error, color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge)
-            picker.step == LivePlayerViewModel.PickerStep.CATEGORIES ->
-                CategoryList(picker.categories, onSelectCategory)
-            else -> EventList(picker.events, onSelectEvent)
+            picker.step == LivePlayerViewModel.PickerStep.ROOT -> RootList(picker.categories, onSelectMediaKind, onSelectCategory)
+            picker.step == LivePlayerViewModel.PickerStep.EVENTS -> EventList(picker.events, onSelectEvent)
+            else -> MediaList(picker.media, onSelectMedia)
         }
     }
 }
 
+/** Continue watching, Favourites, then every sport — one flat list, media first. */
 @Composable
-private fun CategoryList(categories: List<SportCategory>, onSelect: (String, String) -> Unit) {
+private fun RootList(
+    categories: List<SportCategory>,
+    onSelectMediaKind: (LivePlayerViewModel.MediaListKind) -> Unit,
+    onSelectCategory: (String, String) -> Unit,
+) {
     val firstFocus = remember { FocusRequester() }
-    LaunchedEffect(categories.isNotEmpty()) {
-        if (categories.isNotEmpty()) repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }
+    LaunchedEffect(Unit) {
+        repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }
     }
+    val kinds = LivePlayerViewModel.MediaListKind.entries
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
-        itemsIndexed(categories, key = { _, c -> c.id }) { i, c ->
+        itemsIndexed(kinds, key = { _, k -> "media:${k.name}" }) { i, k ->
             SelectableRow(
-                label = c.name,
+                label = k.label,
                 selected = false,
                 focusRequester = if (i == 0) firstFocus else null,
-                onClick = { onSelect(c.id, c.name) },
+                onClick = { onSelectMediaKind(k) },
             )
+        }
+        if (categories.isNotEmpty()) {
+            item(key = "hdr:sports") {
+                Text(
+                    "SPORTS",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Brand.OnSurfaceDim,
+                    modifier = Modifier.padding(top = 14.dp, bottom = 2.dp, start = 4.dp),
+                )
+            }
+            itemsIndexed(categories, key = { _, c -> "cat:${c.id}" }) { _, c ->
+                SelectableRow(label = c.name, selected = false, focusRequester = null, onClick = { onSelectCategory(c.id, c.name) })
+            }
         }
     }
 }
@@ -717,8 +732,8 @@ private fun EventList(events: List<SportEvent>, onSelect: (SportEvent) -> Unit) 
         return
     }
     val firstFocus = remember { FocusRequester() }
-    LaunchedEffect(events.isNotEmpty()) {
-        if (events.isNotEmpty()) repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }
+    LaunchedEffect(Unit) {
+        repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }
     }
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
         itemsIndexed(events, key = { _, e -> e.id }) { i, e ->
@@ -732,10 +747,39 @@ private fun EventList(events: List<SportEvent>, onSelect: (SportEvent) -> Unit) 
     }
 }
 
+@Composable
+private fun MediaList(items: List<LivePlayerViewModel.MediaPick>, onSelect: (LivePlayerViewModel.MediaPick) -> Unit) {
+    if (items.isEmpty()) {
+        PanelCenter { Text("Nothing here yet.", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge) }
+        return
+    }
+    val firstFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }
+    }
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 16.dp)) {
+        itemsIndexed(items, key = { _, m -> "${m.item.mediaType}:${m.item.id}:${m.season}:${m.episode}" }) { i, m ->
+            SelectableRow(
+                label = m.item.title,
+                subtitle = m.subtitle,
+                selected = false,
+                focusRequester = if (i == 0) firstFocus else null,
+                onClick = { onSelect(m) },
+            )
+        }
+    }
+}
+
 // --- Small shared pieces -------------------------------------------------------------------------
 
 @Composable
-private fun SelectableRow(label: String, selected: Boolean, focusRequester: FocusRequester?, onClick: () -> Unit) {
+private fun SelectableRow(
+    label: String,
+    selected: Boolean,
+    focusRequester: FocusRequester?,
+    onClick: () -> Unit,
+    subtitle: String? = null,
+) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
     val shape = RoundedCornerShape(12.dp)
@@ -752,7 +796,12 @@ private fun SelectableRow(label: String, selected: Boolean, focusRequester: Focu
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (selected) Text("●  ", color = if (focused) Color.White else Brand.Cyan, style = MaterialTheme.typography.titleMedium)
-        Text(label, style = MaterialTheme.typography.titleMedium, color = if (focused) Color.White else Brand.OnSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Column {
+            Text(label, style = MaterialTheme.typography.titleMedium, color = if (focused) Color.White else Brand.OnSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            if (!subtitle.isNullOrBlank()) {
+                Text(subtitle, style = MaterialTheme.typography.labelMedium, color = if (focused) Color.White.copy(alpha = 0.85f) else Brand.OnSurfaceDim, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
     }
 }
 
@@ -829,10 +878,7 @@ private fun RoundIconButton(
 @Composable
 private fun TileCenter(content: ColumnScopeContent) {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) { content() }
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) { content() }
     }
 }
 

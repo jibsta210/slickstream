@@ -103,4 +103,10 @@ class LiveMultiViewTest {
         assertTrue(LiveMultiView.decoderLimitMessage(2).contains("2"))
         assertTrue(LiveMultiView.decoderLimitMessage(2).contains("3"))
     }
+
+    @Test
+    fun `media tiles are labelled with season and episode only when they have one`() {
+        assertEquals("Severance · S2 E4", LiveMultiView.mediaLabel("Severance", 2, 4))
+        assertEquals("Heat", LiveMultiView.mediaLabel("Heat", null, null))
+    }
 }

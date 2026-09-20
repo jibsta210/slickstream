@@ -42,6 +42,7 @@ import androidx.compose.material.icons.rounded.Replay10
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.Subscriptions
+import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -124,6 +125,8 @@ fun TvPlayerScreen(
     modifier: Modifier = Modifier,
     onPlayMedia: (com.slickstream.core.model.MediaType, Int) -> Unit = { _, _ -> },
     onOpenDetails: (com.slickstream.core.model.MediaType, Int) -> Unit = { _, _ -> },
+    /** "Add to multiview": this film becomes the first tile, games get added beside it. */
+    onOpenMultiview: () -> Unit = {},
     viewModel: PlayerViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -296,7 +299,13 @@ fun TvPlayerScreen(
     // open or a scrub is in progress). ONLY while Playing — during Buffering/Error there is no
     // transport, and letting controlsVisible churn there would steal focus from the overlay's own
     // buttons (Back / Switch source) via the root-focus effect below.
-    LaunchedEffect(controlsVisible, anyPanelOpen, scrubbing, uiState) {
+    // `lastInteractionNanos` is a key on purpose: every D-pad press while the transport is up (stamped
+    // in the root onPreviewKeyEvent below) RESTARTS the 5 s countdown. Without it the timer ran from
+    // the moment the transport appeared, so walking six or seven buttons to the right at a human pace
+    // (~0.7 s a press, after a second's reaction time) hid the transport under the cursor just as it
+    // reached the far end — "Sources" and "Add to multiview" were reachable only by racing the clock.
+    var lastInteractionNanos by remember { mutableStateOf(0L) }
+    LaunchedEffect(controlsVisible, anyPanelOpen, scrubbing, uiState, lastInteractionNanos) {
         if (uiState is PlayerUiState.Playing && controlsVisible && !anyPanelOpen && !scrubbing) {
             kotlinx.coroutines.delay(5_000)
             controlsVisible = false
@@ -363,6 +372,9 @@ fun TvPlayerScreen(
             .focusable(enabled = uiState is PlayerUiState.Playing)
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                // Preview events tunnel root-first, so this sees every press before the focused
+                // button does. Stamp-and-fall-through: it restarts the auto-hide, consumes nothing.
+                if (controlsVisible) lastInteractionNanos = System.nanoTime()
                 val p = player
                 // Honour the remote's dedicated media keys (play/pause, FF, RW, stop) — with our
                 // custom transport + useController=false, nothing mapped them before, so only
@@ -500,6 +512,7 @@ fun TvPlayerScreen(
                         controlsVisible = true
                     },
                     onOpenSources = { panelOpen = true; controlsVisible = true },
+                    onOpenMultiview = { if (viewModel.handOffToMultiview()) onOpenMultiview() },
                     zoomFill = zoomFill,
                     onToggleZoom = { zoomFill = !zoomFill; controlsVisible = true },
                     thumbnailAt = viewModel::thumbnailAt,
@@ -1056,6 +1069,7 @@ private fun TransportOverlay(
     onSeekBack: () -> Unit,
     onSeekForward: () -> Unit,
     onOpenSources: () -> Unit,
+    onOpenMultiview: () -> Unit,
     zoomFill: Boolean,
     onToggleZoom: () -> Unit,
     thumbnailAt: (Long) -> android.graphics.Bitmap?,
@@ -1209,6 +1223,7 @@ private fun TransportOverlay(
                     tint = if (zoomFill) Brand.Cyan else Color.White,
                 )
                 TransportButton(Icons.Rounded.Tune, "Sources & quality", onOpenSources)
+                TransportButton(Icons.Rounded.GridView, "Add to multiview", onOpenMultiview)
             }
         }
     }
