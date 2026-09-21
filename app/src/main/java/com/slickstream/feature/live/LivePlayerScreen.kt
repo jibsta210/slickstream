@@ -55,6 +55,9 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -97,18 +100,74 @@ fun LivePlayerScreen(
 
     var menuForId by remember { mutableStateOf<Int?>(null) }
     var feedSwitchForId by remember { mutableStateOf<Int?>(null) }
+    // The only way a tile menu opens. Never while a panel is up: an OK that reaches a tile through
+    // an open panel (an empty list has nothing to focus) would stack a second modal on the first.
+    val openMenu: (Int) -> Unit = { id -> if (picker == null && feedSwitchForId == null) menuForId = id }
+
+    // WHERE THE CURSOR LANDS. When the Add panel closes on a successful add, the row that had focus is
+    // gone with it, and Compose's default search then parks the cursor on the first focusable it can
+    // find — the Back chip. So the tile you just added was never the thing under the cursor, and the
+    // next OK reopened the panel instead of acting on the game. Every tile gets a requester keyed by
+    // session id (ids survive reorders, slots do not), and the cursor is moved onto the tile that was
+    // just added, swapped in, expanded or collapsed. The nonce makes a repeat target re-fire.
+    val tileRequesters = remember { mutableMapOf<Int, FocusRequester>() }
+    val tileFocus: (Int) -> FocusRequester = { id -> tileRequesters.getOrPut(id) { FocusRequester() } }
+    var focusTileId by remember { mutableStateOf<Int?>(null) }
+    var focusNonce by remember { mutableStateOf(0) }
+    fun focusTile(id: Int) { focusTileId = id; focusNonce++ }
+    LaunchedEffect(focusNonce) {
+        val id = focusTileId ?: return@LaunchedEffect
+        // Retry past the layout the add/swap just triggered; the requester may not be attached yet.
+        repeat(15) {
+            kotlinx.coroutines.delay(40)
+            if (runCatching { tileFocus(id).requestFocus() }.isSuccess) return@LaunchedEffect
+        }
+    }
+    // A tile appeared (first entry, or an add): it becomes the cursor's home.
+    val ids = sessions.map { it.id }
+    var knownCount by remember { mutableStateOf(0) }
+    LaunchedEffect(ids) {
+        if (ids.size > knownCount) ids.lastOrNull()?.let { focusTile(it) }
+        knownCount = ids.size
+    }
+
+    // AUTO-HIDE. Everything decorative — the corner chips, the tiles' title labels, the focus ring —
+    // fades after 5 s of no remote activity and comes back on the next press, like any player. The
+    // chips stay COMPOSED while hidden (alpha, not removal) so their focus nodes survive: the tile's
+    // explicit `up = backFocus` must always resolve, and UP from a quiet picture both wakes the chrome
+    // and lands on Back, which is exactly the press people make. Modal panels (menu, feed switch,
+    // picker) hold the chrome up. Status pills (Reconnecting…, Buffering) are not chrome and stay.
+    var lastInteractionNanos by remember { mutableStateOf(System.nanoTime()) }
+    var chromeVisible by remember { mutableStateOf(true) }
+    val modalUp = menuForId != null || feedSwitchForId != null || picker != null
+    LaunchedEffect(lastInteractionNanos, modalUp) {
+        chromeVisible = true
+        if (modalUp) return@LaunchedEffect
+        kotlinx.coroutines.delay(5_000)
+        chromeVisible = false
+    }
 
     BackHandler {
         when {
             picker != null -> viewModel.closePicker()
             feedSwitchForId != null -> feedSwitchForId = null
             menuForId != null -> menuForId = null
-            expandedId != null -> viewModel.collapse()
+            expandedId != null -> { expandedId?.let { focusTile(it) }; viewModel.collapse() }
             else -> onBack()
         }
     }
 
-    Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            // Preview keys tunnel root-first: stamp every press, consume none, so the wake press also
+            // does whatever it was going to do (move focus, open a menu).
+            .onPreviewKeyEvent { e ->
+                if (e.type == KeyEventType.KeyDown) lastInteractionNanos = System.nanoTime()
+                false
+            },
+    ) {
         when {
             sessions.isEmpty() -> EmptyMultiview(onAdd = viewModel::openPicker)
             expandedId != null -> {
@@ -116,38 +175,39 @@ fun LivePlayerScreen(
                 if (s != null) {
                     // The chrome chip sits INSIDE the full-screen tile's bounds, so 2D focus search
                     // cannot find it from the tile. Wire UP/DOWN explicitly.
-                    val tileFocus = remember { FocusRequester() }
                     val chipFocus = remember { FocusRequester() }
                     LiveTile(
                         session = s,
                         audible = s.id == audibleId,
                         cornerLabel = false,
-                        onOpenMenu = { menuForId = s.id },
+                        onOpenMenu = { openMenu(s.id) },
+                        showChrome = chromeVisible,
                         modifier = Modifier
                             .fillMaxSize()
-                            .focusRequester(tileFocus)
+                            .focusRequester(tileFocus(s.id))
                             .focusProperties { up = chipFocus },
                     )
                     ExpandedChrome(
                         title = s.title,
-                        onCollapse = viewModel::collapse,
+                        onCollapse = { focusTile(s.id); viewModel.collapse() },
                         chipFocus = chipFocus,
-                        tileFocus = tileFocus,
+                        tileFocus = tileFocus(s.id),
+                        visible = chromeVisible,
                     )
                 }
             }
             layout == LiveMultiView.Layout.SINGLE -> {
                 val s = sessions.first()
-                val tileFocus = remember { FocusRequester() }
                 val backFocus = remember { FocusRequester() }
                 LiveTile(
                     session = s,
                     audible = s.id == audibleId,
                     cornerLabel = false,
-                    onOpenMenu = { menuForId = s.id },
+                    onOpenMenu = { openMenu(s.id) },
+                    showChrome = chromeVisible,
                     modifier = Modifier
                         .fillMaxSize()
-                        .focusRequester(tileFocus)
+                        .focusRequester(tileFocus(s.id))
                         .focusProperties { up = backFocus },
                 )
                 SingleChrome(
@@ -155,21 +215,26 @@ fun LivePlayerScreen(
                     onAdd = viewModel::openPicker.takeIf { canAdd },
                     onSwitchFeed = { feedSwitchForId = s.id }.takeIf { s.feedCount() > 1 },
                     backFocus = backFocus,
-                    tileFocus = tileFocus,
+                    tileFocus = tileFocus(s.id),
+                    visible = chromeVisible,
                 )
             }
             layout == LiveMultiView.Layout.PIP -> PipLayout(
                 sessions = sessions,
                 audibleId = audibleId,
-                onOpenMenu = { menuForId = it },
+                chromeVisible = chromeVisible,
+                tileFocus = tileFocus,
+                onOpenMenu = openMenu,
                 onAdd = viewModel::openPicker.takeIf { canAdd },
                 onBack = onBack,
             )
             else -> GridLayout(
                 sessions = sessions,
                 audibleId = audibleId,
+                chromeVisible = chromeVisible,
+                tileFocus = tileFocus,
                 canAdd = canAdd,
-                onOpenMenu = { menuForId = it },
+                onOpenMenu = openMenu,
                 onAdd = viewModel::openPicker,
             )
         }
@@ -182,8 +247,10 @@ fun LivePlayerScreen(
                 expanded = expandedId == id,
                 audible = audibleId == id,
                 canSwitchFeed = s.feedCount() > 1,
-                onWatchFull = { viewModel.expand(id); menuForId = null },
-                onExitFull = { viewModel.collapse(); menuForId = null },
+                canSwap = layout == LiveMultiView.Layout.PIP && expandedId == null,
+                onSwap = { viewModel.swapToPrimary(id); menuForId = null; focusTile(id) },
+                onWatchFull = { viewModel.expand(id); menuForId = null; focusTile(id) },
+                onExitFull = { viewModel.collapse(); menuForId = null; focusTile(id) },
                 onListen = { viewModel.setAudible(id); menuForId = null },
                 onRetry = { viewModel.retry(id); menuForId = null },
                 onSwitchFeed = { menuForId = null; feedSwitchForId = id },
@@ -238,6 +305,8 @@ private fun TileSession.feedCount(): Int = (this as? LiveSession)?.feeds?.size ?
 private fun PipLayout(
     sessions: List<TileSession>,
     audibleId: Int?,
+    chromeVisible: Boolean,
+    tileFocus: (Int) -> FocusRequester,
     onOpenMenu: (Int) -> Unit,
     onAdd: (() -> Unit)?,
     onBack: () -> Unit,
@@ -248,8 +317,8 @@ private fun PipLayout(
     // all sit inside its bounds. Compose's D-pad focus search only considers targets BEYOND the
     // focused rect, so from the big picture there was nothing to move to and the user was stuck
     // (the grid never had this problem: its cells don't overlap). Spell the graph out instead.
-    val primaryFocus = remember { FocusRequester() }
-    val cornerFocus = remember { FocusRequester() }
+    val primaryFocus = tileFocus(primary.id)
+    val cornerFocus = tileFocus(secondary.id)
     val backFocus = remember { FocusRequester() }
     Box(Modifier.fillMaxSize()) {
         LiveTile(
@@ -257,6 +326,7 @@ private fun PipLayout(
             audible = primary.id == audibleId,
             cornerLabel = false,
             onOpenMenu = { onOpenMenu(primary.id) },
+            showChrome = chromeVisible,
             modifier = Modifier
                 .fillMaxSize()
                 .focusRequester(primaryFocus)
@@ -271,6 +341,7 @@ private fun PipLayout(
             audible = secondary.id == audibleId,
             cornerLabel = true,
             onOpenMenu = { onOpenMenu(secondary.id) },
+            showChrome = chromeVisible,
             zOrderOverlay = true,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
@@ -289,6 +360,7 @@ private fun PipLayout(
             onSwitchFeed = null,
             backFocus = backFocus,
             tileFocus = primaryFocus,
+            visible = chromeVisible,
         )
     }
 }
@@ -298,6 +370,8 @@ private fun PipLayout(
 private fun GridLayout(
     sessions: List<TileSession>,
     audibleId: Int?,
+    chromeVisible: Boolean,
+    tileFocus: (Int) -> FocusRequester,
     canAdd: Boolean,
     onOpenMenu: (Int) -> Unit,
     onAdd: () -> Unit,
@@ -323,7 +397,8 @@ private fun GridLayout(
                             audible = s.id == audibleId,
                             cornerLabel = true,
                             onOpenMenu = { onOpenMenu(s.id) },
-                            modifier = cellMod,
+                            showChrome = chromeVisible,
+                            modifier = cellMod.focusRequester(tileFocus(s.id)),
                         )
                         position == sessions.size && canAdd -> AddGameCell(onAdd = onAdd, modifier = cellMod)
                         else -> Box(cellMod)
@@ -344,6 +419,8 @@ private fun LiveTile(
     cornerLabel: Boolean,
     onOpenMenu: () -> Unit,
     modifier: Modifier = Modifier,
+    /** False while the chrome is auto-hidden: no title label, no focus ring — just the picture. */
+    showChrome: Boolean = true,
     /**
      * True for a tile drawn ON TOP of another tile (the PiP corner). Two overlapping SurfaceViews
      * have no defined z-order — the corner game was rendering UNDER the full-screen film, visible
@@ -366,8 +443,8 @@ private fun LiveTile(
             .clip(shape)
             .background(Color.Black)
             .border(
-                width = if (focused) 4.dp else if (cornerLabel) 1.dp else 0.dp,
-                color = if (focused) Brand.Violet else Color(0x33FFFFFF),
+                width = if (focused && showChrome) 4.dp else if (cornerLabel) 1.dp else 0.dp,
+                color = if (focused && showChrome) Brand.Violet else Color(0x33FFFFFF),
                 shape = shape,
             )
             .clickable(interactionSource = interaction, indication = null, onClick = onOpenMenu)
@@ -408,7 +485,7 @@ private fun LiveTile(
             TileUiState.Playing -> Unit
         }
 
-        if (cornerLabel) {
+        if (cornerLabel && showChrome) {
             Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -494,11 +571,14 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
     onSwitchFeed: (() -> Unit)?,
     backFocus: FocusRequester,
     tileFocus: FocusRequester,
+    visible: Boolean = true,
 ) {
-    // Always visible, small, in the corners. Every chip points DOWN at the tile explicitly: the tile
-    // encloses the chips, so geometric focus search from a chip finds nothing "below" it either.
+    // Faded, never removed, while hidden — the focus nodes must stay attached (see the auto-hide
+    // note in LivePlayerScreen). Every chip points DOWN at the tile explicitly: the tile encloses the
+    // chips, so geometric focus search from a chip finds nothing "below" it either.
+    val alpha by animateFloatAsState(if (visible) 1f else 0f, label = "chrome")
     Row(
-        Modifier.align(Alignment.TopStart).padding(16.dp),
+        Modifier.align(Alignment.TopStart).padding(16.dp).graphicsLayer { this.alpha = alpha },
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -510,7 +590,7 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
         )
     }
     Row(
-        Modifier.align(Alignment.TopEnd).padding(16.dp),
+        Modifier.align(Alignment.TopEnd).padding(16.dp).graphicsLayer { this.alpha = alpha },
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -529,9 +609,11 @@ private fun androidx.compose.foundation.layout.BoxScope.ExpandedChrome(
     onCollapse: () -> Unit,
     chipFocus: FocusRequester,
     tileFocus: FocusRequester,
+    visible: Boolean = true,
 ) {
+    val alpha by animateFloatAsState(if (visible) 1f else 0f, label = "chrome")
     Row(
-        Modifier.align(Alignment.TopStart).padding(16.dp),
+        Modifier.align(Alignment.TopStart).padding(16.dp).graphicsLayer { this.alpha = alpha },
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -553,6 +635,8 @@ private fun TileMenu(
     expanded: Boolean,
     audible: Boolean,
     canSwitchFeed: Boolean,
+    canSwap: Boolean,
+    onSwap: () -> Unit,
     onWatchFull: () -> Unit,
     onExitFull: () -> Unit,
     onListen: () -> Unit,
@@ -578,8 +662,16 @@ private fun TileMenu(
         ) {
             Text(title, style = MaterialTheme.typography.titleLarge, color = Brand.OnSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(4.dp))
-            if (expanded) MenuRow("Back to grid", onExitFull, Modifier.focusRequester(firstFocus))
-            else MenuRow("Watch full screen", onWatchFull, Modifier.focusRequester(firstFocus))
+            when {
+                expanded -> MenuRow("Back to grid", onExitFull, Modifier.focusRequester(firstFocus))
+                // Two tiles: the thing you want is almost always to trade places, so it is first and
+                // focused. Full screen is still here, but named for what it does to the other tile.
+                canSwap -> {
+                    MenuRow("Swap big and small", onSwap, Modifier.focusRequester(firstFocus))
+                    MenuRow("Full screen (hide the other)", onWatchFull)
+                }
+                else -> MenuRow("Watch full screen", onWatchFull, Modifier.focusRequester(firstFocus))
+            }
             if (!audible) MenuRow("Listen to this one", onListen)
             MenuRow("Retry", onRetry)
             if (canSwitchFeed) MenuRow("Switch feed", onSwitchFeed)
@@ -680,10 +772,14 @@ private fun AddPicker(
                 Text("Adding…", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyMedium)
             }
             picker.loading -> PanelCenter { CircularProgressIndicator(color = Brand.Violet, strokeWidth = 3.dp, modifier = Modifier.size(34.dp)) }
-            picker.error != null -> Text(picker.error, color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge)
+            picker.error != null -> EmptyPanel(picker.error, onBack = if (atRoot) onClose else onBack)
             picker.step == LivePlayerViewModel.PickerStep.ROOT -> RootList(picker.categories, onSelectMediaKind, onSelectCategory)
-            picker.step == LivePlayerViewModel.PickerStep.EVENTS -> EventList(picker.events, onSelectEvent)
-            else -> MediaList(picker.media, onSelectMedia)
+            picker.step == LivePlayerViewModel.PickerStep.EVENTS ->
+                if (picker.events.isEmpty()) EmptyPanel("No games here right now.", onBack)
+                else EventList(picker.events, onSelectEvent)
+            else ->
+                if (picker.media.isEmpty()) EmptyPanel("Nothing here yet.", onBack)
+                else MediaList(picker.media, onSelectMedia)
         }
     }
 }
@@ -725,12 +821,26 @@ private fun RootList(
     }
 }
 
+/**
+ * An empty or failed list with a FOCUSED Back. A panel that shows only text has no focus target, so
+ * the next OK fell straight through to the tile underneath and opened its menu on top of the panel —
+ * two modals, and a very confusing screen. The panel must always own the cursor while it is up.
+ */
+@Composable
+private fun EmptyPanel(message: String, onBack: () -> Unit) {
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { focus.requestFocus() }.isSuccess) return@LaunchedEffect }
+    }
+    PanelCenter {
+        Text(message, color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(20.dp))
+        PillButton("Back", onClick = onBack, modifier = Modifier.focusRequester(focus))
+    }
+}
+
 @Composable
 private fun EventList(events: List<SportEvent>, onSelect: (SportEvent) -> Unit) {
-    if (events.isEmpty()) {
-        PanelCenter { Text("No games here right now.", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge) }
-        return
-    }
     val firstFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }
@@ -749,10 +859,6 @@ private fun EventList(events: List<SportEvent>, onSelect: (SportEvent) -> Unit) 
 
 @Composable
 private fun MediaList(items: List<LivePlayerViewModel.MediaPick>, onSelect: (LivePlayerViewModel.MediaPick) -> Unit) {
-    if (items.isEmpty()) {
-        PanelCenter { Text("Nothing here yet.", color = Brand.OnSurfaceDim, style = MaterialTheme.typography.bodyLarge) }
-        return
-    }
     val firstFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         repeat(12) { kotlinx.coroutines.delay(40); if (runCatching { firstFocus.requestFocus() }.isSuccess) return@LaunchedEffect }

@@ -2491,14 +2491,22 @@ class PlayerViewModel @Inject constructor(
      * nothing to hand off yet (details not loaded).
      */
     fun handOffToMultiview(): Boolean {
-        val d = details ?: return false
+        if (mediaId < 0) return false
+        // OFFLINE playback never fetches details — deliberately, so a downloaded title plays on a
+        // plane — which left `details` null and this hand-off a silent no-op for every download:
+        // press the button, nothing happens. The tile fetches its own details by id + type; all the
+        // seed needs from here is the identity, and the title only labels the tile.
+        val item = details?.item ?: MediaItem(
+            id = mediaId, mediaType = mediaType, title = _title.value, overview = "",
+            posterUrl = null, backdropUrl = _backdropUrl.value, voteAverage = 0.0, releaseDate = null,
+        )
         val p: Player? = _player.value ?: vlcPlayer
         val position = p?.currentPosition?.coerceAtLeast(0L) ?: 0L
         val duration = p?.duration?.takeIf { it > 0L } ?: 0L
         saveProgressNow()
         livePlaybackHolder.setMedia(
             com.slickstream.feature.live.LivePlaybackHolder.MediaSeed(
-                item = d.item, season = currentSeason, episode = currentEpisode,
+                item = item, season = currentSeason, episode = currentEpisode,
                 positionMs = position, durationMs = duration,
             ),
         )

@@ -187,6 +187,24 @@ class LivePlayerViewModel @Inject constructor(
 
     fun collapse() { _expandedId.value = null; applyPolicy() }
 
+    /**
+     * Make [id] the PRIMARY tile — the big picture in PiP, top-left in the grid — WITHOUT hiding
+     * anyone. Position 0 in the list is the primary by definition, so this is a reorder; the layout
+     * and the other tile both survive. "Watch full screen" is the other operation: it expands one
+     * tile and hides the rest, which in a two-tile PiP read as the small game simply vanishing rather
+     * than the two trading places — and trading places is what people mean there.
+     */
+    fun swapToPrimary(id: Int) {
+        val list = _sessions.value
+        val target = list.firstOrNull { it.id == id } ?: return
+        if (list.firstOrNull()?.id == id) return
+        _sessions.value = listOf(target) + list.filter { it.id != id }
+        // You promoted it to the big picture — you want to hear it.
+        _audibleId.value = id
+        _expandedId.value = null
+        applyPolicy()
+    }
+
     fun setAudible(id: Int) {
         if (_sessions.value.none { it.id == id }) return
         _audibleId.value = id

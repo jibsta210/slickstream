@@ -13,6 +13,8 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
@@ -1159,9 +1161,16 @@ private fun TransportOverlay(
                 thumbnailAt = thumbnailAt,
                 thumbnailVersion = thumbnailVersion,
             )
+            // A SHOW's row is 12 buttons — three more than a movie's (previous / next episode, Episodes)
+            // — and at 64dp + 20dp gaps that is ~1030dp on a 960dp TV: the LAST button, "Add to
+            // multiview", sat just past the right edge, invisible and unreachable. Movies fit (~780dp),
+            // which is why every emulator test passed. Tighter gaps help; horizontalScroll is the real
+            // fix — focusing a button brings it into view, so walking RIGHT slides the row instead of
+            // falling off it, whatever the box's width or overscan inset.
             Row(
-                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
             ) {
                 // Previous episode (TV only) — disabled at the very first episode.
                 if (hasEpisodes) {
