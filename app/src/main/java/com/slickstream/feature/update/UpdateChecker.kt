@@ -63,6 +63,16 @@ class UpdateChecker @Inject constructor(
         dismissedCode = versionCode
     }
 
+    /**
+     * Forget the dismissal. Called when the app goes to the BACKGROUND, so the next foreground
+     * re-prompts. "For the current process" turned out to mean "until a force-stop" on a TV, where
+     * the app is backgrounded and reopened for days without the process ever dying — the user had
+     * to force-stop to see an update they had pressed Later on once.
+     */
+    fun clearDismissal() {
+        dismissedCode = -1
+    }
+
     /** Streams the APK to external cache with whole-percent progress callbacks. Returns the file. */
     suspend fun download(
         manifest: UpdateManifest,

@@ -199,6 +199,10 @@ fun LivePlayerScreen(
             layout == LiveMultiView.Layout.SINGLE -> {
                 val s = sessions.first()
                 val backFocus = remember { FocusRequester() }
+                val addFocus = remember { FocusRequester() }
+                // The Add chip is top-RIGHT, so RIGHT is the press people make from the big picture
+                // — and geometric search finds nothing there, because nothing lies beyond a
+                // full-screen tile's edge. Wire it. (UP stays Back, top-left.)
                 LiveTile(
                     session = s,
                     audible = s.id == audibleId,
@@ -208,13 +212,17 @@ fun LivePlayerScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .focusRequester(tileFocus(s.id))
-                        .focusProperties { up = backFocus },
+                        .focusProperties {
+                            up = backFocus
+                            if (canAdd) right = addFocus
+                        },
                 )
                 SingleChrome(
                     onBack = onBack,
                     onAdd = viewModel::openPicker.takeIf { canAdd },
                     onSwitchFeed = { feedSwitchForId = s.id }.takeIf { s.feedCount() > 1 },
                     backFocus = backFocus,
+                    addFocus = addFocus,
                     tileFocus = tileFocus(s.id),
                     visible = chromeVisible,
                 )
@@ -320,6 +328,7 @@ private fun PipLayout(
     val primaryFocus = tileFocus(primary.id)
     val cornerFocus = tileFocus(secondary.id)
     val backFocus = remember { FocusRequester() }
+    val addFocus = remember { FocusRequester() }
     Box(Modifier.fillMaxSize()) {
         LiveTile(
             session = primary,
@@ -351,7 +360,8 @@ private fun PipLayout(
                 .focusRequester(cornerFocus)
                 .focusProperties {
                     left = primaryFocus
-                    up = primaryFocus
+                    // Add sits directly above the corner; UP from the small window goes there.
+                    up = if (onAdd != null) addFocus else primaryFocus
                 },
         )
         SingleChrome(
@@ -359,6 +369,7 @@ private fun PipLayout(
             onAdd = onAdd,
             onSwitchFeed = null,
             backFocus = backFocus,
+            addFocus = addFocus,
             tileFocus = primaryFocus,
             visible = chromeVisible,
         )
@@ -570,6 +581,7 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
     onAdd: (() -> Unit)?,
     onSwitchFeed: (() -> Unit)?,
     backFocus: FocusRequester,
+    addFocus: FocusRequester,
     tileFocus: FocusRequester,
     visible: Boolean = true,
 ) {
@@ -586,7 +598,10 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
             Icons.AutoMirrored.Rounded.ArrowBack,
             "Back",
             onBack,
-            modifier = Modifier.focusRequester(backFocus).focusProperties { down = tileFocus },
+            modifier = Modifier.focusRequester(backFocus).focusProperties {
+                down = tileFocus
+                if (onAdd != null) right = addFocus
+            },
         )
     }
     Row(
@@ -598,7 +613,13 @@ private fun androidx.compose.foundation.layout.BoxScope.SingleChrome(
             ChromeChip(Icons.Rounded.GridView, "Switch stream", onSwitchFeed, Modifier.focusProperties { down = tileFocus })
         }
         if (onAdd != null) {
-            ChromeChip(Icons.Rounded.Add, "Add", onAdd, Modifier.focusProperties { down = tileFocus })
+            ChromeChip(
+                Icons.Rounded.Add, "Add", onAdd,
+                Modifier.focusRequester(addFocus).focusProperties {
+                    down = tileFocus
+                    left = backFocus
+                },
+            )
         }
     }
 }
