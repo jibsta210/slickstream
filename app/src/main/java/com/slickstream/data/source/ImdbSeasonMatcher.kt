@@ -45,8 +45,11 @@ object ImdbSeasonMatcher {
          *  extrapolation is for seasons nothing could be checked against — never for ones that failed. */
         val refused: Set<Int> = emptySet(),
     ) {
-        fun imdbSeasonFor(tmdbSeason: Int): Int? =
-            seasonMap[tmdbSeason] ?: if (identity && tmdbSeason !in refused) tmdbSeason else null
+        /** Identity extrapolation only reaches seasons NEWER than every mapped one (not on Cinemeta yet).
+         *  An undated season sitting between mapped ones can't be checked — TMDB and IMDB may split
+         *  episodes differently there (measured: One Piece TMDB S1 = 61 eps, IMDB S1 = 8). */
+        fun imdbSeasonFor(tmdbSeason: Int): Int? = seasonMap[tmdbSeason]
+            ?: if (identity && tmdbSeason !in refused && tmdbSeason > (seasonMap.keys.maxOrNull() ?: 0)) tmdbSeason else null
     }
 
     data class MovieCandidate(val imdbId: String, val name: String, val year: Int?)
@@ -83,7 +86,18 @@ object ImdbSeasonMatcher {
                 val map = seasonMap(dated, c)
                 // Must map the show's FIRST dated season: a candidate that only lines up with some later
                 // season by coincidence of date is not the same show.
-                if (map.isEmpty() || lowest !in map) null else Scored(c, map, closeness(tmdbTitle, c.name))
+                if (map.isEmpty() || lowest !in map) return@mapNotNull null
+                // An OFFSET map (TMDB S1 -> IMDB S4) must also agree on episode counts. A companion
+                // show premiering the same night as its parent's season passes the date check alone —
+                // measured: "Cobra Kai: Inside the Dojo" (3 eps, 2024-07-18) mapped onto Cobra Kai S6
+                // (15 eps, same day) and played Cobra Kai. The Monster stories match exactly (8/9/8/8).
+                if (map.any { (tmdb, imdb) -> tmdb != imdb }) {
+                    val imdbCounts = c.episodes.filter { it.season > 0 }.groupBy { it.season }
+                        .mapValues { (_, eps) -> eps.map { it.episode }.distinct().size }
+                    val tmdbCounts = dated.associate { it.number to it.episodeCount }
+                    if (map.any { (tmdb, imdb) -> tmdbCounts[tmdb] != imdbCounts[imdb] }) return@mapNotNull null
+                }
+                Scored(c, map, closeness(tmdbTitle, c.name))
             }
             .toList()
         if (valid.isEmpty()) return null
@@ -93,6 +107,13 @@ object ImdbSeasonMatcher {
         val chosen = widest.singleOrNull() ?: run {
             val bestScore = widest.maxOf { it.score }
             widest.filter { it.score == bestScore }.singleOrNull() ?: return null
+        }
+        // A winner that only CONTAINS the TMDB title loses to an IMDB entry named exactly like it, even
+        // one that couldn't be evaluated (no episodes listed yet, or its meta failed). Measured: a
+        // release-day "9-1-1: Nashville" whose own entry had no episodes yet mapped onto 9-1-1 S9
+        // (same premiere night, same 18 episodes) and every source was 9-1-1.
+        if (chosen.score == 1 && candidates.any { it.imdbId != chosen.candidate.imdbId && closeness(tmdbTitle, it.name) >= 2 }) {
+            return null
         }
         return Mapping(
             imdbId = chosen.candidate.imdbId,

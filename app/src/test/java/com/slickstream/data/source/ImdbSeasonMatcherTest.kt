@@ -414,4 +414,43 @@ class ImdbSeasonMatcherTest {
         assertNull(m.imdbSeasonFor(3))
         assertEquals(4, m.imdbSeasonFor(4))
     }
+
+    // ── companions and spin-offs (review, measured live 2026-09-22) ─────────────────────────────────
+
+    @Test
+    fun `a companion premiering with its parent's season is not mapped onto it`() {
+        // "Cobra Kai: Inside the Dojo": 3 eps, 2024-07-18 — the same night as Cobra Kai S6 (15 eps).
+        val cobraKai = Candidate(
+            "tt7221388", "Cobra Kai",
+            season(5, 10, "2022-09-09") + season(6, 15, "2024-07-18"),
+        )
+        assertNull(ImdbSeasonMatcher.match("Cobra Kai: Inside the Dojo", listOf(TmdbSeason(1, "2024-07-18", 3)), listOf(cobraKai)))
+    }
+
+    @Test
+    fun `an exact-title entry with no episodes yet vetoes its parent series`() {
+        // Release-day "9-1-1: Nashville": its own entry lists no episodes yet; 9-1-1 S9 premiered the same
+        // night with the same 18 episodes.
+        val parent = Candidate("tt7235466", "9-1-1", season(8, 18, "2025-03-06") + season(9, 18, "2025-10-10"))
+        val own = Candidate("tt33550053", "9-1-1: Nashville", emptyList())
+        val tmdb = listOf(TmdbSeason(1, "2025-10-10", 18))
+        assertNull(ImdbSeasonMatcher.match("9-1-1: Nashville", tmdb, listOf(parent, own)))
+        // Once its own episodes are listed it maps to itself.
+        val listed = own.copy(episodes = season(1, 18, "2025-10-10"))
+        val m = ImdbSeasonMatcher.match("9-1-1: Nashville", tmdb, listOf(parent, listed))!!
+        assertEquals("tt33550053", m.imdbId)
+        assertEquals(1, m.imdbSeasonFor(1))
+    }
+
+    @Test
+    fun `identity never extrapolates into an undated season between mapped ones`() {
+        val show = Candidate("tt0388629", "Long Runner", season(1, 8, "1999-10-20") + season(3, 10, "2003-01-01"))
+        val m = ImdbSeasonMatcher.match(
+            "Long Runner",
+            listOf(TmdbSeason(1, "1999-10-20", 8), TmdbSeason(2, null, 16), TmdbSeason(3, "2003-01-01", 10), TmdbSeason(4, null, 0)),
+            listOf(show),
+        )!!
+        assertNull(m.imdbSeasonFor(2))
+        assertEquals(4, m.imdbSeasonFor(4))
+    }
 }

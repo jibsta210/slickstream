@@ -66,6 +66,11 @@ class ImdbIdResolver @Inject constructor(
         val tmdbId = details.item.id
         return when (details.item.mediaType) {
             MediaType.TV -> {
+                // Talk / News entries are companions (official podcasts, after-shows, "Inside the Dojo")
+                // whose titles contain their parent's and whose premieres coincide with it — the one
+                // shape the date match can't tell apart. Measured: every such blank-id entry mapped onto
+                // its parent. They keep the pre-resolver "no sources" rather than play the parent.
+                if (details.genres.any { it.id in COMPANION_GENRES }) return null
                 // Nothing dated to pair on (details not fully loaded, or TMDB has no season dates): skip
                 // the network AND the memo, so a later call with full details is not blocked by a null.
                 if (details.seasons.none { it.seasonNumber > 0 && it.airDate?.let { d -> ImdbSeasonMatcher.epochDay(d) } != null }) {
@@ -213,18 +218,21 @@ class ImdbIdResolver @Inject constructor(
         val candidates = coroutineScope {
             picks.map { (id, searchName) ->
                 async {
-                    val meta = fetchSeriesMeta(id, failed) ?: return@async null
+                    // A candidate whose meta failed or is empty still goes to the matcher (with no
+                    // episodes): an exact-title entry that can't be evaluated yet must veto a parent
+                    // series winning by title containment. See ImdbSeasonMatcher.match.
+                    val meta = fetchSeriesMeta(id, failed)
                     ImdbSeasonMatcher.Candidate(
                         imdbId = id,
-                        name = meta.name?.takeIf { it.isNotBlank() } ?: searchName,
-                        episodes = meta.videos.mapNotNull { v ->
+                        name = meta?.name?.takeIf { it.isNotBlank() } ?: searchName,
+                        episodes = meta?.videos.orEmpty().mapNotNull { v ->
                             val s = v.season ?: return@mapNotNull null
                             val e = v.episode ?: v.number ?: return@mapNotNull null
                             ImdbSeasonMatcher.CandidateEpisode(season = s, episode = e, released = v.released ?: v.firstAired)
                         },
                     )
                 }
-            }.awaitAll().filterNotNull()
+            }.awaitAll()
         }
         return ImdbSeasonMatcher.match(tmdbTitle, tmdbSeasons, candidates)
     }
@@ -309,6 +317,8 @@ class ImdbIdResolver @Inject constructor(
         /** How old a cached map must be before a season it doesn't cover triggers one re-lookup. */
         const val SEASON_REFRESH_NANOS = 30L * 60 * 1_000_000_000
         val IMDB_ID = Regex("^tt\\d+$")
+        /** TMDB TV genres Talk (10767) and News (10763). */
+        val COMPANION_GENRES = setOf(10767, 10763)
         /** " - ", " – ", " — ": TMDB's measured "DAHMER - Monster: …" uses a hyphen; en/em dashes
          *  appear in other TMDB titles. */
         val DASH_SEPARATOR = Regex("\\s[-\u2013\u2014]\\s")
