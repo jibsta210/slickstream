@@ -185,8 +185,18 @@ interface TorrentStreamer {
      * bytes come from spare capacity and never from the episode on screen.
      *
      * Returns true when a band was actually raised.
+     *
+     * [alternateSeason] is the app's (TMDB) season when [season] is in the indexer's (IMDB) numbering —
+     * a last-resort matching hint for a pack named the other way (see
+     * [com.slickstream.core.model.StreamSource.alternateSeason]).
      */
-    suspend fun warmPackFile(infoHash: String, fileIndex: Int?, season: Int?, episode: Int?): Boolean
+    suspend fun warmPackFile(
+        infoHash: String,
+        fileIndex: Int?,
+        season: Int?,
+        episode: Int?,
+        alternateSeason: Int? = null,
+    ): Boolean
 
     /** Info-hashes currently held in the on-disk cache. */
     fun cachedTorrents(): List<String>

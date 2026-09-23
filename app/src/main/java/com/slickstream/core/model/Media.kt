@@ -52,6 +52,11 @@ data class Season(
     val episodeCount: Int,
     val posterUrl: String?,
     val overview: String = "",
+    /** TMDB season premiere "YYYY-MM-DD" (null when TMDB has none). Used to map a TMDB season onto the
+     *  IMDB/Cinemeta numbering when TMDB carries no imdb id: TMDB lists each Netflix "Monster" story as
+     *  its own one-season show, while IMDB files them all as seasons of tt13207736 — the premiere date
+     *  is the only field both sides agree on. */
+    val airDate: String? = null,
 )
 
 data class Episode(

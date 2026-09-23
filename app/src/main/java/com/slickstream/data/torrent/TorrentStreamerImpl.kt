@@ -153,6 +153,7 @@ class TorrentStreamerImpl @Inject constructor(
                     source.fileIndex,
                     source.expectedSeason,
                     source.expectedEpisode,
+                    alternateSeason = source.alternateSeason,
                     acquireStreamingLease = true,
                 ).also { canonicalHash ->
                     // Source mapping canonicalizes v1 hashes, so these normally match. Store under the
@@ -490,6 +491,7 @@ class TorrentStreamerImpl @Inject constructor(
         fileIndex: Int?,
         season: Int?,
         episode: Int?,
+        alternateSeason: Int?,
     ): Boolean = withContext(Dispatchers.IO) {
         if (!engine.isAvailable()) return@withContext false
         val hash = infoHash.lowercase()
@@ -515,6 +517,7 @@ class TorrentStreamerImpl @Inject constructor(
                         expectedSeason = season,
                         expectedEpisode = episode,
                         headBytes = PREFETCH_HEAD_BYTES,
+                        alternateSeason = alternateSeason,
                     )
                 }.getOrNull() ?: break      // nothing warmable here (single-file torrent / unknown episode)
                 if (band.ready) { standDown = false; break }
@@ -526,7 +529,7 @@ class TorrentStreamerImpl @Inject constructor(
             }
         }
         val ready = band?.ready == true
-        Log.i(TAG, "warm pack s=$season e=$episode ready=$ready band=${band?.pieces} missing=${band?.missing} on $hash")
+        Log.i(TAG, "warm pack s=$season e=$episode alt=$alternateSeason ready=$ready band=${band?.pieces} missing=${band?.missing} on $hash")
         ready
     }
 
@@ -569,6 +572,7 @@ class TorrentStreamerImpl @Inject constructor(
                     source.fileIndex,
                     source.expectedSeason,
                     source.expectedEpisode,
+                    alternateSeason = source.alternateSeason,
                 )
             }
         } catch (cancelled: CancellationException) {

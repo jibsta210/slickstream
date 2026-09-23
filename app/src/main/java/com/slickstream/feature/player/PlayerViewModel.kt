@@ -2704,6 +2704,7 @@ class PlayerViewModel @Inject constructor(
                 fileIndex = best.fileIndex,
                 season = best.expectedSeason ?: nextSeason,
                 episode = best.expectedEpisode ?: nextEpisode,
+                alternateSeason = best.alternateSeason,
             )
             warmPhase = if (raised) WarmPhase.READY else WarmPhase.IDLE
             if (raised) warmed = warmed?.copy(headReady = true)

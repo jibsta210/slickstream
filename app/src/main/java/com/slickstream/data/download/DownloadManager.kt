@@ -19,6 +19,7 @@ import com.slickstream.core.repository.SourceRepository
 import com.slickstream.core.repository.TorrentStreamer
 import com.slickstream.data.settings.SettingsRepository
 import com.slickstream.data.settings.QualityPreference
+import com.slickstream.data.source.ImdbIdResolver
 import com.slickstream.data.source.StreamPicker
 import com.slickstream.data.local.dao.DownloadDao
 import com.slickstream.data.local.entity.DownloadEntity
@@ -65,6 +66,7 @@ class DownloadManager @Inject constructor(
     private val settings: SettingsRepository,
     private val profiles: ProfileRepository,
     private val deviceProfile: com.slickstream.core.common.DeviceProfile,
+    private val imdbIdResolver: ImdbIdResolver,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val workLock = Mutex()
@@ -293,9 +295,19 @@ class DownloadManager @Inject constructor(
                 false
             }
         }
-        // Resume path first (the persisted source), then fresh ranked candidates.
-        d.pickedSource()?.let { if (attempt(it)) return }
-        for (source in resolveCandidates(d, minBytes)) {
+        // Resume path first (the persisted source), then fresh ranked candidates. Details fetched to
+        // renumber the resumed source are handed on, so a failed resume doesn't ask TMDB a second time.
+        var details: MediaDetails? = null
+        d.pickedSource()?.let { picked ->
+            val resume = if (picked.expectedSeason != null && picked.expectedEpisode != null) {
+                details = detailsFor(d)
+                inIndexerNumbering(picked, details)
+            } else {
+                picked
+            }
+            if (attempt(resume)) return
+        }
+        for (source in resolveCandidates(d, minBytes, details)) {
             if (source.attemptKey() in tried) continue
             if (attempt(source)) return
         }
@@ -323,13 +335,76 @@ class DownloadManager @Inject constructor(
         return null
     }
 
+    /**
+     * The persisted resume source with its season put back into the numbering its infoHash + fileIndex
+     * were chosen in. The row stores TMDB (season, episode) — the app's key — but the torrent came from an
+     * indexer queried in IMDB numbering. Measured case: "Monster: The Lizzie Borden Story" is TMDB S1 but
+     * IMDB tt13207736 S4; resuming a complete "Monster" pack with expectedSeason = 1 would let the engine's
+     * filename match pick DAHMER's S01E01 over the stored, correct fileIndex. So the engine gets the IMDB
+     * season as expectedSeason and the TMDB season as [StreamSource.alternateSeason], exactly as a fresh
+     * resolve would hand it over.
+     *
+     * Titles whose TMDB record has an imdb id map to themselves (no Cinemeta call). With no details this
+     * returns [picked] unchanged — the pre-mapping behaviour, right for every title TMDB has an id for.
+     *
+     * A title TMDB has NO id for whose mapping can't be established right now (Cinemeta down or slow) is
+     * the dangerous case: its TMDB numbers are exactly the ones that name a DIFFERENT show inside a
+     * multi-season pack. So the episode identity is dropped and the engine uses the stored fileIndex —
+     * the index this very torrent was picked with — instead of a filename match in the wrong numbering.
+     * No stored index means the engine refuses an ambiguous pack, and the download fails over honestly.
+     */
+    private suspend fun inIndexerNumbering(picked: StreamSource, details: MediaDetails?): StreamSource {
+        val season = picked.expectedSeason ?: return picked
+        val episode = picked.expectedEpisode ?: return picked
+        if (details == null) return picked
+        val unmapped = if (details.imdbId.isNullOrBlank()) {
+            picked.copy(expectedSeason = null, expectedEpisode = null)
+        } else {
+            picked
+        }
+        val coords = try {
+            // Bounded like minBytesFor: this runs while holding workLock.
+            kotlinx.coroutines.withTimeoutOrNull(TMDB_LOOKUP_TIMEOUT_MS) {
+                imdbIdResolver.coordinates(details, season, episode)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
+        } ?: return unmapped
+        val imdbSeason = coords.season ?: return unmapped
+        return picked.copy(
+            expectedSeason = imdbSeason,
+            expectedEpisode = coords.episode ?: episode,
+            alternateSeason = season.takeIf { it != imdbSeason },
+        )
+    }
+
+    /** TMDB details for [d], or null on failure/timeout (bounded: runs while holding workLock).
+     *  Cancellation (delete()/shutdown) propagates. */
+    private suspend fun detailsFor(d: Download): MediaDetails? = try {
+        kotlinx.coroutines.withTimeoutOrNull(TMDB_LOOKUP_TIMEOUT_MS) {
+            (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)?.data
+        }
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (_: Throwable) {
+        null
+    }
+
     /** Resolve once, then rank up to [MAX_SOURCE_ATTEMPTS] candidates by repeatedly asking the SAME
      *  picker the player trusts (pick best → remove → pick next), so failover order == picker order.
      *  The [minBytesFor] floor makes SMALLEST mean "smallest REAL release": a 2 MB fake no longer wins
-     *  the min-size sort just because it's tiny. */
-    private suspend fun resolveCandidates(d: Download, minBytes: Long): List<StreamSource> {
-        val details: MediaDetails =
-            (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)?.data ?: return emptyList()
+     *  the min-size sort just because it's tiny. [knownDetails] (from the resume path) skips a repeat
+     *  TMDB fetch. */
+    private suspend fun resolveCandidates(
+        d: Download,
+        minBytes: Long,
+        knownDetails: MediaDetails? = null,
+    ): List<StreamSource> {
+        val details: MediaDetails = knownDetails
+            ?: (catalogRepository.getDetails(d.mediaId, d.mediaType) as? DataResult.Success)?.data
+            ?: return emptyList()
         val list = (sourceRepository.resolve(details, d.season, d.episode) as? DataResult.Success)?.data ?: return emptyList()
         if (list.isEmpty()) return emptyList()
         val s = settings.current()

@@ -429,6 +429,9 @@ class TorrentEngine @Inject constructor(
         preferredFileIndex: Int?,
         expectedSeason: Int? = null,
         expectedEpisode: Int? = null,
+        /** The app's (TMDB) season when [expectedSeason] is in the indexer's (IMDB) numbering — a
+         *  last-resort file-matching hint, see [matchAlternateFile]. */
+        alternateSeason: Int? = null,
         acquireStreamingLease: Boolean = false,
     ): String {
         ensureStarted()
@@ -449,6 +452,7 @@ class TorrentEngine @Inject constructor(
                     preferredFileIndex,
                     expectedSeason,
                     expectedEpisode,
+                    alternateSeason,
                 )
             }
             // Transfer acquisition protection into a streaming lease before the acquisition count is
@@ -470,6 +474,7 @@ class TorrentEngine @Inject constructor(
         preferredFileIndex: Int?,
         expectedSeason: Int?,
         expectedEpisode: Int?,
+        alternateSeason: Int?,
     ): String {
 
         // Fast path: a Details prewarm (or a prior open) already has this torrent live — re-attach
@@ -479,7 +484,7 @@ class TorrentEngine @Inject constructor(
                 // Season pack: the SAME infoHash carries every episode, distinguished only by
                 // fileIndex. A re-attach that skips selectFile keeps the PREVIOUS episode's file
                 // selected — the HTTP server then serves E5's bytes under E6's title.
-                reselectFileIfNeeded(handle, existing, preferredFileIndex, expectedSeason, expectedEpisode)
+                reselectFileIfNeeded(handle, existing, preferredFileIndex, expectedSeason, expectedEpisode, alternateSeason)
                 applySequentialAndPriority(handle, existing)
                 return infoHash
             }
@@ -491,7 +496,7 @@ class TorrentEngine @Inject constructor(
         // metadata fetch at all.
         loadCachedMetadata(infoHash)?.let { cachedInfo ->
             Log.i(TAG, "metadata cache hit for $infoHash")
-            return addWithInfo(cachedInfo, preferredFileIndex, expectedSeason, expectedEpisode)
+            return addWithInfo(cachedInfo, preferredFileIndex, expectedSeason, expectedEpisode, alternateSeason)
         }
 
         // Cache miss (first watch): add the magnet LIVE, FORCE it active so its metadata fetch runs at
@@ -553,7 +558,7 @@ class TorrentEngine @Inject constructor(
         }
         persistMetadata(infoHash, info, handle)
         try {
-            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode)
+            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode, alternateSeason)
         } catch (t: Throwable) {
             // No playable file (RAR/disc release): tear the torrent down like the metadata-timeout
             // branch, or the force-resumed add keeps downloading the whole multi-GB archive (no file
@@ -573,12 +578,13 @@ class TorrentEngine @Inject constructor(
         preferredFileIndex: Int?,
         expectedSeason: Int?,
         expectedEpisode: Int?,
+        alternateSeason: Int?,
     ): String {
         val infoHash = info.infoHash().toHex().lowercase()
         torrents[infoHash]?.let { existing ->
             liveHandle(existing)?.let { handle ->
                 // Same season-pack re-select as addMagnet's fast path.
-                reselectFileIfNeeded(handle, existing, preferredFileIndex, expectedSeason, expectedEpisode)
+                reselectFileIfNeeded(handle, existing, preferredFileIndex, expectedSeason, expectedEpisode, alternateSeason)
                 applySequentialAndPriority(handle, existing)
                 return infoHash
             }
@@ -607,7 +613,7 @@ class TorrentEngine @Inject constructor(
         }
         active.handle = handle
         try {
-            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode)
+            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode, alternateSeason)
         } catch (t: Throwable) {
             // Cached metadata may be reopening gigabytes of valid partial payload (including other
             // episodes in a pack). Remove the unprioritized handle, but preserve those bytes for a
@@ -830,6 +836,7 @@ class TorrentEngine @Inject constructor(
         preferredFileIndex: Int?,
         expectedSeason: Int?,
         expectedEpisode: Int?,
+        alternateSeason: Int?,
     ) {
         if (preferredFileIndex != null && preferredFileIndex == active.fileIndex &&
             (expectedSeason == null || expectedEpisode == null)
@@ -842,15 +849,18 @@ class TorrentEngine @Inject constructor(
                 !isSampleFile(files.fileName(index))
         }
         val match = matchEpisodeFile(files, expectedSeason, expectedEpisode)
+        // Same order as selectFile: the alternate-season hint is consulted only after both the filename
+        // evidence and the addon's index came up empty, so it can only replace the throw below.
         val requested = resolveMatch(match, files, validPreferred) ?: validPreferred
+            ?: matchAlternateFile(files, expectedSeason, alternateSeason, expectedEpisode)
         if (requested == null && expectedSeason != null && expectedEpisode != null) {
             // Unidentifiable, and an episode was asked for: hand it to selectFile, which either finds
             // the pack has exactly one video (harmless) or throws the same error a fresh attach would.
-            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode)
+            selectFile(handle, info, active, preferredFileIndex, expectedSeason, expectedEpisode, alternateSeason)
             return
         }
         if (requested == null || requested == active.fileIndex) return
-        selectFile(handle, info, active, requested, expectedSeason, expectedEpisode)
+        selectFile(handle, info, active, requested, expectedSeason, expectedEpisode, alternateSeason)
     }
 
     /** Choose the file to stream: explicit index if valid, else the largest video file. */
@@ -861,6 +871,7 @@ class TorrentEngine @Inject constructor(
         preferredFileIndex: Int?,
         expectedSeason: Int?,
         expectedEpisode: Int?,
+        alternateSeason: Int?,
     ) {
         val files = info.files()
         val numFiles = files.numFiles()
@@ -883,11 +894,17 @@ class TorrentEngine @Inject constructor(
         val match = matchEpisodeFile(files, expectedSeason, expectedEpisode)
         // Clear filename evidence beats a stale-but-in-range addon index. With no index and several
         // episode files, failing is safer than silently serving the longest/random episode.
-        val chosen = resolveMatch(match, files, prefValid) ?: prefValid ?: largestVideo?.takeIf {
-            expectedSeason == null || expectedEpisode == null || playableVideos.size == 1
-        }
+        // The alternate-season hint sits AFTER the addon index and BEFORE the largest-video fallback:
+        // with s/e set and several videos that fallback is the throw, so the hint can only turn a
+        // "couldn't tell" into a pick — never move a file the two stronger sources already chose.
+        val chosen = resolveMatch(match, files, prefValid) ?: prefValid
+            ?: matchAlternateFile(files, expectedSeason, alternateSeason, expectedEpisode)
+            ?: largestVideo?.takeIf {
+                expectedSeason == null || expectedEpisode == null || playableVideos.size == 1
+            }
             ?: run {
                 val names = (0 until minOf(numFiles, 8)).joinToString { files.fileName(it) }
+                val alt = alternateSeason?.let { " alt=$it" } ?: ""
                 // Say which of the two failures this actually is. They are completely different problems
                 // and the old message asserted the wrong one: a season pack of 23 ordinary .avi episodes
                 // whose naming we could not parse was reported as an "archive/RAR release", which sent
@@ -900,12 +917,12 @@ class TorrentEngine @Inject constructor(
                 error(
                     if (playableVideos.isEmpty()) {
                         "No playable video file in this torrent (archive/RAR release) — " +
-                            "numFiles=$numFiles s=$expectedSeason e=$expectedEpisode " +
+                            "numFiles=$numFiles s=$expectedSeason e=$expectedEpisode$alt " +
                             "pref=$preferredFileIndex files=[$names]"
                     } else {
                         "Couldn't tell which file is S${expectedSeason}E$expectedEpisode in this " +
                             "${playableVideos.size}-episode pack — try another source. " +
-                            "numFiles=$numFiles pref=$preferredFileIndex " +
+                            "numFiles=$numFiles pref=$preferredFileIndex$alt " +
                             "read=[${readableEpisodes(files, playableVideos)}] files=[$names]"
                     },
                 )
@@ -970,6 +987,41 @@ class TorrentEngine @Inject constructor(
             val name = path.substringAfterLast('/')
             isVideoFile(name) && !isSampleFile(name)
         }
+    }
+
+    /**
+     * Last-resort pick for a pack named in the app's (TMDB) season numbering when the indexer was queried
+     * in IMDB's. Netflix's "Monster: The Lizzie Borden Story" is TMDB season 1 but Torrentio's season 4
+     * of "Monster", and many of the packs it returns for 4:1 are named "…S01E01…": with no addon fileIdx
+     * (tracker fallback, fileIdx-less addons, a download resumed without a stored index) [selectFile]
+     * threw "Couldn't tell which file is S4E1 in this 8-episode pack" over the right eight files.
+     *
+     * Only ever consulted AFTER [resolveMatch] and the addon's index both came up empty, and only a
+     * [EpisodeFileMatcher.Match.Unique] from [EpisodeFileMatcher.resolveAlternate] (which refuses any
+     * pack that states a season other than [alternateSeason]) is accepted — so the hint can turn a
+     * throw into a pick but can never change a file the primary numbering already identified. Null when
+     * any input is missing: titles without a remap pay nothing.
+     */
+    private fun matchAlternateFile(
+        files: FileStorage,
+        expectedSeason: Int?,
+        alternateSeason: Int?,
+        expectedEpisode: Int?,
+    ): Int? {
+        if (expectedSeason == null || alternateSeason == null || expectedEpisode == null) return null
+        val names = (0 until files.numFiles()).map { files.filePath(it) }
+        val match = EpisodeFileMatcher.resolveAlternate(names, expectedSeason, alternateSeason, expectedEpisode) { path ->
+            val name = path.substringAfterLast('/')
+            isVideoFile(name) && !isSampleFile(name)
+        }
+        val unique = match as? EpisodeFileMatcher.Match.Unique ?: return null
+        Log.i(
+            TAG,
+            "episode match via alternate season: S${alternateSeason}E$expectedEpisode stands in for " +
+                "S${expectedSeason}E$expectedEpisode (${unique.evidence}) -> idx=${unique.index} " +
+                "'${files.fileName(unique.index)}'",
+        )
+        return unique.index
     }
 
     /**
@@ -1376,6 +1428,8 @@ class TorrentEngine @Inject constructor(
         expectedSeason: Int?,
         expectedEpisode: Int?,
         headBytes: Long,
+        /** The app's (TMDB) season when [expectedSeason] is IMDB-numbered — see [matchAlternateFile]. */
+        alternateSeason: Int? = null,
     ): WarmBand? {
         val active = torrents[infoHash] ?: return null
         val handle = liveHandle(active) ?: return null
@@ -1392,6 +1446,7 @@ class TorrentEngine @Inject constructor(
         }
         val target = resolveMatch(matchEpisodeFile(files, expectedSeason, expectedEpisode), files, prefValid)
             ?: prefValid
+            ?: matchAlternateFile(files, expectedSeason, alternateSeason, expectedEpisode)
             ?: return null
         // The file the user is watching needs no help, and touching it here could only collide with the
         // head/read-ahead bands that are already deadlined for it.

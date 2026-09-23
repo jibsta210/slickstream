@@ -40,6 +40,7 @@ class SourceRepositoryImpl @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val sourceStatusStore: SourceStatusStore,
     private val trackerFallback: TrackerFallback,
+    private val imdbIdResolver: ImdbIdResolver,
 ) : SourceRepository {
 
     /** Successful resolves are briefly reusable by details prewarm + player startup. [inFlight] also
@@ -58,15 +59,38 @@ class SourceRepositoryImpl @Inject constructor(
         season: Int?,
         episode: Int?,
     ): DataResult<List<StreamSource>> {
-        val imdbId = details.imdbId?.takeIf { it.isNotBlank() }
-            ?: return DataResult.Error("No IMDB id for \"${details.item.title}\" — cannot resolve sources")
+        // Every addon (and the tracker fallback) is keyed by IMDB id AND IMDB's season numbering, while
+        // [season]/[episode] are TMDB's. Measured incident: "Monster: The Lizzie Borden Story" (TMDB tv
+        // 299939 S1) said "No IMDB id … cannot resolve sources" on its release day because TMDB's imdb_id
+        // is blank for every Netflix Monster entry; IMDB files it as season 4 of tt13207736, and the bare
+        // tt13207736:1:1 is DAHMER. A title that HAS a TMDB imdb id comes back untouched with no network.
+        val coords = try {
+            imdbIdResolver.coordinates(details, season, episode)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            null
+        }
+            // An Error, never an empty Success: resolveAndCache would record an empty Success as "nothing
+            // to play" and hide the title from browse for 12h over a lookup miss.
+            ?: return DataResult.Error(
+                "Couldn't match \"${details.item.title}\" to an IMDB entry — the source indexes look " +
+                    "titles up by IMDB id. Try again later.",
+            )
 
         val isSeries = details.item.mediaType == MediaType.TV
         val type = if (isSeries) "series" else "movie"
-        val id = if (isSeries && season != null && episode != null) {
-            "$imdbId:$season:$episode"
+        val id = if (isSeries && coords.season != null && coords.episode != null) {
+            "${coords.imdbId}:${coords.season}:${coords.episode}"
         } else {
-            imdbId
+            coords.imdbId
+        }
+        // The TMDB season rides along as a file-matching hint only when the indexer was asked in a
+        // different numbering (Lizzie: queried 4:1, but many packs are named "…S01E01…").
+        val alternateSeason = if (isSeries && coords.season != null && season != null && season != coords.season) {
+            season
+        } else {
+            null
         }
 
         val customBases = try {
@@ -93,7 +117,17 @@ class SourceRepositoryImpl @Inject constructor(
         }
         // Include the complete addon set without retaining a token-bearing custom URL in the key.
         val addonFingerprint = syntheticHash((customBases + baseUrls + autoBases).distinct().joinToString("\n"))
-        val key = ResolveKey(type, id, addonFingerprint)
+        // alternateSeason is part of the key: the rows are stamped with it, so two TMDB entries that map
+        // onto one IMDB coordinate from different TMDB seasons must never share a cached, stamped list.
+        // Anthology guard: when the id was found by title AND the IMDB season equals ours, sibling entries
+        // released under the same "S01E01" can be filed under this very id (Dahmer at tt13207736:1:1 is
+        // answered mostly with Lizzie Borden). Only rows whose FILE names this entry survive.
+        val entryTokens = if (isSeries && details.imdbId.isNullOrBlank() && alternateSeason == null) {
+            coords.seriesName?.let { ImdbSeasonMatcher.entryTokens(details.item.title, it) }.orEmpty()
+        } else {
+            emptySet()
+        }
+        val key = ResolveKey(type, id, addonFingerprint, alternateSeason, entryTokens)
         val shared = resolveMutex.withLock {
             val now = System.nanoTime()
             resolveCache.entries.removeAll { now - it.value.storedAtNanos >= RESOLVE_CACHE_TTL_NANOS }
@@ -139,7 +173,7 @@ class SourceRepositoryImpl @Inject constructor(
         autoBases: List<String>,
     ): DataResult<List<StreamSource>> {
         try {
-            val result = resolveUncached(details, type, id, customBases, autoBases)
+            val result = resolveUncached(details, type, id, key.alternateSeason, key.entryTokens, customBases, autoBases)
             if (result is DataResult.Success) {
                 resolveMutex.withLock {
                     resolveCache[key] = CachedResolve(result, System.nanoTime())
@@ -172,6 +206,8 @@ class SourceRepositoryImpl @Inject constructor(
         details: MediaDetails,
         type: String,
         id: String,
+        alternateSeason: Int?,
+        entryTokens: Set<String>,
         customBases: List<String>,
         autoBases: List<String>,
     ): DataResult<List<StreamSource>> {
@@ -233,6 +269,8 @@ class SourceRepositoryImpl @Inject constructor(
                 trackerFallback.resolve(
                     parts[0], parts.getOrNull(1)?.toIntOrNull(), parts.getOrNull(2)?.toIntOrNull(),
                     { h, dn -> buildMagnet(h, dn, emptyList()) }, ::parseQuality,
+                    alternateSeason = alternateSeason, showTitle = details.item.title,
+                    requireShowTitle = details.imdbId.isNullOrBlank(),
                 )
                     .takeIf { it.isNotEmpty() }
                     ?.let { fallback ->
@@ -258,7 +296,8 @@ class SourceRepositoryImpl @Inject constructor(
             val expectedEpisode = idParts.getOrNull(2)?.toIntOrNull()
             val sources = ok
                 .flatMap { it.streams }
-                .mapNotNull { it.toStreamSource(movieTitle, expectedSeason, expectedEpisode) }
+                .filter { entryTokens.isEmpty() || ImdbSeasonMatcher.namesEntry(it.entryText(), entryTokens) }
+                .mapNotNull { it.toStreamSource(movieTitle, expectedSeason, expectedEpisode, alternateSeason) }
                 .groupBy { it.infoHash }
                 // A cached debrid URL and a torrent fallback can share an info-hash. Keep the direct
                 // one even if a duplicate torrent row reports more seeders; seeders are irrelevant to
@@ -303,6 +342,8 @@ class SourceRepositoryImpl @Inject constructor(
                 val fallback = trackerFallback.resolve(
                     idParts[0], expectedSeason, expectedEpisode,
                     { h, dn -> buildMagnet(h, dn, emptyList()) }, ::parseQuality,
+                    alternateSeason = alternateSeason, showTitle = details.item.title,
+                    requireShowTitle = details.imdbId.isNullOrBlank(),
                 )
                 if (fallback.isNotEmpty()) {
                     android.util.Log.i(
@@ -340,7 +381,22 @@ class SourceRepositoryImpl @Inject constructor(
         url.substringBefore("manifest.json").let { if (it.endsWith("/")) it else "$it/" }
 
     /** Map one indexer row to a [StreamSource], or null if it's neither a torrent nor a direct URL. */
-    private fun StreamDto.toStreamSource(movieTitle: String, season: Int?, episode: Int?): StreamSource? {
+    /** The FILE this row will play, for the anthology entry guard: the addon's filename hint, else the
+     *  file line Torrentio prints under a pack's name, else the release name itself. A pack's own name
+     *  can't vouch for its file — measured: a "Dahmer S01E01-E10" pack served Lizzie Borden's episode. */
+    private fun StreamDto.entryText(): String {
+        behaviorHints?.filename?.takeIf { it.isNotBlank() }?.let { return it }
+        val lines = (title ?: description).orEmpty().lines().map { it.trim() }.filter { it.isNotEmpty() }
+        lines.getOrNull(1)?.takeIf { !it.startsWith("👤") }?.let { return it }  // line 2 is seeders on single files
+        return lines.firstOrNull() ?: name.orEmpty()
+    }
+
+    private fun StreamDto.toStreamSource(
+        movieTitle: String,
+        season: Int?,
+        episode: Int?,
+        alternateSeason: Int?,
+    ): StreamSource? {
         // Pool every text field that may carry quality / seeders / size / codec metadata (the codec
         // and container often live in the filename, e.g. "…XviD-MAXX.avi", so include it).
         val haystack = listOfNotNull(name, title, description, behaviorHints?.bingeGroup, behaviorHints?.filename)
@@ -386,6 +442,8 @@ class SourceRepositoryImpl @Inject constructor(
             fileIndex = fileIdx,
             expectedSeason = season,
             expectedEpisode = episode,
+            // TMDB season when the id above was IMDB-renumbered; a last-resort file-matching hint only.
+            alternateSeason = alternateSeason,
             // Flag season/multi-episode packs so the picker prefers a single-file episode (faster start).
             isPack = StreamPicker.looksLikePack(haystack, fileIdx),
             // Detect language from the FULL text (filename + Torrentio title/description), not just
@@ -523,7 +581,13 @@ class SourceRepositoryImpl @Inject constructor(
     }
 
     private companion object {
-        data class ResolveKey(val type: String, val id: String, val addonFingerprint: String)
+        data class ResolveKey(
+            val type: String,
+            val id: String,
+            val addonFingerprint: String,
+            val alternateSeason: Int?,
+            val entryTokens: Set<String>,
+        )
         data class SharedResolve(
             val deferred: Deferred<DataResult<List<StreamSource>>>,
             var waiters: Int,

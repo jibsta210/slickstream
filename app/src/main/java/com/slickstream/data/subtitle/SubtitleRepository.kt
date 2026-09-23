@@ -3,6 +3,7 @@ package com.slickstream.data.subtitle
 import com.slickstream.core.model.MediaDetails
 import com.slickstream.core.model.MediaType
 import com.slickstream.core.model.SubtitleTrack
+import com.slickstream.data.source.ImdbIdResolver
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -13,15 +14,23 @@ import javax.inject.Singleton
 @Singleton
 class SubtitleRepository @Inject constructor(
     private val api: SubtitleApi,
+    private val imdbIdResolver: ImdbIdResolver,
 ) {
     private val io: CoroutineDispatcher = Dispatchers.IO
 
     suspend fun fetch(details: MediaDetails, season: Int?, episode: Int?): List<SubtitleTrack> =
         withContext(io) {
-            val imdb = details.imdbId?.takeIf { it.isNotBlank() } ?: return@withContext emptyList()
+            // Same IMDB coordinates as the stream sources, never TMDB numbers glued onto a mapped id:
+            // measured, opensubtitles answers tt13207736:1:1 with DAHMER subs, while "Monster: The Lizzie
+            // Borden Story" (TMDB S1, blank TMDB imdb id) is tt13207736 season 4. No coordinates, no subs.
+            val coords = imdbIdResolver.coordinates(details, season, episode) ?: return@withContext emptyList()
             val isSeries = details.item.mediaType == MediaType.TV
             val type = if (isSeries) "series" else "movie"
-            val id = if (isSeries && season != null && episode != null) "$imdb:$season:$episode" else imdb
+            val id = if (isSeries && coords.season != null && coords.episode != null) {
+                "${coords.imdbId}:${coords.season}:${coords.episode}"
+            } else {
+                coords.imdbId
+            }
 
             runCatching {
                 api.getSubtitles(type, id).subtitles.mapNotNull { dto ->

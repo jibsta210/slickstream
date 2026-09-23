@@ -516,6 +516,69 @@ object EpisodeFileMatcher {
         isPlayable: (String) -> Boolean,
     ): Int? = (resolve(names, season, episode, isPlayable) as? Match.Unique)?.index
 
+    /**
+     * Second opinion for a pack named in a DIFFERENT season numbering from the one the indexer was
+     * queried in. [primarySeason] is that queried (IMDB) season and is what [resolve] already tried;
+     * [altSeason] is the app's own (TMDB) season for the same episode. Call this ONLY after [resolve]
+     * and the addon's fileIdx have both failed — it exists to turn a throw into a pick, never to
+     * overrule either of them.
+     *
+     * The measured case: Netflix's "Monster: The Lizzie Borden Story" is TMDB season 1, but IMDB (and so
+     * Torrentio) files it as season 4 of the single series "Monster" (tt13207736). Querying 4:1 returns
+     * packs named "…S04E01…" — which [resolve] handles as-is — AND packs named
+     * "Monster.The.Lizzie.Borden.Story.S01E01…", which read as a perfectly parseable season 1 that does
+     * not contain S04E01. With the addon's fileIdx present that is fine; without one (the tracker
+     * fallback, a fileIdx-less addon, a download resumed with no stored index) the engine threw
+     * "Couldn't tell which file is S4E1 in this 8-episode pack" about a pack holding exactly the right
+     * eight files.
+     *
+     * Reading S01E01 as S04E01 is only safe when the pack cannot mean anything else, so every one of
+     * these must hold, or the answer is [Match.None] and today's behaviour stands:
+     *  - The two numberings actually differ, and the alternate is a real season (not specials, where
+     *    TMDB and IMDB disagree most and packs rarely name episodes consistently).
+     *  - The pack speaks ONLY the alternate numbering: every season any playable file states — its
+     *    explicit SxxEyy-style codes and every season any of its folders names — is exactly
+     *    {[altSeason]}. A complete "Monster" pack (Season 1..4 folders / S01..S04 codes) states four
+     *    seasons, so its S01E01 is Dahmer and this refuses; [resolve] already answers that pack
+     *    correctly in the primary numbering. A "Season 4/" folder over S01Exx files is contradicting
+     *    itself and is refused too. An unnumbered/absolute pack states NO season, so it is refused as
+     *    well: [resolve]'s "single unnumbered season" rule would happily call its first file season 1
+     *    of anything.
+     *  - [resolve] in the alternate numbering is [Match.Unique]. Never [Match.Ambiguous]: a per-show
+     *    collection names EVERY Monster show "S01E01", so four files tie, and the engine's
+     *    interchangeable-tie collapse would pick the largest — quite possibly Dahmer under Lizzie
+     *    Borden's title.
+     */
+    fun resolveAlternate(
+        paths: List<String>,
+        primarySeason: Int,
+        altSeason: Int,
+        episode: Int,
+        isPlayable: (String) -> Boolean,
+    ): Match {
+        if (altSeason == primarySeason || primarySeason < 0 || altSeason < 1 || episode < 0) return Match.None
+        val playable = paths.filter(isPlayable)
+        if (playable.isEmpty()) return Match.None
+        val stated = HashSet<Int>()
+        for (path in playable) {
+            explicitCodes(path).mapTo(stated) { it.first }
+            stated += directorySeasons(path)
+        }
+        if (stated != setOf(altSeason)) return Match.None
+        return (resolve(paths, altSeason, episode, isPlayable) as? Match.Unique) ?: Match.None
+    }
+
+    /**
+     * EVERY season any directory component of [path] names. Deliberately wider than [folderSeason],
+     * which settles on the deepest single answer: [resolveAlternate] is asking "does this pack say
+     * anything OTHER than the alternate season anywhere?", so a "Monster.S04/Season 1/…" layout must
+     * count its S04 root too rather than let the deeper folder hide the contradiction.
+     */
+    private fun directorySeasons(path: String): Set<Int> =
+        path.split('/').dropLast(1)
+            .flatMap { dir -> SEASON_DIR.findAll(dir).mapNotNull { it.groupValues[1].toIntOrNull() }.toList() }
+            .toSet()
+
     private fun base(path: String) = path.substringAfterLast('/')
 
     private fun baseNoExt(path: String) = base(path).substringBeforeLast('.')

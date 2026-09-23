@@ -3,6 +3,7 @@ package com.slickstream.data.source.di
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.slickstream.core.common.Indexer
 import com.slickstream.core.repository.SourceRepository
+import com.slickstream.data.source.CinemetaApi
 import com.slickstream.data.source.IndexerApi
 import com.slickstream.data.source.SourceRepositoryImpl
 import dagger.Binds
@@ -43,6 +44,21 @@ object SourceModule {
             .addConverterFactory(json.asConverterFactory(contentType))
             .build()
             .create(IndexerApi::class.java)
+    }
+
+    /** Cinemeta (IMDB-keyed metadata), used only by [com.slickstream.data.source.ImdbIdResolver] to
+     *  recover an IMDB id + season numbering for titles TMDB lists with a blank imdb id. Calls pass a
+     *  full @Url, so [CinemetaApi.BASE_URL] (which ends with '/') is only Retrofit's required base. */
+    @Provides
+    @Singleton
+    fun provideCinemetaApi(okHttpClient: OkHttpClient, json: Json): CinemetaApi {
+        val contentType = "application/json".toMediaType()
+        return Retrofit.Builder()
+            .baseUrl(CinemetaApi.BASE_URL)
+            .client(okHttpClient)
+            .addConverterFactory(json.asConverterFactory(contentType))
+            .build()
+            .create(CinemetaApi::class.java)
     }
 }
 

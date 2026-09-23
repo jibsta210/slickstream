@@ -87,6 +87,7 @@ internal fun SeasonSummaryDto.toDomain(): Season = Season(
     episodeCount = episodeCount,
     posterUrl = Img.url(posterPath, Img.POSTER),
     overview = overview.orEmpty(),
+    airDate = airDate?.takeIf { it.isNotBlank() },
 )
 
 internal fun EpisodeDto.toDomain(): Episode = Episode(

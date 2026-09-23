@@ -16,6 +16,21 @@ data class StreamSource(
     /** Episode identity used to recover the right file from a season pack when an addon omits fileIdx. */
     val expectedSeason: Int? = null,
     val expectedEpisode: Int? = null,
+    /**
+     * The app's own (TMDB) season, set only when the indexer was queried in a DIFFERENT (IMDB) numbering
+     * — [expectedSeason] then carries the IMDB season, because that is the numbering the release names
+     * and the addon's fileIdx were produced in. Measured case: Netflix's "Monster: The Lizzie Borden
+     * Story" is TMDB tv 299939 season 1, but IMDB/Torrentio file it as season 4 of the one series
+     * "Monster" (tt13207736), so it is queried as 4:1 while many of the packs that come back are named
+     * "…S01E01…".
+     *
+     * A file-matching HINT only, never identity: the torrent engine consults it solely where it would
+     * otherwise have thrown "couldn't tell which file" (see
+     * [com.slickstream.data.torrent.EpisodeFileMatcher.resolveAlternate]). Deliberately NOT part of the
+     * streamer's pack-selection key, or two callers that do/don't set it would falsely conflict over the
+     * same episode.
+     */
+    val alternateSeason: Int? = null,
     /** True when this source is a season/multi-episode PACK rather than a single-file release. Packs
      *  stream slower to start (large pieces, the wanted episode sits mid-file behind a shared boundary
      *  piece), so the picker prefers a single-file episode when one exists. */

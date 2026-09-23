@@ -439,4 +439,103 @@ class EpisodeFileMatcherTest {
         assertEquals(1, idx(names, 4, 2))
         assertEquals(2, idx(names, 4, 3))
     }
+
+    // =============================================================================================
+    // resolveAlternate — a pack named in the app's (TMDB) season when the indexer was asked in IMDB's
+    // =============================================================================================
+
+    private fun alt(names: List<String>, primary: Int, altSeason: Int, e: Int) =
+        EpisodeFileMatcher.resolveAlternate(names, primary, altSeason, e) { true }
+
+    /** Netflix names every Monster show as its own season 1; IMDB/Torrentio number them S1..S4. */
+    private val lizzieS01Pack = (1..8).map {
+        "Monster.The.Lizzie.Borden.Story.S01.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-FLUX/" +
+            "Monster.The.Lizzie.Borden.Story.S01E%02d.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-FLUX.mkv".format(it)
+    }
+
+    @Test
+    fun `an S01-named Lizzie Borden pack answers IMDB season 4 through the TMDB season`() {
+        // Torrentio answers tt13207736:4:1 with packs named "...S01E01...". Read in the queried numbering
+        // this is a perfectly parseable season 1 that lacks S04E01, so with no addon fileIdx the engine
+        // threw "Couldn't tell which file is S4E1 in this 8-episode pack" over the right eight files.
+        assertTrue(resolve(lizzieS01Pack, 4, 1) is Match.None)
+        val r = alt(lizzieS01Pack, 4, 1, 1)
+        assertTrue(r is Match.Unique)
+        assertEquals(0, (r as Match.Unique).index)
+        assertEquals(4, (alt(lizzieS01Pack, 4, 1, 5) as Match.Unique).index)
+        assertEquals(7, (alt(lizzieS01Pack, 4, 1, 8) as Match.Unique).index)
+        // Episode 9 does not exist; the pack is readable, so the answer is "absent", not a guess.
+        assertTrue(alt(lizzieS01Pack, 4, 1, 9) is Match.None)
+    }
+
+    @Test
+    fun `a complete IMDB-numbered Monster pack is left to the primary numbering`() {
+        // Season 1 here is DAHMER. Its S01E01 must never stand in for Lizzie Borden's S04E01 — and it
+        // never has to, because resolve() already finds S04E01 in the queried numbering.
+        val counts = listOf(10, 9, 8, 8)
+        val names = counts.flatMapIndexed { i, n ->
+            val s = i + 1
+            (1..n).map { e -> "Monster.S01-S04.COMPLETE.1080p.NF.WEB-DL/Season $s/Monster.S%02dE%02d.1080p.mkv".format(s, e) }
+        }
+        assertTrue(alt(names, 4, 1, 1) is Match.None)
+        assertEquals(10 + 9 + 8, (resolve(names, 4, 1) as Match.Unique).index)
+    }
+
+    @Test
+    fun `a per-show collection where every Monster show is S01 is refused, never collapsed`() {
+        // Four files claim "S01E01". resolve() calls that Ambiguous, and the engine's interchangeable-tie
+        // collapse would take the LARGEST — quite possibly Dahmer under Lizzie Borden's title.
+        val shows = listOf(
+            "Monster.The.Jeffrey.Dahmer.Story",
+            "Monster.The.Lyle.and.Erik.Menendez.Story",
+            "Monster.The.Ed.Gein.Story",
+            "Monster.The.Lizzie.Borden.Story",
+        )
+        val names = shows.flatMap { show ->
+            (1..2).map { e -> "Monster Collection/$show.S01.1080p/$show.S01E%02d.1080p.mkv".format(e) }
+        }
+        assertTrue(resolve(names, 1, 1) is Match.Ambiguous)
+        assertTrue(alt(names, 4, 1, 1) is Match.None)
+        assertTrue(alt(names, 4, 1, 2) is Match.None)
+    }
+
+    @Test
+    fun `no alternate is consulted when it is the same season, or specials, or nonsense`() {
+        assertTrue(alt(lizzieS01Pack, 1, 1, 1) is Match.None)
+        // Specials are where TMDB and IMDB numbering disagree most.
+        val specials = listOf("Monster/Specials/Monster.S00E01.mkv", "Monster/Specials/Monster.S00E02.mkv")
+        assertTrue(alt(specials, 1, 0, 1) is Match.None)
+        assertTrue(alt(lizzieS01Pack, -1, 1, 1) is Match.None)
+        assertTrue(alt(lizzieS01Pack, 4, 1, -1) is Match.None)
+        assertTrue(alt(emptyList(), 4, 1, 1) is Match.None)
+    }
+
+    @Test
+    fun `an unnumbered or absolute pack is refused - it states no season to agree with`() {
+        // resolve()'s "single unnumbered season" rule WOULD call this season 1 — which is exactly why the
+        // alternate insists the pack explicitly speaks the alternate numbering.
+        val names = (1..8).map { "[SubsPlease] Monster - %02d (1080p) [ABCD1234].mkv".format(it) }
+        assertTrue(resolve(names, 1, 1) is Match.Unique)
+        assertTrue(alt(names, 4, 1, 1) is Match.None)
+    }
+
+    @Test
+    fun `a season 4 folder over S01 files contradicts itself and is refused`() {
+        val names = (1..8).map { "Monster Season 4/Monster.The.Lizzie.Borden.Story.S01E%02d.1080p.mkv".format(it) }
+        assertTrue(alt(names, 4, 1, 1) is Match.None)
+        // A deeper "Season 1" folder does not hide an S04 root either.
+        val nested = (1..8).map { "Monster.S04.1080p/Season 1/Monster.The.Lizzie.Borden.Story.S01E%02d.mkv".format(it) }
+        assertTrue(alt(nested, 4, 1, 1) is Match.None)
+    }
+
+    @Test
+    fun `a pack readable in the primary season that lacks the episode is not rescued`() {
+        // S04E01 is genuinely absent from an S04 pack; the alternate must not turn that into a pick.
+        val s04 = (2..8).map { "Monster.S04.1080p/Monster.S04E%02d.1080p.mkv".format(it) }
+        assertTrue(resolve(s04, 4, 1) is Match.None)
+        assertTrue(alt(s04, 4, 1, 1) is Match.None)
+        // ...and neither is an S01-named pack that lacks it.
+        val s01 = lizzieS01Pack.drop(1)
+        assertTrue(alt(s01, 4, 1, 1) is Match.None)
+    }
 }
