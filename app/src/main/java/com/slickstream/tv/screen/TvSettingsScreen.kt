@@ -35,7 +35,10 @@ import com.slickstream.data.settings.SubtitleLanguage
 import com.slickstream.data.settings.SubtitleSize
 import com.slickstream.data.settings.SubtitleStyle
 import com.slickstream.data.settings.UiDensity
+import com.slickstream.BuildConfig
 import com.slickstream.feature.settings.SettingsViewModel
+import com.slickstream.feature.update.UpdateUiState
+import com.slickstream.feature.update.UpdateViewModel
 import com.slickstream.ui.theme.Brand
 
 /**
@@ -52,6 +55,12 @@ fun TvSettingsScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val cache by viewModel.cacheStats.collectAsStateWithLifecycle()
     val syncDiag by viewModel.syncDiagnostic.collectAsStateWithLifecycle()
+    // The ACTIVITY's updater — the same instance UpdateGate renders — so "Check for updates" here pops
+    // the real update prompt. A plain hiltViewModel() inside the NavHost would be a second, private
+    // copy whose result the prompt never sees.
+    val activity = androidx.compose.ui.platform.LocalContext.current.findComponentActivity()
+    val updateVm: UpdateViewModel = activity?.let { hiltViewModel<UpdateViewModel>(it) } ?: hiltViewModel()
+    val updateState by updateVm.state.collectAsStateWithLifecycle()
 
     syncDiag?.let { result ->
         com.slickstream.tv.components.TvConfirmDialog(
@@ -84,6 +93,37 @@ fun TvSettingsScreen(
     ) {
         item {
             Text("Settings", style = MaterialTheme.typography.headlineMedium, color = Brand.OnSurface)
+        }
+
+        item {
+            TvSettingSection("Software update") {
+                Text(
+                    text = "Version ${BuildConfig.VERSION_NAME} · " + when (val u = updateState) {
+                        UpdateUiState.Checking -> "checking for updates…"
+                        UpdateUiState.UpToDate -> "you're on the latest version"
+                        is UpdateUiState.Available -> "version ${u.manifest.versionName} is available"
+                        is UpdateUiState.Downloading -> "downloading… ${u.percent}%"
+                        is UpdateUiState.ReadyToInstall -> "downloaded, ready to install"
+                        is UpdateUiState.Error -> u.message
+                        else -> "checked every time you open the app"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Brand.OnSurfaceDim,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+                androidx.compose.foundation.layout.Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    when (val u = updateState) {
+                        is UpdateUiState.Available -> TvSettingsPill("Update now") { updateVm.startDownload(u.manifest) }
+                        is UpdateUiState.ReadyToInstall -> TvSettingsPill("Install") { updateVm.launchInstall() }
+                        else -> Unit
+                    }
+                    TvSettingsPill(if (updateState is UpdateUiState.Checking) "Checking…" else "Check for updates") {
+                        if (updateState !is UpdateUiState.Checking && updateState !is UpdateUiState.Downloading) {
+                            updateVm.forceCheck()
+                        }
+                    }
+                }
+            }
         }
 
         item {
@@ -249,6 +289,34 @@ fun TvSettingsScreen(
             }
         }
     }
+}
+
+/** Pill button in the Cloud-sync style: violet fill + 3dp ring when focused. */
+@Composable
+private fun TvSettingsPill(label: String, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(50)
+    Surface(
+        onClick = onClick,
+        shape = ClickableSurfaceDefaults.shape(shape = shape),
+        colors = ClickableSurfaceDefaults.colors(
+            containerColor = Brand.Surface,
+            focusedContainerColor = Brand.Violet,
+            contentColor = Brand.OnSurface,
+            focusedContentColor = Color.White,
+        ),
+        border = ClickableSurfaceDefaults.border(
+            focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Brand.Violet), shape = shape),
+        ),
+        scale = ClickableSurfaceDefaults.scale(scale = 1f, focusedScale = 1.03f),
+    ) {
+        Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp))
+    }
+}
+
+private tailrec fun android.content.Context.findComponentActivity(): androidx.activity.ComponentActivity? = when (this) {
+    is androidx.activity.ComponentActivity -> this
+    is android.content.ContextWrapper -> baseContext.findComponentActivity()
+    else -> null
 }
 
 @Composable

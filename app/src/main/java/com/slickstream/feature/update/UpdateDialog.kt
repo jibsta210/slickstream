@@ -50,15 +50,18 @@ import com.slickstream.ui.theme.Brand
 fun UpdateGate(viewModel: UpdateViewModel = hiltViewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
 
-    // Re-check for updates every time the app comes to the foreground (not just cold start), and
-    // resume a pending install once the user grants unknown-sources permission and returns.
+    // Re-check for updates every time the app comes back to the screen, and resume a pending install
+    // once the user grants unknown-sources permission and returns.
+    // ON_RESUME, not ON_START: a TV's screensaver / ambient mode and input switching can PAUSE the app
+    // without stopping it, and coming back from those never delivered ON_START — so "open the app
+    // again" produced no check at all. ON_RESUME follows every ON_START too, so nothing is lost;
+    // checkNow() skips while a check or prompt is already in flight.
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            when (event) {
-                androidx.lifecycle.Lifecycle.Event.ON_START -> viewModel.checkNow()
-                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> viewModel.onResume()
-                else -> Unit
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                viewModel.checkNow()
+                viewModel.onResume()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -94,7 +97,8 @@ fun UpdateGate(viewModel: UpdateViewModel = hiltViewModel()) {
             title = "Update failed",
             body = s.message,
             primaryLabel = "Dismiss",
-            onPrimary = { /* leave; next launch retries */ },
+            onPrimary = viewModel::clearError,
+            onSecondary = viewModel::clearError,
             dismissable = true,
         )
         else -> Unit

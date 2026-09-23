@@ -24,6 +24,9 @@ class UpdateViewModel @Inject constructor(
 
     private var downloadedApk: File? = null
 
+    /** The foreground check in flight, so ON_RESUME bursts (and Settings) never stack requests. */
+    private var checkJob: kotlinx.coroutines.Job? = null
+
     /**
      * A dismissal lasts until the app is next BACKGROUNDED — not for the life of the process.
      *
@@ -56,9 +59,10 @@ class UpdateViewModel @Inject constructor(
     }
 
     /**
-     * Re-check on every foreground (ON_START), not just fresh start. Skips if a check/download/
-     * prompt is already in flight so it never interrupts the user; the checker's dismissed-version
-     * gate keeps a previously-dismissed update from popping again.
+     * Re-check whenever the app comes back to the screen (ON_RESUME — see [UpdateGate]), not just on a
+     * fresh start. Skips if a check/download/prompt is already in flight so it never interrupts the
+     * user; the checker's dismissed-version gate keeps a just-dismissed update from popping again
+     * until the app has been backgrounded.
      */
     fun checkNow() {
         when (_state.value) {
@@ -68,15 +72,23 @@ class UpdateViewModel @Inject constructor(
             is UpdateUiState.ReadyToInstall -> return
             else -> Unit
         }
-        viewModelScope.launch {
+        if (checkJob?.isActive == true) return
+        checkJob = viewModelScope.launch {
             val manifest = checker.check()
             if (manifest != null) _state.value = UpdateUiState.Available(manifest)
         }
     }
 
+    /** "Update failed" → Dismiss (or Back): clear it so the next resume can check again. Before this
+     *  the dialog's Dismiss did nothing and Back was routed to a no-op, so it could not be closed. */
+    fun clearError() {
+        if (_state.value is UpdateUiState.Error) _state.value = UpdateUiState.Idle
+    }
+
     /** User-initiated check (Settings). Always re-checks and ignores a session dismissal. */
     fun forceCheck() {
-        viewModelScope.launch {
+        checkJob?.cancel()
+        checkJob = viewModelScope.launch {
             _state.value = UpdateUiState.Checking
             val manifest = checker.check(ignoreDismiss = true)
             _state.value = if (manifest != null) UpdateUiState.Available(manifest) else UpdateUiState.UpToDate
