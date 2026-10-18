@@ -13,7 +13,9 @@ data class VlcCastTarget(val address: String, val controlPort: Int, val httpPort
     }
 
     fun mediaOptions(): List<String> = listOf(
-        ":sout=#chromecast{ip=$address,port=$controlPort,http-port=$httpPort}",
+        // Always downmix audio before the receiver-specific video remux/conversion. A receiver
+        // accepting the video does not prove its HDMI/audio path can play the original audio.
+        ":sout=#transcode{acodec=mp4a,aenc=avcodec,ab=192,channels=2,samplerate=48000}:chromecast{ip=$address,port=$controlPort,http-port=$httpPort}",
         // This filter reports the receiver's clock and forwards pause/seek to the receiver.
         ":demux-filter=cc_demux",
         ":no-sout-keep",

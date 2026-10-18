@@ -126,6 +126,8 @@ fun PlayerScreen(
     val isCasting by viewModel.isCasting.collectAsState()
     val castConnecting by viewModel.castConnecting.collectAsState()
     val castConverting by viewModel.castConverting.collectAsState()
+    val castVolume by viewModel.castVolume.collectAsState()
+    val castMuted by viewModel.castMuted.collectAsState()
     val castError by viewModel.castError.collectAsState()
 
     // Keep the device awake while playing/loading (not when paused/idle) — replaces the always-on
@@ -220,7 +222,20 @@ fun PlayerScreen(
     ) {
         // --- Video surface ---------------------------------------------------
         val activePlayer = player
-        if (activePlayer != null) {
+        if (isCasting) {
+            CastPlaybackControls(
+                player = activePlayer,
+                connecting = castConnecting,
+                converting = castConverting,
+                volume = castVolume,
+                muted = castMuted,
+                onVolume = viewModel::setCastVolume,
+                onMute = viewModel::toggleCastMute,
+                onRepairAudio = viewModel::repairCastAudio,
+                onPlayOnPhone = viewModel::stopCasting,
+                modifier = Modifier.fillMaxSize().statusBarsPadding().padding(top = 64.dp, bottom = 8.dp),
+            )
+        } else if (activePlayer != null) {
             AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
@@ -369,7 +384,7 @@ fun PlayerScreen(
 
         // --- Top bar overlay (title + back + sources) -----------------------
         AnimatedVisibility(
-            visible = (overlayVisible || uiState !is PlayerUiState.Playing) && !isInPip,
+            visible = (isCasting || overlayVisible || uiState !is PlayerUiState.Playing) && !isInPip,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.align(Alignment.TopCenter),
@@ -420,7 +435,7 @@ fun PlayerScreen(
 
         // --- State overlays (hidden inside the PiP window) ------------------
         if (!isInPip) {
-            when (val state = uiState) {
+            if (!isCasting) when (val state = uiState) {
                 // ONE continuous overlay from tap → first frame. The torrent head-download AND the
                 // player's own prepare/buffer both live under PlayerUiState.Buffering, so we keep it up
                 // until Playing (not just until the player object exists). This removes the old jarring
@@ -446,13 +461,6 @@ fun PlayerScreen(
                 )
                 PlayerUiState.Playing -> Unit
             }
-
-            if (isCasting) CastingOverlay(
-                connecting = castConnecting,
-                converting = castConverting,
-                controlsVisible = overlayVisible,
-                onPlayOnDevice = viewModel::stopCasting,
-            )
 
             // Film-strip preview while dragging the seek bar: a row of frames around the scrub point
             // that scrolls as you drag (earlier frames left, later frames right), the centre frame
@@ -1286,67 +1294,6 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit, onOtherStreams: (
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun CastingOverlay(connecting: Boolean, converting: Boolean, controlsVisible: Boolean, onPlayOnDevice: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.85f)),
-        contentAlignment = Alignment.Center,
-    ) {
-        AnimatedVisibility(visible = controlsVisible, enter = fadeIn(), exit = fadeOut()) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(
-                imageVector = Icons.Filled.CastConnected,
-                contentDescription = null,
-                tint = Brand.Cyan,
-                modifier = Modifier.size(72.dp),
-            )
-            Spacer(Modifier.height(18.dp))
-            Text(
-                text = when {
-                    connecting && converting -> "Preparing this file for your TV…"
-                    connecting -> "Starting playback on your TV…"
-                    else -> "Casting to your TV"
-                },
-                color = Brand.OnSurface,
-                fontWeight = FontWeight.Bold,
-                fontSize = 18.sp,
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = "Use the cast icon to switch device, or bring it back here",
-                color = Brand.OnSurfaceDim,
-                fontSize = 13.sp,
-            )
-            Spacer(Modifier.height(22.dp))
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .background(Brand.Violet)
-                    .clickable(onClick = onPlayOnDevice)
-                    .padding(horizontal = 24.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Cast,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(18.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = "Play on this device",
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 15.sp,
-                )
-            }
-        }
         }
     }
 }

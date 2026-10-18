@@ -61,6 +61,7 @@ class VlcCastIntegrationTest {
             instrumentation.runOnMainSync {
                 player = VlcPlayer(engine, instrumentation.targetContext, VlcCastTarget(host!!, 18009, 18080))
                 created = true
+                player.setPreferredAudioLanguages("en,eng,english")
                 player.addListener(object : Player.Listener {
                     override fun onPlayerError(failure: PlaybackException) { error.set(failure) }
                 })
@@ -69,6 +70,9 @@ class VlcCastIntegrationTest {
                 player.play()
             }
             await("No converted media delivered") { status().optLong("bytes") > 50_000 }
+            instrumentation.runOnMainSync {
+                assertTrue("Cast audio picker has no selected track", player.audioTracks().any { it.selected })
+            }
             instrumentation.runOnMainSync { player.pause() }
             await("Pause was not sent to receiver") { status().optInt("pauses") > 0 }
             instrumentation.runOnMainSync { player.play() }
