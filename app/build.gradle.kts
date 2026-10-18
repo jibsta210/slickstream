@@ -63,7 +63,9 @@ android {
         // Ship only ARM (real phones + TV boxes). Dropping x86/x86_64 (emulator-only) removes
         // ~25 MB of duplicate libtorrent .so files. Add them back here if you need an x86 emulator.
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += if (providers.gradleProperty("castEmulatorTest").orNull == "true") {
+                listOf("x86_64")
+            } else listOf("arm64-v8a", "armeabi-v7a")
         }
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"${secret("GOOGLE_WEB_CLIENT_ID")}\"")
         // "TVs and Limited Input devices" OAuth client for the Android TV device-pairing flow.
@@ -199,6 +201,8 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
 
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("junit:junit:4.13.2")
 
     // Firebase — cross-device sync of favourites + watch history (dormant without google-services.json)
     implementation(platform(libs.firebase.bom))

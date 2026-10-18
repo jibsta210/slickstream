@@ -125,6 +125,7 @@ fun PlayerScreen(
     val player by viewModel.currentPlayer.collectAsState()
     val isCasting by viewModel.isCasting.collectAsState()
     val castConnecting by viewModel.castConnecting.collectAsState()
+    val castConverting by viewModel.castConverting.collectAsState()
     val castError by viewModel.castError.collectAsState()
 
     // Keep the device awake while playing/loading (not when paused/idle) — replaces the always-on
@@ -448,6 +449,7 @@ fun PlayerScreen(
 
             if (isCasting) CastingOverlay(
                 connecting = castConnecting,
+                converting = castConverting,
                 controlsVisible = overlayVisible,
                 onPlayOnDevice = viewModel::stopCasting,
             )
@@ -1289,7 +1291,7 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit, onOtherStreams: (
 }
 
 @Composable
-private fun CastingOverlay(connecting: Boolean, controlsVisible: Boolean, onPlayOnDevice: () -> Unit) {
+private fun CastingOverlay(connecting: Boolean, converting: Boolean, controlsVisible: Boolean, onPlayOnDevice: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1306,7 +1308,11 @@ private fun CastingOverlay(connecting: Boolean, controlsVisible: Boolean, onPlay
             )
             Spacer(Modifier.height(18.dp))
             Text(
-                text = if (connecting) "Starting playback on your TV…" else "Casting to your TV",
+                text = when {
+                    connecting && converting -> "Preparing this file for your TV…"
+                    connecting -> "Starting playback on your TV…"
+                    else -> "Casting to your TV"
+                },
                 color = Brand.OnSurface,
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,
