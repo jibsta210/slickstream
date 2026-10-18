@@ -124,6 +124,8 @@ fun PlayerScreen(
     val uiState by viewModel.uiState.collectAsState()
     val player by viewModel.currentPlayer.collectAsState()
     val isCasting by viewModel.isCasting.collectAsState()
+    val castConnecting by viewModel.castConnecting.collectAsState()
+    val castError by viewModel.castError.collectAsState()
 
     // Keep the device awake while playing/loading (not when paused/idle) — replaces the always-on
     // PlayerView flag and covers the libVLC fallback too. Casting plays on the TV, so don't hold the
@@ -192,6 +194,23 @@ fun PlayerScreen(
     val videoAspect by viewModel.videoAspect.collectAsState()
     val pipController = LocalPipController.current
     var videoBounds by remember { mutableStateOf<Rect?>(null) }
+
+    castError?.let { message ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = viewModel::dismissCastError,
+            title = { Text("Casting stopped") },
+            text = { Text(message) },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = viewModel::dismissCastError) { Text("OK") }
+            },
+            dismissButton = if (sources.size > 1) {{
+                androidx.compose.material3.TextButton(onClick = {
+                    viewModel.dismissCastError()
+                    showSources = true
+                }) { Text("Other streams") }
+            }} else null,
+        )
+    }
 
     Box(
         modifier = Modifier
@@ -428,6 +447,7 @@ fun PlayerScreen(
             }
 
             if (isCasting) CastingOverlay(
+                connecting = castConnecting,
                 controlsVisible = overlayVisible,
                 onPlayOnDevice = viewModel::stopCasting,
             )
@@ -1269,7 +1289,7 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit, onOtherStreams: (
 }
 
 @Composable
-private fun CastingOverlay(controlsVisible: Boolean, onPlayOnDevice: () -> Unit) {
+private fun CastingOverlay(connecting: Boolean, controlsVisible: Boolean, onPlayOnDevice: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1286,7 +1306,7 @@ private fun CastingOverlay(controlsVisible: Boolean, onPlayOnDevice: () -> Unit)
             )
             Spacer(Modifier.height(18.dp))
             Text(
-                text = "Casting to your TV",
+                text = if (connecting) "Starting playback on your TV…" else "Casting to your TV",
                 color = Brand.OnSurface,
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,

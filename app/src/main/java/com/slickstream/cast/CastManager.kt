@@ -1,6 +1,10 @@
 package com.slickstream.cast
 
 import android.content.Context
+import android.content.Intent
+import androidx.core.content.ContextCompat
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.util.Log
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastState
@@ -8,14 +12,13 @@ import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.net.Inet4Address
-import java.net.NetworkInterface
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
  * Thin wrapper around [CastContext]. Initialises the Cast framework lazily and only when Google
  * Play services is present (so Android TV / Play-less devices simply report cast unavailable),
- * and rewrites a loopback stream URL to a LAN URL the Chromecast can actually reach.
+ * and selects the physical LAN interface for the phone's Cast media bridge.
  */
 @Singleton
 class CastManager @Inject constructor(
@@ -45,28 +48,30 @@ class CastManager @Inject constructor(
             .onFailure { Log.w(TAG, "endCurrentSession failed", it) }
     }
 
-    /**
-     * The torrent stream server binds to all interfaces but reports a 127.0.0.1 URL for local
-     * playback. A Chromecast is a different device, so swap loopback for this phone's LAN IP.
-     * Returns null if no usable LAN address is found (e.g. no Wi-Fi).
-     */
-    fun toLanUrl(localUrl: String): String? {
-        val ip = siteLocalIpv4() ?: return null
-        return localUrl
-            .replace("127.0.0.1", ip)
-            .replace("localhost", ip)
+    fun startHosting() {
+        ContextCompat.startForegroundService(context, Intent(context, CastStreamingService::class.java))
     }
 
-    private fun siteLocalIpv4(): String? = try {
-        NetworkInterface.getNetworkInterfaces().asSequence()
-            .filter { runCatching { it.isUp && !it.isLoopback && !it.isVirtual }.getOrDefault(false) }
-            .flatMap { it.inetAddresses.asSequence() }
-            .firstOrNull { addr ->
-                !addr.isLoopbackAddress && addr is Inet4Address && addr.isSiteLocalAddress
+    fun stopHosting() {
+        context.stopService(Intent(context, CastStreamingService::class.java))
+    }
+
+    /** Pick the physical LAN, never a cellular/VPN address that the receiver cannot reach. */
+    fun lanAddress(): String? = try {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        connectivity.allNetworks.asSequence()
+            .filter { network ->
+                val caps = connectivity.getNetworkCapabilities(network)
+                caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                    (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
             }
+            .flatMap { connectivity.getLinkProperties(it)?.linkAddresses.orEmpty().asSequence() }
+            .map { it.address }
+            .firstOrNull { it is Inet4Address && !it.isLoopbackAddress && !it.isLinkLocalAddress }
             ?.hostAddress
     } catch (t: Throwable) {
-        Log.w(TAG, "siteLocalIpv4 failed", t)
+        Log.w(TAG, "LAN address unavailable", t)
         null
     }
 
