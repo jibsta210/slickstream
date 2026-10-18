@@ -279,6 +279,11 @@ class PlayerViewModel @Inject constructor(
     val castConnecting: StateFlow<Boolean> = _castConnecting.asStateFlow()
     private val _castConverting = MutableStateFlow(false)
     val castConverting: StateFlow<Boolean> = _castConverting.asStateFlow()
+    private val _castVolume = MutableStateFlow(1f)
+    val castVolume: StateFlow<Float> = _castVolume.asStateFlow()
+    private val _castMuted = MutableStateFlow(false)
+    val castMuted: StateFlow<Boolean> = _castMuted.asStateFlow()
+    private var castVolumeJob: Job? = null
     private val _castError = MutableStateFlow<String?>(null)
     val castError: StateFlow<String?> = _castError.asStateFlow()
     fun dismissCastError() { _castError.value = null }
@@ -1719,6 +1724,7 @@ class PlayerViewModel @Inject constructor(
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
                 // Enumerate audio tracks for the manual picker (label + language + which is selected).
                 latestTracks = tracks
+                if (_isCasting.value) return
                 val audio = exoAudioTracks(tracks)
                 publishAudioTracks(audio)
                 // No-sound bug (~20% of torrents): AC3 / E-AC3 / DTS / DTS-HD / TrueHD audio that
@@ -2148,7 +2154,7 @@ class PlayerViewModel @Inject constructor(
         audioDecisionMade = true
         audioPickedByUser = true
         if (option.id.startsWith(VLC_TRACK_PREFIX)) {
-            val vlc = vlcPlayer
+            val vlc = if (_isCasting.value) castNativePlayer else vlcPlayer
             val esId = option.id.removePrefix(VLC_TRACK_PREFIX).toIntOrNull()
             if (vlc == null || esId == null || !vlc.selectAudioTrack(esId)) {
                 diagnostics.breadcrumb("audioSelect VLC failed id=${option.id} player=${vlc != null}")
@@ -2207,6 +2213,7 @@ class PlayerViewModel @Inject constructor(
 
     /** Re-read libVLC's audio ES list and publish it into the SAME flow the picker renders. */
     private fun refreshVlcAudioTracks(vlc: VlcPlayer) {
+        if (_isCasting.value && vlc !== castNativePlayer) return
         val infos = vlc.audioTracks().map { t ->
             AudioTrackChoice.Track(
                 id = VLC_TRACK_PREFIX + t.id,
@@ -2410,6 +2417,7 @@ class PlayerViewModel @Inject constructor(
         _isCasting.value = true
         _castConnecting.value = true
         _castError.value = null
+        clearAudioTracks()
         _currentPlayer.value = castPlayer
         loadCastMedia(url, startPos)
     }
@@ -2436,6 +2444,12 @@ class PlayerViewModel @Inject constructor(
         val bridge = CastStreamServer(address, headers)
         castBridge = bridge
         castRemote = remote
+        castVolumeJob = viewModelScope.launch {
+            while (isActive && generation == castGeneration) {
+                refreshCastVolume()
+                delay(500)
+            }
+        }
         castTimeoutJob = viewModelScope.launch {
             delay(CAST_START_TIMEOUT_MS)
             if (generation == castGeneration && _castConnecting.value) {
@@ -2565,6 +2579,12 @@ class PlayerViewModel @Inject constructor(
                 val target = VlcCastTarget(receiverAddress, device.servicePort, port)
                 val player = VlcPlayer(vlcEngine, appContext, target)
                 castNativePlayer = player
+                clearAudioTracks()
+                audioPickedByUser = false
+                audioDecidedTrackCount = 0
+                player.onAudioTracksChanged = {
+                    if (generation == castGeneration) refreshVlcAudioTracks(player)
+                }
                 player.setPreferredAudioLanguages(AudioTrackChoice.vlcPreferenceList(preferredAudioCode))
                 player.addListener(object : Player.Listener {
                     override fun onPlayerError(error: PlaybackException) {
@@ -2597,6 +2617,8 @@ class PlayerViewModel @Inject constructor(
 
     private fun clearCastLoad() {
         castGeneration++
+        castVolumeJob?.cancel()
+        castVolumeJob = null
         castLoadJob?.cancel()
         castLoadJob = null
         castTimeoutJob?.cancel()
@@ -2637,6 +2659,53 @@ class PlayerViewModel @Inject constructor(
         local?.seekTo(resumePos)
         local?.playWhenReady = true
         _currentPlayer.value = local
+        if (local is VlcPlayer) refreshVlcAudioTracks(local)
+        else _player.value?.let { publishAudioTracks(exoAudioTracks(it.currentTracks)) }
+    }
+
+    private fun refreshCastVolume() {
+        runCatching {
+            val session = castManager.castContext?.sessionManager?.currentCastSession ?: return
+            val media = session.remoteMediaClient?.mediaStatus
+            _castVolume.value = (session.volume * (media?.streamVolume ?: 1.0)).toFloat().coerceIn(0f, 1f)
+            _castMuted.value = session.isMute || media?.isMute == true
+        }
+    }
+
+    /** Explicit volume controls operate on the TV, never the paused phone player. */
+    fun setCastVolume(volume: Float) {
+        runCatching {
+            val session = castManager.castContext?.sessionManager?.currentCastSession ?: return
+            val level = volume.coerceIn(0f, 1f).toDouble()
+            val deviceLevel = session.volume
+            // Media volume also works on receivers with a fixed device-volume setting.
+            // Raise the device level only when the requested combined level requires it.
+            if (deviceLevel > 0.0 && level <= deviceLevel) {
+                session.remoteMediaClient?.setStreamVolume(level / deviceLevel)
+            } else {
+                session.remoteMediaClient?.setStreamVolume(1.0)
+                runCatching { session.volume = level }
+            }
+            session.remoteMediaClient?.setStreamMute(false)
+            runCatching { session.setMute(false) }
+            _castVolume.value = volume.coerceIn(0f, 1f)
+            _castMuted.value = false
+        }.onFailure { diagnostics.breadcrumb("cast volume command failed") }
+    }
+
+    fun toggleCastMute() {
+        runCatching {
+            val session = castManager.castContext?.sessionManager?.currentCastSession ?: return
+            val mute = !_castMuted.value
+            session.remoteMediaClient?.setStreamMute(mute)
+            runCatching { session.setMute(mute) }
+            _castMuted.value = mute
+        }.onFailure { diagnostics.breadcrumb("cast mute command failed") }
+    }
+
+    /** A successful video LOAD can still have unsupported audio without a receiver error. */
+    fun repairCastAudio() {
+        if (_isCasting.value && !_castConverting.value) retryCastWithConversion(castGeneration)
     }
 
     /** Fraction of the file (0f..1f) where playback will actually START — the resume point, a Start-over
