@@ -14,6 +14,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.cast.DefaultMediaItemConverter
 import androidx.media3.cast.CastPlayer
 import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.datasource.DefaultDataSource
@@ -25,6 +26,12 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.mediarouter.media.MediaRouteSelector
 import com.slickstream.cast.CastManager
+import com.slickstream.cast.CastStreamServer
+import com.google.android.gms.cast.MediaLoadRequestData
+import com.google.android.gms.cast.MediaStatus
+import com.google.android.gms.cast.MediaError
+import com.google.android.gms.cast.framework.media.RemoteMediaClient
+import kotlinx.coroutines.CancellationException
 import com.slickstream.core.common.DeviceProfile
 import com.slickstream.core.model.DataResult
 import com.slickstream.core.model.Episode
@@ -164,6 +171,7 @@ data class StreamStats(
 )
 
 @HiltViewModel
+@OptIn(UnstableApi::class)
 class PlayerViewModel @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val catalogRepository: CatalogRepository,
@@ -265,6 +273,21 @@ class PlayerViewModel @Inject constructor(
 
     private val _isCasting = MutableStateFlow(false)
     val isCasting: StateFlow<Boolean> = _isCasting.asStateFlow()
+    private val _castConnecting = MutableStateFlow(false)
+    val castConnecting: StateFlow<Boolean> = _castConnecting.asStateFlow()
+    private val _castError = MutableStateFlow<String?>(null)
+    val castError: StateFlow<String?> = _castError.asStateFlow()
+    fun dismissCastError() { _castError.value = null }
+
+    private var castLoadJob: Job? = null
+    private var castTimeoutJob: Job? = null
+    private var castBridge: CastStreamServer? = null
+    private var castGeneration = 0
+    private var castRequestedUrl: String? = null
+    private var castResumePositionMs = 0L
+    private var castRemote: RemoteMediaClient? = null
+    private var castCallback: RemoteMediaClient.Callback? = null
+    private var castProgress: RemoteMediaClient.ProgressListener? = null
 
     private val _title = MutableStateFlow("Now Playing")
     val title: StateFlow<String> = _title.asStateFlow()
@@ -535,9 +558,11 @@ class PlayerViewModel @Inject constructor(
     val castMergedSelector: MediaRouteSelector? get() = castManager.castContext?.mergedSelector
     fun isCastConnected(): Boolean = castManager.isConnected()
 
-    /** Stop casting and continue on this device. The CastPlayer's onCastSessionUnavailable()
-     *  callback (wired in ensureCastPlayer) drives transferToLocal() at the cast position. */
-    fun stopCasting() = castManager.stopCasting(stopReceiver = true)
+    /** Snapshot/restore before ending the session, when the SDK still knows its playback position. */
+    fun stopCasting() {
+        transferToLocal()
+        castManager.stopCasting(stopReceiver = true)
+    }
 
     /** Fetch TMDB "similar" titles for the end-of-content suggestion bar — similar films at the end of a
      *  movie, or similar shows at the end of the available series (non-critical; ignore failures). */
@@ -802,6 +827,13 @@ class PlayerViewModel @Inject constructor(
     }
 
     private fun startSource(source: StreamSource) {
+        if (_isCasting.value) {
+            val remote = castRemote
+            clearCastLoad()
+            remote?.stop()
+            castResumePositionMs = 0L
+            _castConnecting.value = true
+        }
         _currentSource.value = source
         hasSeekedToResume = false
         activeInfoHash = source.infoHash
@@ -1425,7 +1457,10 @@ class PlayerViewModel @Inject constructor(
         }
         val existing = _player.value
         // Steady-state READY re-emissions carry the same URL and must be no-ops.
-        if (existing != null && currentMediaUrl == url) return
+        if (existing != null && currentMediaUrl == url) {
+            syncCastPlayback()
+            return
+        }
         if (existing != null && _currentSource.value?.isDirect != true) {
             // TORRENT source switch / episode hop: REUSE the same ExoPlayer + PlayerView surface so the
             // video doesn't black out on the hand-off (releasing+rebuilding tore the surface down ->
@@ -1450,7 +1485,7 @@ class PlayerViewModel @Inject constructor(
             currentMediaUrl = url
             switchingEpisode = false   // new media bound -> resume progress saves (for the new episode)
             startProgressTicker()      // restart the ticker we cancelled for the hop
-            if (_isCasting.value) loadCastMedia(fromPositionMs = 0L)
+            syncCastPlayback()
             return
         }
         // DIRECT source reached with a live player (a switch INTO a direct URL): its required headers +
@@ -1544,7 +1579,7 @@ class PlayerViewModel @Inject constructor(
                     .build()
                 setMediaItem(buildMediaItem(url))
                 prepare()
-                playWhenReady = true
+                playWhenReady = !_isCasting.value
             }
         sourceErrorRetries = 0
         currentMediaUrl = url
@@ -1863,7 +1898,7 @@ class PlayerViewModel @Inject constructor(
         if (!_isCasting.value) _currentPlayer.value = exo
         if (preferredSubCode != null) applyPreferredSub()
         startProgressTicker()
-        ensureCastPlayer()
+        syncCastPlayback()
     }
 
     /**
@@ -1876,7 +1911,10 @@ class PlayerViewModel @Inject constructor(
     private fun ensureVlcPlayer(url: String, startPositionMs: Long = 0L) {
         usingVlcForSource = true
         val existing = vlcPlayer
-        if (existing != null && currentMediaUrl == url) return  // steady-state READY re-emit -> no-op
+        if (existing != null && currentMediaUrl == url) {
+            syncCastPlayback()
+            return
+        }
 
         // Capture the OUTGOING ExoPlayer but DON'T release it yet. Pause it now (no double-audio while
         // VLC spins up), then release it only AFTER the UI has rebound to VLC — otherwise PlayerView
@@ -1924,6 +1962,7 @@ class PlayerViewModel @Inject constructor(
         switchingEpisode = false   // new media bound (VLC) -> resume progress saves
         if (!_isCasting.value) _currentPlayer.value = vlc
         startProgressTicker()
+        syncCastPlayback()
         // Release the outgoing ExoPlayer AFTER the UI has had a frame to rebind to VLC, so PlayerView
         // detaches its surface from the LIVE old player (already paused above), not a released one.
         outgoingExo?.let { exo ->
@@ -2339,68 +2378,174 @@ class PlayerViewModel @Inject constructor(
     // --- Cast playback transfer ---------------------------------------------
 
     @OptIn(UnstableApi::class)
-    private fun ensureCastPlayer() {
-        if (castPlayer != null) return
-        val ctx = castManager.castContext ?: return
-        val cp = CastPlayer(ctx)
-        cp.setSessionAvailabilityListener(object : SessionAvailabilityListener {
-            override fun onCastSessionAvailable() = transferToCast()
-            override fun onCastSessionUnavailable() = transferToLocal()
-        })
-        castPlayer = cp
-        // A Cast session may already be live when the player screen opens.
-        if (cp.isCastSessionAvailable) transferToCast()
+    private fun syncCastPlayback() {
+        if (castPlayer == null) {
+            val ctx = castManager.castContext ?: return
+            castPlayer = CastPlayer(ctx).also { cp ->
+                cp.setSessionAvailabilityListener(object : SessionAvailabilityListener {
+                    override fun onCastSessionAvailable() = transferToCast()
+                    override fun onCastSessionUnavailable() = transferToLocal()
+                })
+            }
+        }
+        // Also reload after a new direct source/episode or VLC fallback. A session callback only
+        // fires on connection; it won't fire again when the stream URL changes.
+        if (castPlayer?.isCastSessionAvailable == true) transferToCast()
     }
 
     @OptIn(UnstableApi::class)
     private fun transferToCast() {
-        val startPos = _player.value?.currentPosition?.coerceAtLeast(0L) ?: 0L
-        _player.value?.playWhenReady = false
+        val url = currentMediaUrl ?: return
+        if (_isCasting.value && castRequestedUrl == url) return
+        val local = vlcPlayer ?: _player.value
+        val startPos = local?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        local?.playWhenReady = false
         _isCasting.value = true
-        loadCastMedia(fromPositionMs = startPos)
+        _castConnecting.value = true
+        _castError.value = null
         _currentPlayer.value = castPlayer
+        loadCastMedia(url, startPos)
     }
 
     @OptIn(UnstableApi::class)
-    private fun loadCastMedia(fromPositionMs: Long) {
-        val url = currentMediaUrl ?: return
-        val remoteUrl = castManager.toLanUrl(url)
-        if (remoteUrl == null) {
-            _uiState.value = PlayerUiState.Error("Can't cast: no Wi-Fi network found to reach the TV.")
+    private fun loadCastMedia(url: String, fromPositionMs: Long) {
+        clearCastLoad()
+        val generation = castGeneration
+        castRequestedUrl = url
+        castResumePositionMs = fromPositionMs
+        val remote = castManager.castContext?.sessionManager?.currentCastSession?.remoteMediaClient
+        val address = castManager.lanAddress()
+        if (remote == null || address == null) {
+            failCast("The TV couldn't reach this phone. Connect both devices to the same Wi-Fi network.")
             return
         }
-        val item = ExoMediaItem.Builder()
-            .setUri(remoteUrl)
-            .setMimeType(guessMimeType())
-            .build()
-        castPlayer?.apply {
-            setMediaItem(item, fromPositionMs)
-            playWhenReady = true
-            prepare()
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            failCast("This downloaded file can't be cast. Choose an online stream instead.")
+            return
         }
+        val source = _currentSource.value
+        val headers = source?.takeIf { it.isDirect }?.requestHeaders.orEmpty().toMutableMap()
+        if (headers.keys.none { it.equals("User-Agent", true) }) headers["User-Agent"] = DEFAULT_USER_AGENT
+        val bridge = CastStreamServer(address, headers)
+        castBridge = bridge
+        castRemote = remote
+        castTimeoutJob = viewModelScope.launch {
+            delay(CAST_START_TIMEOUT_MS)
+            if (generation == castGeneration && _castConnecting.value) {
+                failCast("The TV didn't start this stream. Try another stream, preferably 1080p H.264, or play it in the TV app.")
+            }
+        }
+        castLoadJob = viewModelScope.launch {
+            try {
+                castManager.startHosting()
+                val startPosition = if (fromPositionMs > 0L || hasSeekedToResume) fromPositionMs else {
+                    startOverSessionPositionMs ?: libraryRepository.getProgress(
+                        mediaId, mediaType, currentSeason, currentEpisode,
+                    )?.takeIf { !it.isFinished }?.positionMs ?: 0L
+                }
+                castResumePositionMs = startPosition
+                val media = withContext(Dispatchers.IO) {
+                    try {
+                        bridge.prepare(url, source?.title.orEmpty())
+                    } finally {
+                        // Cancellation may arrive while HEAD/start is in progress. Never leave a
+                        // server started by an obsolete load listening after disconnect/source change.
+                        if (!isActive) bridge.stop()
+                    }
+                }
+                if (generation != castGeneration) return@launch
+                val callback = object : RemoteMediaClient.Callback() {
+                    override fun onStatusUpdated() {
+                        if (generation != castGeneration || remote.mediaInfo?.contentId != media.url) return
+                        val status = remote.mediaStatus ?: return
+                        if (status.playerState == MediaStatus.PLAYER_STATE_IDLE &&
+                            status.idleReason == MediaStatus.IDLE_REASON_ERROR) {
+                            failCast("The Chromecast couldn't play this stream. Try another stream, preferably 1080p H.264, or use the TV app.")
+                        } else if (status.playerState == MediaStatus.PLAYER_STATE_PLAYING ||
+                            status.playerState == MediaStatus.PLAYER_STATE_PAUSED) {
+                            _castConnecting.value = false
+                            castTimeoutJob?.cancel()
+                            castResumePositionMs = remote.approximateStreamPosition.coerceAtLeast(0L)
+                        }
+                    }
+                    override fun onMediaError(error: MediaError) {
+                        if (generation == castGeneration) {
+                            failCast("The Chromecast rejected this stream. Choose another stream or use the TV app.")
+                        }
+                    }
+                }
+                castCallback = callback
+                remote.registerCallback(callback)
+                val progress = RemoteMediaClient.ProgressListener { position, _ ->
+                    if (generation == castGeneration && !_castConnecting.value &&
+                        remote.playerState != MediaStatus.PLAYER_STATE_IDLE &&
+                        remote.mediaInfo?.contentId == media.url) castResumePositionMs = position.coerceAtLeast(0L)
+                }
+                castProgress = progress
+                remote.addProgressListener(progress, 1_000L)
+                // Use Media3's converter so its required customData survives the receiver's
+                // status updates; raw MediaInfo makes CastPlayer crash while rebuilding its timeline.
+                val info = DefaultMediaItemConverter().toMediaQueueItem(ExoMediaItem.Builder()
+                    .setUri(media.url)
+                    .setMimeType(media.mimeType)
+                    .setMediaMetadata(androidx.media3.common.MediaMetadata.Builder().setTitle(_title.value).build())
+                    .build()).media
+                // Media3 1.5.1 discards queueLoad's PendingResult. Observe the SDK LOAD result
+                // directly, while retaining CastPlayer for the existing transport controls.
+                remote.load(MediaLoadRequestData.Builder()
+                    .setMediaInfo(info)
+                    .setCurrentTime(startPosition)
+                    .setAutoplay(true)
+                    .build()).setResultCallback { result ->
+                    if (generation == castGeneration && !result.status.isSuccess) {
+                        failCast("The TV couldn't load this stream (Cast error ${result.status.statusCode}). Try another stream or use the TV app.")
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                if (generation == castGeneration) {
+                    failCast("Couldn't send this stream to the TV. Try another stream and check that both devices are on the same Wi-Fi network.")
+                }
+            }
+        }
+    }
+
+    private fun clearCastLoad() {
+        castGeneration++
+        castLoadJob?.cancel()
+        castLoadJob = null
+        castTimeoutJob?.cancel()
+        castTimeoutJob = null
+        castCallback?.let { castRemote?.unregisterCallback(it) }
+        castProgress?.let { castRemote?.removeProgressListener(it) }
+        castCallback = null
+        castProgress = null
+        castRemote = null
+        castBridge?.let { bridge -> cleanupScope.launch { bridge.stop() } }
+        castBridge = null
+        castRequestedUrl = null
+    }
+
+    private fun failCast(message: String) {
+        transferToLocal()
+        castManager.stopCasting(stopReceiver = true)
+        _castError.value = "$message Playback has returned to this phone."
     }
 
     @OptIn(UnstableApi::class)
     private fun transferToLocal() {
-        val resumePos = castPlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L
+        if (!_isCasting.value) return
+        val resumePos = castResumePositionMs
+        clearCastLoad()
         _isCasting.value = false
-        val exo = _player.value
-        if (exo != null) {
-            exo.seekTo(resumePos)
-            exo.playWhenReady = true
-        }
-        _currentPlayer.value = exo
-    }
-
-    /** Best-effort MIME for the Cast receiver, inferred from the chosen source's title. */
-    private fun guessMimeType(): String {
-        val t = _currentSource.value?.title?.lowercase().orEmpty()
-        return when {
-            "mkv" in t -> "video/x-matroska"
-            "webm" in t -> "video/webm"
-            "avi" in t -> "video/x-msvideo"
-            else -> "video/mp4"
-        }
+        _castConnecting.value = false
+        castManager.stopHosting()
+        val local = vlcPlayer ?: _player.value
+        hasSeekedToResume = true
+        local?.seekTo(resumePos)
+        local?.playWhenReady = true
+        _currentPlayer.value = local
     }
 
     /** Fraction of the file (0f..1f) where playback will actually START — the resume point, a Start-over
@@ -2518,9 +2663,9 @@ class PlayerViewModel @Inject constructor(
         // While hopping episodes the (reused) player still holds the OUTGOING episode's position until
         // the new media item is bound — never persist in that window, or it lands under the new key.
         if (switchingEpisode) return null
-        // Read from whichever local backend is active — ExoPlayer or the VLC fallback (both Media3
-        // [Player]s). Keep using _player while casting so we persist the local position, not the TV's.
-        val p: Player = _player.value ?: vlcPlayer ?: return null
+        // During Cast, the phone is paused. Save the receiver's progress, never that stale position.
+        if (_isCasting.value && _castConnecting.value) return null
+        val p: Player = (if (_isCasting.value) castPlayer else vlcPlayer ?: _player.value) ?: return null
         val d = details ?: return null
         val position = p.currentPosition
         if (position <= 0L) return null
@@ -3058,7 +3203,10 @@ class PlayerViewModel @Inject constructor(
         _player.value = null
         releaseVlcPlayer()
         thumbnails.release()
+        clearCastLoad()
         castPlayer?.setSessionAvailabilityListener(null)
+        if (_isCasting.value) castManager.stopCasting(stopReceiver = true)
+        castManager.stopHosting()
         castPlayer?.release()
         castPlayer = null
         _currentPlayer.value = null
@@ -3071,6 +3219,7 @@ class PlayerViewModel @Inject constructor(
     }
 
     private companion object {
+        const val CAST_START_TIMEOUT_MS = 45_000L
         /** Real browser User-Agent for direct (file-server) streams — DefaultHttpDataSource sends NO UA
          *  by default, which header-checking CDNs reject (403). Matches LivePlayerViewModel.DEFAULT_UA. */
         const val DEFAULT_USER_AGENT =
