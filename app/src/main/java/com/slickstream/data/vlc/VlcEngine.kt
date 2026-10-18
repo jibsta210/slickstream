@@ -26,6 +26,10 @@ class VlcEngine @Inject constructor(@ApplicationContext private val context: Con
             "--no-stats",
             "--no-snapshot-preview",
             "--audio-time-stretch",
+            // sout is owned by the engine's input resource, so these must be GLOBAL options.
+            // A per-media option cannot suppress the native conversion dialog (no app UI handles it).
+            "--sout-chromecast-show-perf-warning=0",
+            "--no-sout-chromecast-audio-passthrough",
         )
         LibVLC(context, opts)
     }

@@ -36,9 +36,11 @@ import org.videolan.libvlc.interfaces.IMedia
  * The shared [org.videolan.libvlc.LibVLC] is owned by [VlcEngine]; this class
  * only owns the `MediaPlayer`/`Media` it creates.
  */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 class VlcPlayer(
     private val engine: VlcEngine,
     private val context: Context,
+    private val castTarget: VlcCastTarget? = null,
 ) : SimpleBasePlayer(Looper.getMainLooper()) {
 
     private val mediaPlayer = MediaPlayer(engine.libVlc)
@@ -169,12 +171,14 @@ class VlcPlayer(
             }
 
             MediaPlayer.Event.Playing -> {
+                if (castTarget != null) playWhenReadyField = true
                 playbackStateField = Player.STATE_READY
                 isLoadingField = false
                 applyPendingSeek()
             }
 
             MediaPlayer.Event.Paused -> {
+                if (castTarget != null) playWhenReadyField = false
                 if (playbackStateField == Player.STATE_BUFFERING) {
                     playbackStateField = Player.STATE_READY
                 }
@@ -335,7 +339,10 @@ class VlcPlayer(
         if (item != null) {
             val uriString = item.localConfiguration!!.uri.toString()
             val media = Media(engine.libVlc, Uri.parse(uriString))
-            media.setHWDecoderEnabled(true, false)
+            // Conversion needs decoded CPU frames; the local player's surface decoder can't
+            // supply those to the encoder. Remuxing still avoids decoding compatible tracks.
+            media.setHWDecoderEnabled(castTarget == null, false)
+            castTarget?.mediaOptions()?.forEach(media::addOption)
             // Apply the direct host's required headers. libVLC exposes only user-agent + referrer (no
             // per-arbitrary-header option), which covers the two virtually every CDN validates. Origin
             // has no libVLC option, so map it onto referrer too. No-op when headers are empty (torrents).
