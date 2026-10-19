@@ -1,7 +1,7 @@
 """Local Cast V2 fixture receiver. Exercises VLC transport/conversion, not Chromecast decoding.
 
 Pass a scratch directory containing cert.pem, key.pem and fixture.mkv. Forward emulator
-tcp:18080 with adb. The first converted HTTP response is saved as converted.mkv for ffprobe.
+tcp:18080 with adb. converted.mkv points to the latest video response for decoded-frame checks.
 """
 import http.server
 import json
@@ -15,7 +15,9 @@ import time
 import urllib.request
 
 root = pathlib.Path(sys.argv[1])
-state = dict(loads=0, pauses=0, plays=0, bytes=0)
+(root / "converted.mkv").unlink(missing_ok=True)
+state = dict(loads=0, pauses=0, plays=0, bytes=0, videoLoads=0, loadBytes=0)
+active_response = None
 lock = threading.Lock()
 
 
@@ -74,14 +76,23 @@ def receive(sock, size):
     return data
 
 
-def capture(url, save):
+def capture(url, load, save):
+    global active_response
     # The emulator's advertised IP is private to its virtual network; adb forwards this port.
     from urllib.parse import urlsplit
     parsed = urlsplit(url)
     url = "http://127.0.0.1:18080" + parsed.path + ("?" + parsed.query if parsed.query else "")
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
-            output = (root / "converted.mkv").open("wb") if save else None
+            with lock:
+                if load != state["loads"]:
+                    return
+                active_response = response
+            output = (root / f"converted-{load}.mkv").open("wb") if save else None
+            if save:
+                latest = root / "converted.mkv"
+                latest.unlink(missing_ok=True)
+                latest.symlink_to(f"converted-{load}.mkv")
             try:
                 while chunk := response.read(16 * 1024):
                     if output:
@@ -89,6 +100,8 @@ def capture(url, save):
                         output.flush()
                     with lock:
                         state["bytes"] += len(chunk)
+                        if load == state["loads"]:
+                            state["loadBytes"] += len(chunk)
             finally:
                 if output:
                     output.close()
@@ -97,6 +110,7 @@ def capture(url, save):
 
 
 def cast_connection(sock):
+    global active_response
     media = None
     player_state = "IDLE"
     started = time.monotonic()
@@ -133,8 +147,22 @@ def cast_connection(sock):
                     started = time.monotonic()
                     with lock:
                         state["loads"] += 1
-                        first = state["loads"] == 1
-                    threading.Thread(target=capture, args=(media["contentId"], first), daemon=True).start()
+                        state["loadBytes"] = 0
+                        load = state["loads"]
+                        is_video = media.get("contentType", "").startswith("video/")
+                        if is_video:
+                            state["videoLoads"] += 1
+                        save_video = is_video
+                        previous = active_response
+                        active_response = None
+                    # A real receiver abandons the old HTTP request on LOAD. Leaving two readers
+                    # attached stole bytes from VLC's single stream and corrupted the fixture output.
+                    if previous is not None:
+                        try:
+                            previous.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+                        except (AttributeError, OSError):
+                            pass
+                    threading.Thread(target=capture, args=(media["contentId"], load, save_video), daemon=True).start()
                 elif kind == "PAUSE":
                     player_state = "PAUSED"
                     with lock:

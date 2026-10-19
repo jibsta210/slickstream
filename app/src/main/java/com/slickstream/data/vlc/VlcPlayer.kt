@@ -86,6 +86,7 @@ class VlcPlayer(
 
     // --- Mutable player state, all read back in getState() ---
     private var playWhenReadyField: Boolean = false
+    private var pendingCastAudioTrackId: Int? = null
     private var mediaItemField: MediaItem? = null
     private var positionMs: Long = 0L
     private var durationMs: Long = C.TIME_UNSET
@@ -149,7 +150,15 @@ class VlcPlayer(
             MediaPlayer.Event.ESDeleted,
             MediaPlayer.Event.ESSelected,
             -> {
-                if (esType == IMedia.Track.Type.Audio) onAudioTracksChanged?.invoke()
+                if (esType == IMedia.Track.Type.Audio) {
+                    pendingCastAudioTrackId?.let { id ->
+                        if (mediaPlayer.audioTracks?.any { it.id == id } == true) {
+                            pendingCastAudioTrackId = null
+                            mediaPlayer.setAudioTrack(id)
+                        }
+                    }
+                    onAudioTracksChanged?.invoke()
+                }
                 return   // no Media3 state changed — don't invalidate
             }
 
@@ -332,6 +341,7 @@ class VlcPlayer(
     ): ListenableFuture<*> {
         val item = mediaItems.firstOrNull()
         mediaItemField = item
+        pendingCastAudioTrackId = null
         // A NEW media item has painted nothing yet, so the anti-"blue box" black backing is earned
         // again for this source (see [hasRenderedFrame] / [doAttach]).
         hasRenderedFrame = false
@@ -343,6 +353,11 @@ class VlcPlayer(
             // supply those to the encoder. Remuxing still avoids decoding compatible tracks.
             media.setHWDecoderEnabled(castTarget == null, false)
             castTarget?.mediaOptions()?.forEach(media::addOption)
+            if (castTarget != null && startPositionMs > 0L) {
+                // Start the decoder at the resume point. Seeking on Playing interrupts an encoder
+                // that is still initializing and can leave the Cast output missing its video track.
+                media.addOption(":start-time=${startPositionMs / 1000.0}")
+            }
             // Apply the direct host's required headers. libVLC exposes only user-agent + referrer (no
             // per-arbitrary-header option), which covers the two virtually every CDN validates. Origin
             // has no libVLC option, so map it onto referrer too. No-op when headers are empty (torrents).
@@ -363,7 +378,7 @@ class VlcPlayer(
             mediaPlayer.media = media
             media.release()
 
-            pendingSeekMs = if (startPositionMs > 0L) startPositionMs else -1L
+            pendingSeekMs = if (castTarget == null && startPositionMs > 0L) startPositionMs else -1L
             positionMs = startPositionMs.coerceAtLeast(0L)
         } else {
             pendingSeekMs = -1L
@@ -405,6 +420,23 @@ class VlcPlayer(
         seekCommand: Int,
     ): ListenableFuture<*> {
         val target = positionMs.coerceAtLeast(0L)
+        if (castTarget != null && mediaItemField != null) {
+            // VLC 3's outer transcode module does not forward flushes to Chromecast. An in-place
+            // seek can therefore keep serving the old encoded timeline. Reopen at the new source
+            // time so the TV receives a fresh mux header, decoder keyframe and Cast LOAD.
+            val item = mediaItemField!!
+            val wasPlaying = playWhenReadyField
+            val audioTrackId = mediaPlayer.audioTrack.takeIf { it >= 0 }
+            mediaPlayer.stop()
+            handleSetMediaItems(listOf(item), 0, target)
+            pendingCastAudioTrackId = audioTrackId
+            handlePrepare()
+            mediaPlayer.play()
+            if (!wasPlaying) mediaPlayer.pause()
+            playWhenReadyField = wasPlaying
+            invalidateState()
+            return Futures.immediateVoidFuture()
+        }
         mediaPlayer.setTime(target)
         this.positionMs = target
         invalidateState()
