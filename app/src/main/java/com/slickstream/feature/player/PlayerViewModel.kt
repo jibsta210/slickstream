@@ -24,10 +24,8 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
-import androidx.mediarouter.media.MediaRouteSelector
 import com.slickstream.cast.CastManager
 import com.slickstream.cast.CastStreamServer
-import com.slickstream.cast.CastMediaItemConverter
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.MediaError
@@ -557,6 +555,7 @@ class PlayerViewModel @Inject constructor(
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
+        syncCastPlayback()
         load()
     }
 
@@ -564,11 +563,6 @@ class PlayerViewModel @Inject constructor(
         _uiState.value = PlayerUiState.Buffering(0, 0, 0, "Loading…")
         load()
     }
-
-    // --- Cast (Chromecast) state for the UI ---------------------------------
-    val castAvailable: Boolean get() = castManager.isAvailable
-    val castMergedSelector: MediaRouteSelector? get() = castManager.castContext?.mergedSelector
-    fun isCastConnected(): Boolean = castManager.isConnected()
 
     /** Snapshot/restore before ending the session, when the SDK still knows its playback position. */
     fun stopCasting() {
@@ -1492,7 +1486,7 @@ class PlayerViewModel @Inject constructor(
             existing.setMediaItem(buildMediaItem(url))
             existing.prepare()
             // While casting, keep the local surface paused and push the new source to the TV.
-            existing.playWhenReady = !_isCasting.value
+            existing.playWhenReady = !_isCasting.value && !castManager.isConnected()
             sourceErrorRetries = 0
             currentMediaUrl = url
             switchingEpisode = false   // new media bound -> resume progress saves (for the new episode)
@@ -1591,7 +1585,7 @@ class PlayerViewModel @Inject constructor(
                     .build()
                 setMediaItem(buildMediaItem(url))
                 prepare()
-                playWhenReady = !_isCasting.value
+                playWhenReady = !_isCasting.value && !castManager.isConnected()
             }
         sourceErrorRetries = 0
         currentMediaUrl = url
@@ -1970,7 +1964,7 @@ class PlayerViewModel @Inject constructor(
         vlc.setPreferredAudioLanguages(AudioTrackChoice.vlcPreferenceList(preferredAudioCode))
         vlc.setMediaItem(buildMediaItem(url), startPositionMs)
         vlc.prepare()
-        vlc.playWhenReady = !_isCasting.value
+        vlc.playWhenReady = !_isCasting.value && !castManager.isConnected()
         currentMediaUrl = url
         switchingEpisode = false   // new media bound (VLC) -> resume progress saves
         if (!_isCasting.value) _currentPlayer.value = vlc
@@ -2394,13 +2388,10 @@ class PlayerViewModel @Inject constructor(
     @OptIn(UnstableApi::class)
     private fun syncCastPlayback() {
         if (castPlayer == null) {
-            val ctx = castManager.castContext ?: return
-            castPlayer = CastPlayer(ctx, CastMediaItemConverter()).also { cp ->
-                cp.setSessionAvailabilityListener(object : SessionAvailabilityListener {
-                    override fun onCastSessionAvailable() = transferToCast()
-                    override fun onCastSessionUnavailable() = transferToLocal()
-                })
-            }
+            castPlayer = castManager.acquirePlayer(this, object : SessionAvailabilityListener {
+                override fun onCastSessionAvailable() = transferToCast()
+                override fun onCastSessionUnavailable() = transferToLocal()
+            })
         }
         // Also reload after a new direct source/episode or VLC fallback. A session callback only
         // fires on connection; it won't fire again when the stream URL changes.
@@ -3363,11 +3354,9 @@ class PlayerViewModel @Inject constructor(
         _player.value = null
         releaseVlcPlayer()
         thumbnails.release()
+        castManager.detachPlayer(this, stopMedia = _isCasting.value)
         clearCastLoad()
-        castPlayer?.setSessionAvailabilityListener(null)
-        if (_isCasting.value) castManager.stopCasting(stopReceiver = true)
         castManager.stopHosting()
-        castPlayer?.release()
         castPlayer = null
         _currentPlayer.value = null
         val hash = activeInfoHash

@@ -168,25 +168,30 @@ fun PhoneApp() {
     val currentRoute = backStackEntry?.destination?.route
     val showBottomBar = currentRoute in CHROME_ROUTES
     val showTopBar = currentRoute in TOP_LEVEL_ROUTES
+    val showCastBar = currentRoute != Routes.PLAYER && currentRoute != Routes.LIVE
 
     Scaffold(
         containerColor = Brand.Background,
         contentColor = Brand.OnSurface,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
-            AnimatedVisibility(
-                visible = showTopBar,
-                enter = slideInVertically { -it },
-                exit = slideOutVertically { -it },
-            ) {
-                TopBar(
-                    activeProfile = activeProfile,
-                    onSearch = { navController.navigate(Routes.SEARCH) { launchSingleTop = true } },
-                    // The avatar opens the account hub (Settings, sign-in/out, Link TV, switch
-                    // profile). The "Switch profile" row there reaches the picker — going straight to
-                    // the picker used to hide Settings entirely.
-                    onProfile = { navController.navigate(Routes.PROFILE) { launchSingleTop = true } },
-                )
+            Column {
+                AnimatedVisibility(
+                    visible = showTopBar,
+                    enter = slideInVertically { -it },
+                    exit = slideOutVertically { -it },
+                ) {
+                    TopBar(
+                        activeProfile = activeProfile,
+                        onSearch = { navController.navigate(Routes.SEARCH) { launchSingleTop = true } },
+                        onProfile = { navController.navigate(Routes.PROFILE) { launchSingleTop = true } },
+                    )
+                }
+                if (showCastBar) {
+                    Box(if (showTopBar) Modifier else Modifier.statusBarsPadding()) {
+                        com.slickstream.cast.CastButton(expanded = true)
+                    }
+                }
             }
         },
         bottomBar = {

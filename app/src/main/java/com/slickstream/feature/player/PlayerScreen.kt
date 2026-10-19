@@ -45,6 +45,9 @@ import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ModalBottomSheet
@@ -72,9 +75,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
-import android.view.ContextThemeWrapper
-import androidx.mediarouter.app.MediaRouteChooserDialog
-import androidx.mediarouter.app.MediaRouteControllerDialog
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -414,22 +414,7 @@ fun PlayerScreen(
                 onEpisodes = { showEpisodes = true },
                 pipSupported = pipController?.isSupported == true && !isCasting,
                 onPip = { pipController?.enter() },
-                castAvailable = viewModel.castAvailable,
-                isCasting = isCasting,
-                onCast = {
-                    val selector = viewModel.castMergedSelector
-                    if (selector != null) {
-                        val themed = ContextThemeWrapper(
-                            context,
-                            androidx.appcompat.R.style.Theme_AppCompat_DayNight,
-                        )
-                        if (viewModel.isCastConnected()) {
-                            MediaRouteControllerDialog(themed).show()
-                        } else {
-                            MediaRouteChooserDialog(themed).apply { routeSelector = selector }.show()
-                        }
-                    }
-                },
+                castAction = { com.slickstream.cast.CastButton() },
             )
         }
 
@@ -700,7 +685,7 @@ private fun PhoneUpNextCard(
 }
 
 @Composable
-private fun TopOverlay(
+internal fun TopOverlay(
     title: String,
     onBack: () -> Unit,
     onSources: () -> Unit,
@@ -721,9 +706,7 @@ private fun TopOverlay(
     onEpisodes: () -> Unit,
     pipSupported: Boolean,
     onPip: () -> Unit,
-    castAvailable: Boolean,
-    isCasting: Boolean,
-    onCast: () -> Unit,
+    castAction: @Composable () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -754,77 +737,28 @@ private fun TopOverlay(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        // Episode navigation (TV only).
-        if (hasEpisodes) {
-            IconButton(onClick = onPrevious, enabled = hasPrevious) {
-                Icon(
-                    imageVector = Icons.Filled.SkipPrevious,
-                    contentDescription = "Previous episode",
-                    tint = if (hasPrevious) Brand.OnSurface else Brand.OnSurface.copy(alpha = 0.35f),
-                )
+        // Keep Cast in a fixed slot. The former unbounded row pushed it off narrow phones,
+        // especially when a show exposed episode navigation and VLC exposed audio tracks.
+        castAction()
+        var menuOpen by remember { mutableStateOf(false) }
+        Box {
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Default.MoreVert, "Player options",
+                    tint = if (audioNeedsAttention) Brand.Amber else Brand.OnSurface)
             }
-            IconButton(onClick = onNext, enabled = hasNext) {
-                Icon(
-                    imageVector = Icons.Filled.SkipNext,
-                    contentDescription = "Next episode",
-                    tint = if (hasNext) Brand.OnSurface else Brand.OnSurface.copy(alpha = 0.35f),
-                )
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                fun action(callback: () -> Unit): () -> Unit = { menuOpen = false; callback() }
+                if (showSourcesButton) DropdownMenuItem(text = { Text("Streams") }, onClick = action(onSources))
+                DropdownMenuItem(text = { Text(if (subtitlesActive) "Subtitles · On" else "Subtitles") }, onClick = action(onSubtitles))
+                if (showAudioButton) DropdownMenuItem(text = { Text("Audio track") }, onClick = action(onAudio))
+                if (hasEpisodes) {
+                    DropdownMenuItem(text = { Text("Episodes") }, onClick = action(onEpisodes))
+                    DropdownMenuItem(text = { Text("Previous episode") }, enabled = hasPrevious, onClick = action(onPrevious))
+                    DropdownMenuItem(text = { Text("Next episode") }, enabled = hasNext, onClick = action(onNext))
+                }
+                DropdownMenuItem(text = { Text(if (zoomFill) "Fit to screen" else "Fill screen") }, onClick = action(onToggleZoom))
+                if (pipSupported) DropdownMenuItem(text = { Text("Picture-in-picture") }, onClick = action(onPip))
             }
-            IconButton(onClick = onEpisodes) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.PlaylistPlay,
-                    contentDescription = "Episodes",
-                    tint = Brand.OnSurface,
-                )
-            }
-        }
-        IconButton(onClick = onSubtitles) {
-            Icon(
-                imageVector = Icons.Filled.ClosedCaption,
-                contentDescription = "Subtitles",
-                tint = if (subtitlesActive) Brand.Cyan else Brand.OnSurface,
-            )
-        }
-        if (showAudioButton) {
-            IconButton(onClick = onAudio) {
-                Icon(
-                    imageVector = Icons.Filled.GraphicEq,
-                    contentDescription = "Audio track",
-                    // Amber = "we could not confirm this is your language". The failure mode is
-                    // otherwise silent: the film just speaks the wrong language.
-                    tint = if (audioNeedsAttention) Brand.Amber else Brand.OnSurface,
-                )
-            }
-        }
-        IconButton(onClick = onToggleZoom) {
-            Icon(
-                imageVector = Icons.Filled.AspectRatio,
-                contentDescription = if (zoomFill) "Fit to screen" else "Fill screen",
-                tint = if (zoomFill) Brand.Cyan else Brand.OnSurface,
-            )
-        }
-        if (pipSupported) {
-            IconButton(onClick = onPip) {
-                Icon(
-                    imageVector = Icons.Filled.PictureInPictureAlt,
-                    contentDescription = "Picture-in-picture",
-                    tint = Brand.OnSurface,
-                )
-            }
-        }
-        if (castAvailable) {
-            Spacer(Modifier.width(4.dp))
-            IconButton(onClick = onCast) {
-                Icon(
-                    imageVector = if (isCasting) Icons.Filled.CastConnected else Icons.Filled.Cast,
-                    contentDescription = "Cast to TV",
-                    tint = if (isCasting) Brand.Cyan else Brand.OnSurface,
-                )
-            }
-        }
-        if (showSourcesButton) {
-            Spacer(Modifier.width(8.dp))
-            SourcesButton(onClick = onSources)
         }
     }
 }
