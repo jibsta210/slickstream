@@ -6,6 +6,9 @@ import androidx.core.content.ContextCompat
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
+import androidx.media3.cast.CastPlayer
+import androidx.media3.cast.SessionAvailabilityListener
+import com.google.android.gms.cast.framework.CastStateListener
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastState
 import com.google.android.gms.common.ConnectionResult
@@ -14,6 +17,8 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import java.net.Inet4Address
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.callbackFlow
 
 /**
  * Thin wrapper around [CastContext]. Initialises the Cast framework lazily and only when Google
@@ -24,6 +29,47 @@ import javax.inject.Singleton
 class CastManager @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
+    // CastPlayer.release() ends the SDK session, even with stopReceiver=false. Own one adapter
+    // for the app lifetime so leaving a movie does not discard the TV chosen while browsing.
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private var sharedPlayer: CastPlayer? = null
+    private var playbackOwner: Any? = null
+
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    fun acquirePlayer(owner: Any, listener: SessionAvailabilityListener): CastPlayer? {
+        val ctx = castContext ?: return null
+        val player = sharedPlayer ?: CastPlayer(ctx, CastMediaItemConverter()).also { sharedPlayer = it }
+        playbackOwner = owner
+        player.setSessionAvailabilityListener(listener)
+        return player
+    }
+
+    /** Stop this video's media before its HTTP bridge closes, but keep the selected TV connected. */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    fun detachPlayer(owner: Any, stopMedia: Boolean) {
+        if (playbackOwner !== owner) return
+        playbackOwner = null
+        sharedPlayer?.setSessionAvailabilityListener(null)
+        if (stopMedia) runCatching { castContext?.sessionManager?.currentCastSession?.remoteMediaClient?.stop() }
+    }
+
+    fun connectionSnapshot(): CastConnectionState {
+        val ctx = castContext ?: return CastConnectionState(available = false)
+        return CastConnectionState(
+            connected = ctx.castState == CastState.CONNECTED,
+            connecting = ctx.castState == CastState.CONNECTING,
+            deviceName = ctx.sessionManager.currentCastSession?.castDevice?.friendlyName,
+        )
+    }
+
+    /** Collected on main; listen even before any player exists. Discovery starts with the chooser. */
+    val connection = callbackFlow {
+        val ctx = castContext
+        val listener = CastStateListener { trySend(connectionSnapshot()) }
+        ctx?.addCastStateListener(listener)
+        trySend(connectionSnapshot())
+        awaitClose { ctx?.removeCastStateListener(listener) }
+    }
 
     /** Null when Play services / Cast is unavailable on this device. */
     val castContext: CastContext? by lazy {
