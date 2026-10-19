@@ -68,6 +68,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
 import com.slickstream.feature.sports.SportCategory
+import com.slickstream.feature.player.rememberIsInPipMode
 import com.slickstream.feature.sports.SportEvent
 import com.slickstream.ui.theme.Brand
 
@@ -95,6 +96,7 @@ fun LivePlayerScreen(
     val audibleId by viewModel.audibleId.collectAsStateWithLifecycle()
     val canAdd by viewModel.canAdd.collectAsStateWithLifecycle()
     val picker by viewModel.picker.collectAsStateWithLifecycle()
+    val floating = rememberIsInPipMode()
 
     com.slickstream.feature.player.KeepScreenOn(enabled = sessions.isNotEmpty())
 
@@ -138,13 +140,14 @@ fun LivePlayerScreen(
     // and lands on Back, which is exactly the press people make. Modal panels (menu, feed switch,
     // picker) hold the chrome up. Status pills (Reconnecting…, Buffering) are not chrome and stay.
     var lastInteractionNanos by remember { mutableStateOf(System.nanoTime()) }
-    var chromeVisible by remember { mutableStateOf(true) }
+    var chromeAwake by remember { mutableStateOf(true) }
+    val chromeVisible = chromeAwake && !floating
     val modalUp = menuForId != null || feedSwitchForId != null || picker != null
     LaunchedEffect(lastInteractionNanos, modalUp) {
-        chromeVisible = true
+        chromeAwake = true
         if (modalUp) return@LaunchedEffect
         kotlinx.coroutines.delay(5_000)
-        chromeVisible = false
+        chromeAwake = false
     }
 
     BackHandler {
@@ -157,7 +160,10 @@ fun LivePlayerScreen(
         }
     }
 
-    Box(
+    LiveFloatingWindow(
+        sessions = sessions,
+        expandedId = expandedId,
+        showControls = chromeVisible && !modalUp,
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
@@ -247,7 +253,7 @@ fun LivePlayerScreen(
             )
         }
 
-        menuForId?.let { id ->
+        if (!floating) menuForId?.let { id ->
             val s = sessions.firstOrNull { it.id == id }
             if (s == null) menuForId = null
             else TileMenu(
@@ -268,7 +274,7 @@ fun LivePlayerScreen(
             )
         }
 
-        feedSwitchForId?.let { id ->
+        if (!floating) feedSwitchForId?.let { id ->
             val live = sessions.firstOrNull { it.id == id } as? LiveSession
             if (live == null) feedSwitchForId = null
             else {
@@ -283,7 +289,7 @@ fun LivePlayerScreen(
         }
 
         AnimatedVisibility(
-            visible = picker != null,
+            visible = picker != null && !floating,
             enter = slideInHorizontally { it } + fadeIn(),
             exit = slideOutHorizontally { it } + fadeOut(),
             modifier = Modifier.align(Alignment.CenterEnd),
@@ -310,7 +316,7 @@ private fun TileSession.feedCount(): Int = (this as? LiveSession)?.feeds?.size ?
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun PipLayout(
+internal fun PipLayout(
     sessions: List<TileSession>,
     audibleId: Int?,
     chromeVisible: Boolean,
@@ -319,6 +325,7 @@ private fun PipLayout(
     onAdd: (() -> Unit)?,
     onBack: () -> Unit,
 ) {
+    val floating = rememberIsInPipMode()
     val primary = sessions[0]
     val secondary = sessions[1]
     // EVERYTHING here overlaps the full-screen tile — the corner tile, the Back arrow, the Add chip
@@ -354,7 +361,7 @@ private fun PipLayout(
             zOrderOverlay = true,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(24.dp)
+                .padding(if (floating) 4.dp else 24.dp)
                 .fillMaxWidth(0.34f)
                 .aspectRatio(16f / 9f)
                 .focusRequester(cornerFocus)
@@ -378,7 +385,7 @@ private fun PipLayout(
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun GridLayout(
+internal fun GridLayout(
     sessions: List<TileSession>,
     audibleId: Int?,
     chromeVisible: Boolean,
@@ -388,14 +395,16 @@ private fun GridLayout(
     onAdd: () -> Unit,
 ) {
     val cells = LiveMultiView.MAX_SLOTS
+    val floating = rememberIsInPipMode()
+    val gap = if (floating) 2.dp else 12.dp
     Column(
-        Modifier.fillMaxSize().padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier.fillMaxSize().padding(gap),
+        verticalArrangement = Arrangement.spacedBy(gap),
     ) {
         for (row in 0 until 2) {
             Row(
                 Modifier.fillMaxWidth().weight(1f),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(gap),
             ) {
                 for (col in 0 until 2) {
                     val position = row * 2 + col
@@ -411,7 +420,7 @@ private fun GridLayout(
                             showChrome = chromeVisible,
                             modifier = cellMod.focusRequester(tileFocus(s.id)),
                         )
-                        position == sessions.size && canAdd -> AddGameCell(onAdd = onAdd, modifier = cellMod)
+                        position == sessions.size && canAdd && !floating -> AddGameCell(onAdd = onAdd, modifier = cellMod)
                         else -> Box(cellMod)
                     }
                 }
@@ -424,7 +433,7 @@ private fun GridLayout(
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun LiveTile(
+internal fun LiveTile(
     session: TileSession,
     audible: Boolean,
     cornerLabel: Boolean,

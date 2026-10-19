@@ -9,6 +9,7 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.util.Rational
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -70,6 +71,19 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var sourceStatusStore: com.slickstream.data.source.SourceStatusStore
+
+    @Inject
+    lateinit var castManager: com.slickstream.cast.CastManager
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (!onTv && castManager.dispatchVolumeKey(event)) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (!onTv && castManager.dispatchVolumeKey(event)) return true
+        return super.onKeyUp(keyCode, event)
+    }
 
     // Authoritative TV signal (LEANBACK feature OR-ed with TV ui-mode); see DeviceProfile.
     private val onTv: Boolean get() = deviceProfile.isTv

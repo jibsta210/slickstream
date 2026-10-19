@@ -2646,43 +2646,23 @@ class PlayerViewModel @Inject constructor(
     }
 
     private fun refreshCastVolume() {
-        runCatching {
-            val session = castManager.castContext?.sessionManager?.currentCastSession ?: return
-            val media = session.remoteMediaClient?.mediaStatus
-            _castVolume.value = (session.volume * (media?.streamVolume ?: 1.0)).toFloat().coerceIn(0f, 1f)
-            _castMuted.value = session.isMute || media?.isMute == true
+        castManager.volumeSnapshot()?.let {
+            _castVolume.value = it.level
+            _castMuted.value = it.muted
         }
     }
 
     /** Explicit volume controls operate on the TV, never the paused phone player. */
     fun setCastVolume(volume: Float) {
-        runCatching {
-            val session = castManager.castContext?.sessionManager?.currentCastSession ?: return
-            val level = volume.coerceIn(0f, 1f).toDouble()
-            val deviceLevel = session.volume
-            // Media volume also works on receivers with a fixed device-volume setting.
-            // Raise the device level only when the requested combined level requires it.
-            if (deviceLevel > 0.0 && level <= deviceLevel) {
-                session.remoteMediaClient?.setStreamVolume(level / deviceLevel)
-            } else {
-                session.remoteMediaClient?.setStreamVolume(1.0)
-                runCatching { session.volume = level }
-            }
-            session.remoteMediaClient?.setStreamMute(false)
-            runCatching { session.setMute(false) }
-            _castVolume.value = volume.coerceIn(0f, 1f)
-            _castMuted.value = false
-        }.onFailure { diagnostics.breadcrumb("cast volume command failed") }
+        castManager.setVolume(volume)
+        _castVolume.value = volume.coerceIn(0f, 1f)
+        _castMuted.value = false
     }
 
     fun toggleCastMute() {
-        runCatching {
-            val session = castManager.castContext?.sessionManager?.currentCastSession ?: return
-            val mute = !_castMuted.value
-            session.remoteMediaClient?.setStreamMute(mute)
-            runCatching { session.setMute(mute) }
-            _castMuted.value = mute
-        }.onFailure { diagnostics.breadcrumb("cast mute command failed") }
+        val muted = !_castMuted.value
+        castManager.setMuted(muted)
+        _castMuted.value = muted
     }
 
     /** A successful video LOAD can still have unsupported audio without a receiver error. */
