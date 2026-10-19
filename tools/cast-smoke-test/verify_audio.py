@@ -14,7 +14,7 @@ audio = next(stream for stream in probe["streams"] if stream["codec_type"] == "a
 assert audio["codec_name"] == "aac" and audio["profile"] == "LC", audio
 assert audio["channels"] == 2 and audio["sample_rate"] == "48000", audio
 pcm = array.array("f", subprocess.check_output([
-    "ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-t", "5", "-f", "f32le", "-",
+    "ffmpeg", "-v", "error", "-xerror", "-i", path, "-map", "0:a:0", "-t", "5", "-f", "f32le", "-",
 ]))
 if sys.byteorder != "little":
     pcm.byteswap()

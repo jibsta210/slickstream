@@ -9,6 +9,7 @@ import com.google.android.gms.cast.MediaQueueItem
 import com.slickstream.data.vlc.VlcCastTarget
 import com.slickstream.data.vlc.VlcEngine
 import com.slickstream.data.vlc.VlcPlayer
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeNotNull
@@ -44,10 +45,19 @@ class VlcCastIntegrationTest {
         val engine = VlcEngine(instrumentation.targetContext)
         val bridge = CastStreamServer("127.0.0.1", mapOf("X-Cast-Test" to "fixture"))
         val media = bridge.prepare("$base/fixture.mkv", "fixture.mkv")
+        val video = runBlocking { probeCastVideo(engine, media.url) }
+        assertNotNull("Could not inspect actual fixture video", video)
+        val transcodeVideo = video?.canCopy != true
+        val expected = InstrumentationRegistry.getArguments().getString("castExpectedVideoConversion")
+        if (expected != null) assertEquals("Unexpected video path for $video", expected.toBoolean(), transcodeVideo)
         val error = AtomicReference<PlaybackException>()
         lateinit var player: VlcPlayer
         var created = false
-        fun status() = JSONObject(URL("$base/status").readText())
+        fun status() = JSONObject(URL("$base/status").openConnection().apply {
+            connectTimeout = 3_000
+            readTimeout = 3_000
+            setRequestProperty("Connection", "close")
+        }.getInputStream().bufferedReader().use { it.readText() })
         fun await(message: String, condition: () -> Boolean) {
             val deadline = System.nanoTime() + 45_000_000_000L
             while (System.nanoTime() < deadline) {
@@ -59,7 +69,7 @@ class VlcCastIntegrationTest {
         }
         try {
             instrumentation.runOnMainSync {
-                player = VlcPlayer(engine, instrumentation.targetContext, VlcCastTarget(host!!, 18009, 18080))
+                player = VlcPlayer(engine, instrumentation.targetContext, VlcCastTarget(host!!, 18009, 18080, transcodeVideo))
                 created = true
                 player.setPreferredAudioLanguages("en,eng,english")
                 player.addListener(object : Player.Listener {
@@ -80,6 +90,24 @@ class VlcCastIntegrationTest {
             val loads = status().optInt("loads")
             instrumentation.runOnMainSync { player.seekTo(7_000) }
             await("Seeking did not reload the converted stream") { status().optInt("loads") > loads }
+            await("No complete video/audio output after seeking") { status().optLong("loadBytes") > 2_000_000 }
+            val pausedLoads = status().optInt("loads")
+            val pauses = status().optInt("pauses")
+            var audioId = -1
+            instrumentation.runOnMainSync {
+                audioId = player.audioTracks().first { it.selected }.id
+                player.pause()
+            }
+            await("Receiver did not pause before seeking") { status().optInt("pauses") > pauses }
+            instrumentation.runOnMainSync { player.seekTo(4_000) }
+            Thread.sleep(500) // Allow native events to run: a paused seek must not silently resume.
+            instrumentation.runOnMainSync {
+                assertFalse("Seeking resumed paused playback", player.playWhenReady)
+                player.play()
+            }
+            await("Paused seek did not reopen the receiver") { status().optInt("loads") > pausedLoads }
+            await("No converted output after paused seek") { status().optLong("loadBytes") > 2_000_000 }
+            instrumentation.runOnMainSync { assertEquals(audioId, player.audioTracks().first { it.selected }.id) }
         } finally {
             instrumentation.runOnMainSync { if (created) player.release() }
             bridge.stop()

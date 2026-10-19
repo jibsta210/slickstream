@@ -14,7 +14,6 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.cast.DefaultMediaItemConverter
 import androidx.media3.cast.CastPlayer
 import androidx.media3.cast.SessionAvailabilityListener
 import androidx.media3.datasource.DefaultDataSource
@@ -25,8 +24,8 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import com.slickstream.cast.CastManager
+import com.slickstream.cast.probeCastVideo
 import com.slickstream.cast.CastStreamServer
-import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.MediaError
 import com.google.android.gms.cast.framework.media.RemoteMediaClient
@@ -298,6 +297,7 @@ class PlayerViewModel @Inject constructor(
     private var castNativePlayer: VlcPlayer? = null
     private var castNativePort: Int? = null
     private var castPreparedMedia: CastStreamServer.Media? = null
+    private var castTranscodeVideo = true
 
     private val _title = MutableStateFlow("Now Playing")
     val title: StateFlow<String> = _title.asStateFlow()
@@ -2467,6 +2467,10 @@ class PlayerViewModel @Inject constructor(
                 }
                 if (generation != castGeneration) return@launch
                 castPreparedMedia = media
+                // A receiver can report PLAYING with audio only or video only. Normalize audio on
+                // every cast and copy video only after inspecting the actual authenticated stream.
+                castTranscodeVideo = probeCastVideo(vlcEngine, media.url)?.canCopy != true
+                if (generation != castGeneration) return@launch
                 val callback = object : RemoteMediaClient.Callback() {
                     override fun onStatusUpdated() {
                         if (generation != castGeneration) return
@@ -2484,6 +2488,10 @@ class PlayerViewModel @Inject constructor(
                             retryCastWithConversion(generation)
                         } else if (status.playerState == MediaStatus.PLAYER_STATE_PLAYING ||
                             status.playerState == MediaStatus.PLAYER_STATE_PAUSED) {
+                            // Audio can become ready before the video encoder registers its track.
+                            // Keep the startup watchdog until VLC reloads the complete video stream.
+                            if (_castConverting.value &&
+                                remote.mediaInfo?.contentType?.startsWith("video/") != true) return
                             _castConnecting.value = false
                             castTimeoutJob?.cancel()
                             if (!_castConverting.value) {
@@ -2512,25 +2520,7 @@ class PlayerViewModel @Inject constructor(
                 }
                 castProgress = progress
                 remote.addProgressListener(progress, 1_000L)
-                // Use Media3's converter so its required customData survives the receiver's
-                // status updates; raw MediaInfo makes CastPlayer crash while rebuilding its timeline.
-                val info = DefaultMediaItemConverter().toMediaQueueItem(ExoMediaItem.Builder()
-                    .setUri(media.url)
-                    .setMimeType(media.mimeType)
-                    .setMediaMetadata(androidx.media3.common.MediaMetadata.Builder().setTitle(_title.value).build())
-                    .build()).media
-                // Media3 1.5.1 discards queueLoad's PendingResult. Observe the SDK LOAD result
-                // directly, while retaining CastPlayer for the existing transport controls.
-                remote.load(MediaLoadRequestData.Builder()
-                    .setMediaInfo(info)
-                    .setCurrentTime(startPosition)
-                    .setAutoplay(true)
-                    .build()).setResultCallback { result ->
-                    if (generation == castGeneration && !result.status.isSuccess) {
-                        diagnostics.breadcrumb("cast load rejected status=${result.status.statusCode}")
-                        retryCastWithConversion(generation)
-                    }
-                }
+                retryCastWithConversion(generation)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -2541,7 +2531,7 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    /** Keep the selected file and credentials; VLC remuxes/converts it for the same receiver. */
+    /** Keep the selected file and credentials; normalize both tracks before loading the receiver. */
     private fun retryCastWithConversion(generation: Int) {
         if (generation != castGeneration || !_isCasting.value || _castConverting.value) return
         val media = castPreparedMedia
@@ -2560,14 +2550,14 @@ class PlayerViewModel @Inject constructor(
                 failCast("The TV couldn't start this file after conversion. Check that it can reach this phone over Wi-Fi.")
             }
         }
-        diagnostics.breadcrumb("cast retry using VLC conversion")
+        diagnostics.breadcrumb("cast compatible output videoConversion=$castTranscodeVideo")
         castLoadJob = viewModelScope.launch {
             try {
                 // Each attempt owns a distinct output port, including rapid source changes.
                 val port = withContext(Dispatchers.IO) { java.net.ServerSocket(0).use { it.localPort } }
                 if (generation != castGeneration) return@launch
                 castNativePort = port
-                val target = VlcCastTarget(receiverAddress, device.servicePort, port)
+                val target = VlcCastTarget(receiverAddress, device.servicePort, port, castTranscodeVideo)
                 val player = VlcPlayer(vlcEngine, appContext, target)
                 castNativePlayer = player
                 clearAudioTracks()
@@ -2623,6 +2613,7 @@ class PlayerViewModel @Inject constructor(
         castNativePlayer = null
         castNativePort = null
         castPreparedMedia = null
+        castTranscodeVideo = true
         _castConverting.value = false
         castBridge?.let { bridge -> cleanupScope.launch { bridge.stop() } }
         castBridge = null
