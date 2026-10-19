@@ -6,6 +6,7 @@ import androidx.core.content.ContextCompat
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
+import android.view.KeyEvent
 import androidx.media3.cast.CastPlayer
 import androidx.media3.cast.SessionAvailabilityListener
 import com.google.android.gms.cast.framework.CastStateListener
@@ -34,6 +35,56 @@ class CastManager @Inject constructor(
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     private var sharedPlayer: CastPlayer? = null
     private var playbackOwner: Any? = null
+    private val volumeKeys = CastVolumeKeys()
+
+    data class Volume(val level: Float, val muted: Boolean)
+
+    fun volumeSnapshot(): Volume? = runCatching {
+        val session = castContext?.sessionManager?.currentCastSession ?: return null
+        val media = session.remoteMediaClient?.mediaStatus
+        Volume((session.volume * (media?.streamVolume ?: 1.0)).toFloat().coerceIn(0f, 1f),
+            session.isMute || media?.isMute == true)
+    }.getOrNull()
+
+    /** Both the on-screen slider and hardware keys change the same combined receiver volume. */
+    fun setVolume(volume: Float) {
+        runCatching {
+            val session = castContext?.sessionManager?.currentCastSession ?: return
+            val level = volume.coerceIn(0f, 1f).toDouble()
+            val deviceLevel = session.volume
+            if (deviceLevel > 0.0 && level <= deviceLevel) {
+                session.remoteMediaClient?.setStreamVolume(level / deviceLevel)
+            } else {
+                session.remoteMediaClient?.setStreamVolume(1.0)
+                runCatching { session.volume = level }
+            }
+            session.remoteMediaClient?.setStreamMute(false)
+            runCatching { session.setMute(false) }
+            volumeKeys.volumeRequested(level.toFloat())
+        }.onFailure { Log.w(TAG, "Cast volume command failed", it) }
+    }
+
+    fun setMuted(muted: Boolean) {
+        runCatching {
+            val session = castContext?.sessionManager?.currentCastSession ?: return
+            session.remoteMediaClient?.setStreamMute(muted)
+            runCatching { session.setMute(muted) }
+        }.onFailure { Log.w(TAG, "Cast mute command failed", it) }
+    }
+
+    fun dispatchVolumeKey(event: KeyEvent): Boolean {
+        if (event.keyCode != KeyEvent.KEYCODE_VOLUME_UP && event.keyCode != KeyEvent.KEYCODE_VOLUME_DOWN &&
+            event.keyCode != KeyEvent.KEYCODE_VOLUME_MUTE) return false
+        val session = castContext?.sessionManager?.currentCastSession
+        // A selected TV alone must not steal local volume. Paused/buffering Cast media still counts.
+        val receiver = session?.takeIf {
+            playbackOwner != null && it.isConnected && it.remoteMediaClient?.hasMediaSession() == true
+        }
+        val volume = if (receiver != null) volumeSnapshot() else null
+        return volumeKeys.handle(event.keyCode, event.action, event.repeatCount,
+            receiver.takeIf { volume != null }, volume?.level ?: 0f,
+            setVolume = ::setVolume, toggleMute = { setMuted(volume?.muted != true) })
+    }
 
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun acquirePlayer(owner: Any, listener: SessionAvailabilityListener): CastPlayer? {
