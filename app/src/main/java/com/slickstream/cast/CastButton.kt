@@ -42,11 +42,13 @@ fun CastButton(expanded: Boolean = false, viewModel: CastViewModel = hiltViewMod
         }
     }
     CastDestinationControl(state, expanded, onClick)
-    if (unavailable) AlertDialog(
-        onDismissRequest = { unavailable = false },
-        title = { Text("Cast unavailable") },
-        text = { Text("Casting needs Google Play services on this phone. Check that it is installed and up to date.") },
-        confirmButton = { TextButton(onClick = { unavailable = false }) { Text("OK") } },
+    if (unavailable) com.slickstream.feature.profile.ConfirmDialog(
+        title = "Cast unavailable",
+        message = "Casting needs Google Play services on this phone. Check that it is installed and up to date.",
+        confirmLabel = "OK",
+        onConfirm = { unavailable = false },
+        onDismiss = { unavailable = false },
+        dismissLabel = null,
     )
 }
 

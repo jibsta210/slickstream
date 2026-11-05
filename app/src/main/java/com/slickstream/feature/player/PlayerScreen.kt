@@ -199,19 +199,19 @@ fun PlayerScreen(
     var videoBounds by remember { mutableStateOf<Rect?>(null) }
 
     castError?.let { message ->
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = viewModel::dismissCastError,
-            title = { Text("Casting stopped") },
-            text = { Text(message) },
-            confirmButton = {
-                androidx.compose.material3.TextButton(onClick = viewModel::dismissCastError) { Text("OK") }
+        // Styled modal, never the native AlertDialog. With other streams to try, that is the primary
+        // action and OK (or Back / the backdrop) just closes it.
+        val canSwitch = sources.size > 1
+        com.slickstream.feature.profile.ConfirmDialog(
+            title = "Casting stopped",
+            message = message,
+            confirmLabel = if (canSwitch) "Other streams" else "OK",
+            onConfirm = {
+                viewModel.dismissCastError()
+                if (canSwitch) showSources = true
             },
-            dismissButton = if (sources.size > 1) {{
-                androidx.compose.material3.TextButton(onClick = {
-                    viewModel.dismissCastError()
-                    showSources = true
-                }) { Text("Other streams") }
-            }} else null,
+            onDismiss = viewModel::dismissCastError,
+            dismissLabel = if (canSwitch) "OK" else null,
         )
     }
 

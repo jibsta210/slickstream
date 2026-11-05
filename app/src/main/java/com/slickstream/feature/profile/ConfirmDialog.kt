@@ -34,7 +34,8 @@ fun ConfirmDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
     destructive: Boolean = false,
-    dismissLabel: String = "Cancel",
+    /** null = a single-button notice (Back / backdrop still dismiss). */
+    dismissLabel: String? = "Cancel",
 ) {
     Dialog(
         onDismissRequest = onDismiss,
@@ -71,13 +72,15 @@ fun ConfirmDialog(
                         .padding(top = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
                 ) {
-                    TextButton(
-                        onClick = onDismiss,
-                        colors = ButtonDefaults.textButtonColors(
-                            contentColor = Brand.OnSurfaceDim,
-                        ),
-                    ) {
-                        Text(dismissLabel, style = MaterialTheme.typography.labelLarge)
+                    if (dismissLabel != null) {
+                        TextButton(
+                            onClick = onDismiss,
+                            colors = ButtonDefaults.textButtonColors(
+                                contentColor = Brand.OnSurfaceDim,
+                            ),
+                        ) {
+                            Text(dismissLabel, style = MaterialTheme.typography.labelLarge)
+                        }
                     }
                     Button(
                         onClick = onConfirm,
