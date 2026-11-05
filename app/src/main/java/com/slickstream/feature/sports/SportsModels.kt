@@ -38,4 +38,6 @@ data class SportStream(
      * is already a playable HLS master (FanCode).
      */
     val needsResolution: Boolean = false,
+    /** Referer the WebView sends when loading the embed page ([needsResolution] only). */
+    val pageReferer: String? = null,
 )

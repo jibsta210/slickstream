@@ -47,6 +47,8 @@ class LivePlaybackHolder @Inject constructor() {
         val headers: Map<String, String>,
         /** url is an embed page to resolve via WebView before playing (vs a direct m3u8). */
         val needsResolution: Boolean,
+        /** Referer for loading the embed page, from [com.slickstream.feature.sports.SportStream.pageReferer]. */
+        val pageReferer: String? = null,
     )
 
     data class Selection(

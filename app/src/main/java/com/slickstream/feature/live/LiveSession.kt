@@ -3,6 +3,7 @@ package com.slickstream.feature.live
 import android.content.Context
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import com.slickstream.feature.sports.PpvSchedule
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -163,7 +164,7 @@ class LiveSession(
                 val playUrl = if (feed.needsResolution) {
                     resolver.resolve(
                         embedUrl = feed.url,
-                        pageReferer = "https://streamed.pk/",
+                        pageReferer = feed.pageReferer ?: PpvSchedule.PAGE_REFERER,
                         userAgent = feed.headers["User-Agent"] ?: DEFAULT_UA,
                     )
                 } else {
@@ -389,7 +390,7 @@ class LiveSession(
             if (!resolver.isWebViewAvailable()) null
             else resolver.resolve(
                 embedUrl = feed.url,
-                pageReferer = "https://streamed.pk/",
+                pageReferer = feed.pageReferer ?: PpvSchedule.PAGE_REFERER,
                 userAgent = feed.headers["User-Agent"] ?: DEFAULT_UA,
                 timeoutMs = RE_RESOLVE_TIMEOUT_MS,
             )

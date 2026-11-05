@@ -134,7 +134,7 @@ class SportsViewModel @Inject constructor(
                 "feeds=${sheet.streams.size}",
         )
         val feeds = sheet.streams.map {
-            com.slickstream.feature.live.LivePlaybackHolder.Feed(it.label, it.url, it.headers, it.needsResolution)
+            com.slickstream.feature.live.LivePlaybackHolder.Feed(it.label, it.url, it.headers, it.needsResolution, it.pageReferer)
         }
         playbackHolder.set(
             title = sheet.event.title,

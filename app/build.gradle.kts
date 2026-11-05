@@ -55,8 +55,8 @@ android {
         buildConfigField("String", "INDEXER_BASE_URL", "\"${secret("INDEXER_BASE_URL", "https://torrentio.strem.fun/")}\"")
         // Stremio-compatible subtitle addon (resolves IMDB id -> subtitle files). Keyless.
         buildConfigField("String", "SUBTITLE_BASE_URL", "\"${secret("SUBTITLE_BASE_URL", "https://opensubtitles-v3.strem.io/")}\"")
-        // Live-sports schedule/stream source (streamed.pk-compatible REST). Keyless, user-overridable.
-        buildConfigField("String", "SPORTS_BASE_URL", "\"${secret("SPORTS_BASE_URL", "https://streamed.pk/")}\"")
+        // Live-sports schedule host (ppv.st feed; streamed.pk shut down). Keyless. The repository reads the full feed URL.
+        buildConfigField("String", "SPORTS_BASE_URL", "\"${secret("SPORTS_BASE_URL", "https://api.ppv.st/")}\"")
         // In-app updater: version manifest on the (public) GitHub repo's latest release.
         buildConfigField("String", "UPDATE_MANIFEST_URL", "\"${secret("UPDATE_MANIFEST_URL", "https://github.com/jibsta210/slickstream/releases/latest/download/update.json")}\"")
 

@@ -332,7 +332,7 @@ class LivePlayerViewModel @Inject constructor(
                         _picker.value = _picker.value?.copy(adding = false, error = "No live feeds for this game yet.")
                         return@launch
                     }
-                    val feeds = streams.map { LivePlaybackHolder.Feed(it.label, it.url, it.headers, it.needsResolution) }
+                    val feeds = streams.map { LivePlaybackHolder.Feed(it.label, it.url, it.headers, it.needsResolution, it.pageReferer) }
                     addSession(newLiveSession(event.title, feeds, 0))
                 }
                 is DataResult.Error -> _picker.value = _picker.value?.copy(adding = false, error = r.message)
