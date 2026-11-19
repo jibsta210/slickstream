@@ -30,8 +30,11 @@ import javax.inject.Inject
 @HiltViewModel
 class CatalogViewModel @Inject constructor(
     private val catalog: CatalogRepository,
-    profileRepository: com.slickstream.core.repository.ProfileRepository,
+    private val profileRepository: com.slickstream.core.repository.ProfileRepository,
 ) : ViewModel() {
+
+    /** Bumped by retry/refresh so it rotates in different shelves. */
+    private var salt = 0
 
     private val _state = MutableStateFlow(HomeUiState())
     val state: StateFlow<HomeUiState> = _state.asStateFlow()
@@ -63,10 +66,44 @@ class CatalogViewModel @Inject constructor(
     }
 
     fun retry() {
+        salt++
         loadedType?.let { fetch(it) }
     }
 
     private fun fetch(mediaType: MediaType) {
+        if (profileRepository.activeProfile.value?.isKids != true) fetchShelves(mediaType) else fetchKids(mediaType)
+    }
+
+    /** Adult Movies/TV tab: its own new releases, a rotating set of shelves, then genre carousels on
+     *  rotating pages — all de-duplicated against each other (core/catalog/Shelves). */
+    private fun fetchShelves(mediaType: MediaType) {
+        viewModelScope.launch {
+            _state.value = HomeUiState(isLoading = true)
+            val today = com.slickstream.core.catalog.Shelves.Date.today()
+            val genresDef = async { catalog.getGenres(mediaType) }
+            val allGenres = (genresDef.await() as? DataResult.Success)?.data.orEmpty()
+            _genres.value = allGenres
+            val genreShelves = com.slickstream.core.catalog.Shelves
+                .rotate(allGenres, 5, today.epochDay + salt + mediaType.ordinal)
+                .map { com.slickstream.core.catalog.Shelves.genre(mediaType, it.id, it.name) }
+            val plan = com.slickstream.core.catalog.Shelves.tab(mediaType, today, salt) + genreShelves
+            val loaded = com.slickstream.core.catalog.ShelfLoader.load(catalog, plan, today, salt)
+            val rows = loaded.rows.map { (shelf, items) -> MediaRowUi(shelf.title, items) }
+            val top = rows.firstOrNull()?.items.orEmpty()
+            val featured = top.firstOrNull { !it.backdropUrl.isNullOrBlank() } ?: top.firstOrNull()
+            _state.value = if (rows.isEmpty()) {
+                HomeUiState(
+                    isLoading = false,
+                    errorMessage = loaded.firstError ?: "Couldn't load content. Check your connection and try again.",
+                )
+            } else {
+                HomeUiState(isLoading = false, featured = featured, rows = rows)
+            }
+        }
+    }
+
+    /** Kids profile: the kid-safe rows (the repository caps every call by rating). */
+    private fun fetchKids(mediaType: MediaType) {
         viewModelScope.launch {
             _state.value = HomeUiState(isLoading = true)
 

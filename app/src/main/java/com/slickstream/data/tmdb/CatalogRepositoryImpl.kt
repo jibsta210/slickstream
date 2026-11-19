@@ -130,6 +130,9 @@ class CatalogRepositoryImpl @Inject constructor(
          *  Horror, Thriller, Crime, Mystery, War. */
         val ADULT_LEAN_GENRE_IDS = setOf(27, 53, 80, 9648, 10752)
 
+        /** Talk, News, Soap, Reality — kept out of browse shelves. */
+        val TV_NOISE_GENRES = setOf(10767, 10763, 10766, 10764)
+
         /** discover/tv OR-group: TMDB has NO rating filter for TV, so kids TV = these genres. */
         const val KID_TV_GENRES = "10762|10751|16"
 
@@ -289,6 +292,34 @@ class CatalogRepositoryImpl @Inject constructor(
                 }
             }
         }
+
+    override suspend fun getShelf(
+        shelf: com.slickstream.core.catalog.Shelf,
+        page: Int,
+    ): DataResult<List<MediaItem>> = withContext(io) {
+        result {
+            if (kids) return@result emptyList<MediaItem>()
+            val type = shelf.mediaType
+            val dto = when (shelf.source) {
+                com.slickstream.core.catalog.Shelf.Source.TRENDING_DAY ->
+                    if (type == null) api.trendingAll("day", page) else api.trending(type.path(), "day", page)
+                com.slickstream.core.catalog.Shelf.Source.TRENDING_WEEK ->
+                    if (type == null) api.trendingAll("week", page) else api.trending(type.path(), "week", page)
+                com.slickstream.core.catalog.Shelf.Source.TOP_RATED ->
+                    api.topRated((type ?: MediaType.MOVIE).path(), page)
+                com.slickstream.core.catalog.Shelf.Source.NOW_PLAYING -> api.movieNowPlaying(page)
+                com.slickstream.core.catalog.Shelf.Source.DISCOVER -> api.discoverWith(
+                    (type ?: MediaType.MOVIE).path(),
+                    shelf.params + mapOf("page" to page.toString(), "include_adult" to "false"),
+                )
+            }
+            dto.results.toDomain(forcedType = type)
+                // Trending / top-rated can't be genre-filtered at TMDB, and its TV side is padded with
+                // talk shows, news and soaps (Jimmy Kimmel Live! in "Popular This Week"). Drop those.
+                .filterNot { it.mediaType == MediaType.TV && it.genreIds.any { g -> g in TV_NOISE_GENRES } }
+                .browsable()
+        }
+    }
 
     override suspend fun getGenres(mediaType: MediaType): DataResult<List<Genre>> =
         withContext(io) {

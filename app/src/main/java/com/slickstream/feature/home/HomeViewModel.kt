@@ -271,6 +271,8 @@ class HomeViewModel @Inject constructor(
 
     /** Whether the active profile is a kids profile — branches Home between default and kid rows. */
     private var kidsMode: Boolean = false
+    /** Bumped by pull-to-refresh so a refresh rotates in different shelves and pages. */
+    private var refreshSalt = 0
 
     /** The in-flight load. Each load() cancels the previous one: publish() is last-writer-wins, so a
      *  slow default load finishing AFTER a kids-profile switch would otherwise put adult rows on the
@@ -315,39 +317,30 @@ class HomeViewModel @Inject constructor(
                 errorMessage = null,
             )
 
-            // Fan out every catalog call concurrently.
-            val trendingDef = asyncCatalog { catalogRepository.getTrending(null) }
-            val popularMoviesDef = asyncCatalog { catalogRepository.getPopular(MediaType.MOVIE) }
-            val popularTvDef = asyncCatalog { catalogRepository.getPopular(MediaType.TV) }
-            val topRatedDef = asyncCatalog { catalogRepository.getTopRated(MediaType.MOVIE) }
-            val upcomingDef = asyncCatalog { catalogRepository.getNewAndUpcoming(MediaType.MOVIE) }
-            // Personalized "Because You Watched" rail from THIS profile's history+favourites genre mix
-            // (concurrent; null when there isn't enough signal yet).
+            // Distinct, rotating shelves (core/catalog/Shelves): what's new on top, a different mix of
+            // networks / eras / languages each day, de-duplicated so a title shows up once.
+            if (isRefresh) refreshSalt++
+            val today = com.slickstream.core.catalog.Shelves.Date.today()
+            val plan = com.slickstream.core.catalog.Shelves.home(today, refreshSalt)
             val personalizedDef = viewModelScope.async { runCatching { buildPersonalizedRow() }.getOrNull() }
-
-            val trending = trendingDef.await()
-            val popularMovies = popularMoviesDef.await()
-            val popularTv = popularTvDef.await()
-            val topRated = topRatedDef.await()
-            val upcoming = upcomingDef.await()
             val personalized = personalizedDef.await()
+            val loaded = com.slickstream.core.catalog.ShelfLoader.load(
+                catalogRepository, plan, today, refreshSalt,
+                alreadyShown = personalized?.items.orEmpty().mapTo(HashSet(), com.slickstream.core.catalog.Shelves::key),
+            )
 
             val rows = buildList {
                 // Right after Continue Watching (rendered separately) — the prime slot.
                 personalized?.let { add(it) }
-                trending.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Trending", it)) }
-                popularMovies.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Popular Movies", it)) }
-                popularTv.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Popular TV", it)) }
-                topRated.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("Top Rated", it)) }
-                upcoming.itemsOrEmpty().let { if (it.isNotEmpty()) add(MediaRowUi("New & Upcoming", it)) }
+                loaded.rows.forEach { (shelf, items) -> add(MediaRowUi(shelf.title, items)) }
             }
 
-            // Featured hero = best trending entry that has a backdrop to show.
-            val featured = trending.itemsOrEmpty()
-                .firstOrNull { !it.backdropUrl.isNullOrBlank() }
-                ?: trending.itemsOrEmpty().firstOrNull()
+            // Featured hero = the top of "Trending Today" (what's new right now) with a backdrop.
+            val heroPool = loaded.rows.firstOrNull { it.first.id == "trending-day" }?.second
+                ?: rows.firstOrNull()?.items.orEmpty()
+            val featured = heroPool.firstOrNull { !it.backdropUrl.isNullOrBlank() } ?: heroPool.firstOrNull()
 
-            publish(rows, featured, firstError(trending, popularMovies, popularTv, topRated, upcoming), isRefresh)
+            publish(rows, featured, loaded.firstError, isRefresh)
         }
 
     /**

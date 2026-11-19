@@ -11,6 +11,7 @@ import com.slickstream.data.tmdb.dto.TvDetailsDto
 import retrofit2.http.GET
 import retrofit2.http.Path
 import retrofit2.http.Query
+import retrofit2.http.QueryMap
 
 /**
  * TMDB v3 REST surface. Authentication (Bearer header or api_key query param) is injected
@@ -81,6 +82,13 @@ interface TmdbApi {
         @Query("vote_count.gte") voteCountGte: Int? = null,
         @Query("primary_release_date.lte") releasedBefore: String? = null,
         @Query("first_air_date.lte") airedBefore: String? = null,
+    ): PagedDto<MediaListItemDto>
+
+    /** Free-form discover for browse shelves (core/catalog/Shelves): any TMDB discover filter. */
+    @GET("discover/{media_type}")
+    suspend fun discoverWith(
+        @Path("media_type") mediaType: String,
+        @QueryMap params: Map<String, String>,
     ): PagedDto<MediaListItemDto>
 
     /** Per-country movie certifications (kids-profile search/similar filtering). */

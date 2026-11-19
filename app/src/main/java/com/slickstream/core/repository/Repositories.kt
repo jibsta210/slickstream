@@ -29,6 +29,9 @@ interface CatalogRepository {
     suspend fun getNewAndUpcoming(mediaType: MediaType, page: Int = 1): DataResult<List<MediaItem>>
     suspend fun getByGenre(mediaType: MediaType, genreId: Int, page: Int = 1): DataResult<List<MediaItem>>
     suspend fun getGenres(mediaType: MediaType): DataResult<List<Genre>>
+    /** One browse shelf at [page] (see [com.slickstream.core.catalog.Shelves]). Adult profiles only:
+     *  a kids profile gets an empty list (its Home/tabs keep their own kid-safe rows). */
+    suspend fun getShelf(shelf: com.slickstream.core.catalog.Shelf, page: Int = 1): DataResult<List<MediaItem>>
     suspend fun getDetails(id: Int, mediaType: MediaType): DataResult<MediaDetails>
     suspend fun getEpisodes(tvId: Int, seasonNumber: Int): DataResult<List<Episode>>
     suspend fun getSimilar(id: Int, mediaType: MediaType): DataResult<List<MediaItem>>
