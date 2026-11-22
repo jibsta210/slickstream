@@ -1327,7 +1327,7 @@ private fun ScrubBar(
     Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (scrubbing) {
             @Suppress("UNUSED_EXPRESSION") thumbnailVersion
-            TvFilmstrip(centerMs = scrubTargetMs, durationMs = durationMs, thumbnailAt = thumbnailAt)
+            TvFilmstrip(centerMs = scrubTargetMs, durationMs = durationMs, thumbnailAt = thumbnailAt, speedLevel = speedLevel)
             Row(
                 modifier = Modifier.align(Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1419,7 +1419,7 @@ private fun fmtTime(ms: Long): String {
 private const val SCRUB_TICK_MS = 33L      // drive-loop cadence (~30 fps)
 private const val SCRUB_GRACE_MS = 500L    // hold this long before any movement (just shows the strip)
 private const val SCRUB_DOUBLE_MS = 500L   // every further 500 ms held, double the speed
-private const val SCRUB_MAX_LEVEL = 7      // cap at 2^7 = 128×
+private const val SCRUB_MAX_LEVEL = 8      // cap at 2^8 = 256× (128× wasn't enough to cross a film)
 
 // Film-strip tuning: how many frames fit across the full width, how far to draw beyond the edges (so
 // the ribbon stays filled as it glides), the minute spacing of the frame grid, and the side-frame
@@ -1440,8 +1440,13 @@ private fun TvFilmstrip(
     centerMs: Long,
     durationMs: Long,
     thumbnailAt: (Long) -> android.graphics.Bitmap?,
+    speedLevel: Int = -1,
 ) {
     val dur = durationMs.takeIf { it > 0 } ?: 0L
+    // Frame spacing grows with speed: 1 min apart up to 32×, then 2/4/8 min at 64/128/256×. On a fixed
+    // 1-minute grid a fast scrub showed six near-identical (or the same nearest) frames and outran
+    // everything decoded; wider spacing previews where you'll be in the next few seconds.
+    val step = TV_FILMSTRIP_STEP_MS * (1L shl (speedLevel - 5).coerceIn(0, 3))
     val animatedCenter by animateFloatAsState(
         targetValue = centerMs.toFloat(),
         animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
@@ -1454,7 +1459,6 @@ private fun TvFilmstrip(
         val pitchPx = with(LocalDensity.current) { maxWidth.toPx() } / TV_FILM_VISIBLE
         val frameW = with(LocalDensity.current) { (pitchPx * 0.94f).toDp() }
         val frameH = frameW * 9f / 16f
-        val step = TV_FILMSTRIP_STEP_MS
         val centerK = Math.round(animatedCenter / step).toInt()
         // Draw far → near so the swollen centre frame lands on top of its shrunk neighbours.
         for (k in (centerK - TV_FILM_SPAN..centerK + TV_FILM_SPAN)

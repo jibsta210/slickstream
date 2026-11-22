@@ -89,6 +89,13 @@ class FrameThumbnailExtractor(
     /** Last position the UI asked a thumbnail for — used as the anchor when evicting a full cache. */
     @Volatile private var lastScrubMs: Long = 0L
 
+    /** The source plays on the libVLC fallback: the platform decoder may not handle it, so decode one
+     *  frame per round and stop after [MAX_EMPTY_DECODES] empties in a row. */
+    @Volatile private var fallbackDecoder: Boolean = false
+
+    /** When the UI last asked for a thumbnail (elapsedRealtime) — "is the user scrubbing right now". */
+    @Volatile private var lastScrubAtMs: Long = 0L
+
     /** timestamp(ms at frame centre) -> decoded thumbnail. Guarded by [lock]. Keyed by time (not
      *  sample index) because the two tiers sit on different grids and the dense grid is sparse. */
     private val frames = HashMap<Long, Bitmap>()
@@ -118,9 +125,11 @@ class FrameThumbnailExtractor(
         filePath: String? = null,
         headers: Map<String, String> = emptyMap(),
         torrentBacked: Boolean = true,
+        fallbackDecoder: Boolean = false,
     ) {
         if (streamUrl == url) return
         reset()
+        this.fallbackDecoder = fallbackDecoder
         if (durationMs <= 0L) return
         // Only the torrent path maps time→byte to ask the bitfield what's on disk; a direct source has
         // no such gate, so a missing length must not silently kill its previews (the RD bug).
@@ -160,6 +169,7 @@ class FrameThumbnailExtractor(
      *  closest frame on the (possibly sparse) grid. */
     fun thumbnailAt(positionMs: Long): Bitmap? {
         lastScrubMs = positionMs
+        lastScrubAtMs = android.os.SystemClock.elapsedRealtime()
         scrubbed = true
         val iv = denseIntervalMs
         if (iv <= 0L) return null
@@ -221,6 +231,8 @@ class FrameThumbnailExtractor(
             if (retriever == null) delay(RETRIEVER_RETRY_MS)
         }
         val activeRetriever = retriever ?: return
+        val perRound = if (fallbackDecoder) 1 else MAX_DECODES_PER_ROUND
+        var emptyRun = 0
 
         try {
             // Frame centres we've already attempted (decoded or proven-empty) — keyed by time, so we
@@ -229,6 +241,8 @@ class FrameThumbnailExtractor(
             // Coarse points still missing get their deadlines re-armed each round so libtorrent keeps
             // sipping them; dense points are free-only and never re-armed.
             var idleRounds = 0
+            // Scrub position at the previous round, to tell which way the user is scrubbing.
+            var prevAnchor = lastScrubMs
             // The coarse tier defines "complete enough to back off"; the dense tier is opportunistic
             // and may keep filling for the whole session as the download head grows, so we don't
             // require denseCount to finish before idling.
@@ -248,12 +262,42 @@ class FrameThumbnailExtractor(
                 val available = streamer.availableByteOffsets(hash, pending.map { it.second })
                 var decodedThisRound = 0
                 for (i in pending.indices) {
-                    if (!currentCoroutineContext().isActive || decodedThisRound >= MAX_DECODES_PER_ROUND) break
+                    if (!currentCoroutineContext().isActive || decodedThisRound >= perRound) break
                     if (!available.getOrElse(i) { false }) continue
                     val t = pending[i].first
-                    if (decodeAndStore(activeRetriever, t)) progressed = true
+                    val result = decodeAndStore(activeRetriever, t)
+                    if (result != Decode.EMPTY) emptyRun = 0
+                    if (result == Decode.STORED) {
+                        progressed = true
+                    } else if (result == Decode.EMPTY && fallbackDecoder && ++emptyRun >= MAX_EMPTY_DECODES) {
+                        Log.w(TAG, "scrub previews: platform decoder can't read this (VLC) source — stopping")
+                        return
+                    }
                     done += t
                     decodedThisRound++
+                }
+
+                // SCRUB-DRIVEN FETCH. Everything above is free-only, so a fast scrub runs straight past
+                // the downloaded region into timeline with no frames — "high-speed scrub previews never
+                // show anything". While the user is actively scrubbing, ask the engine (relaxed
+                // deadline, playback still wins) for the coarse points nearest where they're looking.
+                // Re-aimed every round at the few coarse points the scrub is heading INTO (the ones
+                // behind cost 3x), since at 128-256x the target crosses a minute of film every few
+                // hundred ms and only points ahead of it can arrive before it gets there. Bounded:
+                // coarse points only (~20 per title), [SCRUB_FETCH_POINTS] per round, while scrubbing.
+                val scrubbingNow = android.os.SystemClock.elapsedRealtime() - lastScrubAtMs < SCRUB_ACTIVE_MS
+                if (scrubbingNow) {
+                    val anchor = lastScrubMs
+                    val dir = (anchor - prevAnchor).let { if (it > 0) 1 else if (it < 0) -1 else 0 }
+                    prevAnchor = anchor
+                    val wanted = coarseTimes.indices
+                        .filter { coarseTimes[it] !in done }
+                        .sortedBy { i ->
+                            val d = coarseTimes[i] - anchor
+                            if (dir == 0 || d * dir >= 0) abs(d) else abs(d) * 3
+                        }
+                        .take(SCRUB_FETCH_POINTS)
+                    if (wanted.isNotEmpty()) streamer.prefetchPreviewOffsets(hash, wanted.map { coarseOffsets[it] })
                 }
 
                 // If the coarse tier is fully decoded AND every dense point has been attempted, there's
@@ -262,7 +306,7 @@ class FrameThumbnailExtractor(
                 val denseDone = denseTimes.all { it in done }
                 if (coarseDone && denseDone) break
 
-                idleRounds = if (progressed) 0 else idleRounds + 1
+                idleRounds = if (progressed || scrubbingNow) 0 else idleRounds + 1
                 // Back off as the buffered region stops growing; never give up entirely (the user may
                 // still be downloading more, unlocking more free dense frames) but don't spin tightly.
                 delay(if (idleRounds > 6) IDLE_POLL_MS else ACTIVE_POLL_MS)
@@ -348,7 +392,7 @@ class FrameThumbnailExtractor(
                     budget--
 
                     if (bmp != null) {
-                        storeFrame(t, bmp)
+                        if (looksFlat(bmp)) bmp.recycle() else storeFrame(t, bmp)
                         emptyDecodes = 0
                     } else if (++emptyDecodes >= MAX_EMPTY_DECODES) {
                         // HLS playlist, audio-only, or a host that won't serve ranges: nothing will ever
@@ -442,9 +486,18 @@ class FrameThumbnailExtractor(
 
     /** Decode the frame centred at [timeMs], store it (capped + evicting) and bump version. Returns
      *  true if a bitmap was actually added. */
-    private fun decodeAndStore(retriever: MediaMetadataRetriever, timeMs: Long): Boolean {
-        val bmp = decodeFrame(retriever, timeMs) ?: return false
-        return storeFrame(timeMs, bmp)
+    private enum class Decode { STORED, EMPTY, FLAT }
+
+    /** Decode + store. FLAT = the decoder worked but the frame is a uniform slab — either a partly
+     *  downloaded keyframe (measured: a solid green tile in the strip) or a black fade. It isn't
+     *  shown, but it doesn't count as "this decoder can't read the file" either. */
+    private fun decodeAndStore(retriever: MediaMetadataRetriever, timeMs: Long): Decode {
+        val bmp = decodeFrame(retriever, timeMs) ?: return Decode.EMPTY
+        if (looksFlat(bmp)) {
+            bmp.recycle()
+            return Decode.FLAT
+        }
+        return if (storeFrame(timeMs, bmp)) Decode.STORED else Decode.FLAT
     }
 
     /** Cache an already-decoded frame (capped + evicting) and bump version. */
@@ -510,6 +563,19 @@ class FrameThumbnailExtractor(
         }
     }
 
+    /** True when a 6x6 sample of [bmp] has under ~3% spread in every channel (a corrupt/blank frame). */
+    private fun looksFlat(bmp: Bitmap): Boolean = runCatching {
+        var minR = 255; var maxR = 0; var minG = 255; var maxG = 0; var minB = 255; var maxB = 0
+        for (yi in 1..6) for (xi in 1..6) {
+            val c = bmp.getPixel(bmp.width * xi / 7, bmp.height * yi / 7)
+            val r = (c shr 16) and 0xff; val g = (c shr 8) and 0xff; val b = c and 0xff
+            if (r < minR) minR = r; if (r > maxR) maxR = r
+            if (g < minG) minG = g; if (g > maxG) maxG = g
+            if (b < minB) minB = b; if (b > maxB) maxB = b
+        }
+        maxR - minR < 8 && maxG - minG < 8 && maxB - minB < 8
+    }.getOrDefault(false)
+
     /** Approximate file byte offset of the keyframe nearest [timeMs] (linear time→byte; the
      *  container's own index refines the actual frame inside getFrameAtTime). */
     private fun byteOffsetForTime(timeMs: Long): Long {
@@ -528,6 +594,8 @@ class FrameThumbnailExtractor(
         headers = emptyMap()
         denseIntervalMs = 0L
         lastScrubMs = 0L
+        lastScrubAtMs = 0L
+        fallbackDecoder = false
         scrubbed = false
         synchronized(lock) {
             // No recycle(): a failover calls this mid-scrub while the filmstrip may still be drawing
@@ -606,5 +674,9 @@ class FrameThumbnailExtractor(
         /** How often the remote path checks whether the user has started scrubbing (it stays off the
          *  network until they do). Short enough that the strip starts filling right away. */
         const val SCRUB_WAIT_POLL_MS = 400L
+        /** A thumbnail request within this long means the user is scrubbing right now. */
+        const val SCRUB_ACTIVE_MS = 3_000L
+        /** Coarse points (re)requested from the swarm per sampling round while scrubbing. */
+        const val SCRUB_FETCH_POINTS = 3
     }
 }

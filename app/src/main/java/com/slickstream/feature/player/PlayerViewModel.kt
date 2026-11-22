@@ -1999,6 +1999,7 @@ class PlayerViewModel @Inject constructor(
                     hasReachedPlaying = true
                     _uiState.value = PlayerUiState.Playing
                     if (!firstFrameRendered) armFirstFrameWatchdog()
+                    maybeStartThumbnails(vlc)
                 }
                 Player.STATE_BUFFERING -> {
                     if (_uiState.value !is PlayerUiState.Playing) {
@@ -2705,15 +2706,19 @@ class PlayerViewModel @Inject constructor(
 
     /**
      * Kick off sparse scrub-preview sampling once we're actually playing with a known duration. The
-     * extractor is idempotent for the same URL, so calling it on every READY re-emit is fine. Skipped
-     * for the libVLC fallback — MediaMetadataRetriever can't decode the codecs VLC is there for, so it
-     * would only waste prefetch bandwidth.
+     * extractor is idempotent for the same URL, so calling it on every READY re-emit is fine.
+     *
+     * Runs on the libVLC fallback too. It used to be skipped there ("MediaMetadataRetriever can't decode
+     * what VLC is for"), but measured: 1080p x265 10-bit — the most common release — falls back to VLC
+     * when ExoPlayer's HEVC decoder reports the profile as unsupported, and those titles then had NO
+     * scrub previews at all. The retriever often still decodes a single keyframe (software decoder), so
+     * try; [FrameThumbnailExtractor] gives up by itself after a run of empty decodes.
      */
     private fun maybeStartThumbnails(player: Player) {
-        if (usingVlcForSource) return
         val hash = activeInfoHash ?: return
         val url = currentMediaUrl ?: return
         val dur = player.duration.takeIf { it > 0 } ?: return
+        val fallbackDecoder = usingVlcForSource
         val src = _currentSource.value
         if (src?.isDirect == true) {
             // DIRECT (Real-Debrid / free addon / offline download): the torrent engine never started for
@@ -2734,9 +2739,13 @@ class PlayerViewModel @Inject constructor(
                 filePath = null,
                 headers = hdrs,
                 torrentBacked = false,
+                fallbackDecoder = fallbackDecoder,
             )
         } else {
-            thumbnails.start(url, hash, dur, torrentStreamer.fileLength(hash), torrentStreamer.filePath(hash))
+            thumbnails.start(
+                url, hash, dur, torrentStreamer.fileLength(hash), torrentStreamer.filePath(hash),
+                fallbackDecoder = fallbackDecoder,
+            )
         }
     }
 
